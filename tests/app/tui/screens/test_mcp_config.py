@@ -25,6 +25,7 @@ from chrys.app.tui.screens.agents.panels.mcp import (
     MCPConfigPanel,
     MCPConnectionCard,
     _format_mcp_report,
+    format_mcp_command_line,
 )
 from chrys.app.tui.screens.dialogs.connection_test import _MCP_SERVER, ConnectionTestDialog
 from chrys.app.tui.widgets.markdown import VirtualizedMarkdown
@@ -712,7 +713,7 @@ async def test_stdio_command_line_parses_into_command_and_args() -> None:
 def test_a_saved_command_line_shown_in_the_field_reads_back_as_the_same_arguments() -> None:
     args = ["[/bold] literal", 'say "hi"', "", "C:\\Program Files\\data\\", "two\nlines", "--flag"]
 
-    shown = MCPConnectionCard._format_command_line("python server.py", args)
+    shown = format_mcp_command_line("python server.py", args)
 
     assert MCPConnectionCard._split_command_line(shown) == ("python server.py", args)
 

@@ -57,6 +57,9 @@ from chrys.app.tui.screens.agents.validation_messages import (
     TOOL_NAME_ITEM,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
+    MCP_COMMAND as _COMMAND,
+)
+from chrys.app.tui.screens.agents.validation_messages import (
     MCP_ENVIRONMENT_VARIABLES as _ENVIRONMENT_VARIABLES,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
@@ -70,6 +73,9 @@ from chrys.app.tui.screens.agents.validation_messages import (
 )
 from chrys.app.tui.screens.agents.validation_messages import (
     MCP_TOOL_ACCESS_NONE as _TOOL_ACCESS_NONE_LABEL,
+)
+from chrys.app.tui.screens.agents.validation_messages import (
+    MCP_URL as _URL,
 )
 from chrys.app.tui.screens.dialogs.confirm import ConfirmDialog
 from chrys.app.tui.screens.dialogs.connection_test import ConnectionTestDialog
@@ -96,6 +102,10 @@ _MCP_SERVER_SUBJECT = msg("tui.mcp.connection_test.subject", fallback="MCP Serve
 _WAIT_BEFORE_ADDING = msg(
     "tui.mcp.wait_before_adding",
     fallback="Wait for MCP connection tests to finish before adding servers.",
+)
+_WAIT_BEFORE_IMPORTING = msg(
+    "tui.mcp.wait_before_importing",
+    fallback="Wait for MCP connection tests to finish before importing servers.",
 )
 _WAIT_BEFORE_REMOVING = msg(
     "tui.mcp.wait_before_removing",
@@ -206,7 +216,6 @@ _REQUEST_TIMEOUT_PLACEHOLDER = msg(
 _ENABLED = msg("tui.mcp.enabled", fallback="Enabled")
 _TEST = msg("tui.mcp.test", fallback="Test")
 _TESTING = msg("tui.mcp.testing", fallback="Testing...")
-_URL = msg("tui.mcp.url", fallback="URL")
 _URL_PLACEHOLDER = msg("tui.mcp.placeholder.url", fallback="https://api.example.com/mcp")
 _SKIP_TLS_VERIFICATION = msg("tui.mcp.skip_tls_verification", fallback="Skip TLS verification")
 _INSECURE_TLS = msg(
@@ -214,7 +223,6 @@ _INSECURE_TLS = msg(
     fallback="Insecure: disables HTTPS certificate validation. Use only for trusted self-signed servers.",
 )
 _BYPASS_PROXY = msg("tui.mcp.bypass_proxy", fallback="Bypass proxy")
-_COMMAND = msg("tui.mcp.command", fallback="Command")
 _COMMAND_PLACEHOLDER = msg(
     "tui.mcp.placeholder.command",
     fallback="e.g. npx -y @modelcontextprotocol/server-filesystem /path",
@@ -222,6 +230,7 @@ _COMMAND_PLACEHOLDER = msg(
 _HTTP_OPTIONS = msg("tui.mcp.http_options", fallback="HTTP Options")
 _STDIO_OPTIONS = msg("tui.mcp.stdio_options", fallback="STDIO Options")
 _ADD = msg("tui.mcp.add", fallback="+ Add")
+_IMPORT = msg("tui.mcp.import", fallback="Import from other agents")
 _SERVERS = msg("tui.mcp.servers", fallback="MCP Servers")
 _SERVERS_DESCRIPTION = msg(
     "tui.mcp.servers_description",
@@ -383,6 +392,16 @@ _MCP_ENV_ROWS = _MCPKeyValueRows(
     key_placeholder=_VARIABLE_NAME_PLACEHOLDER,
     value_placeholder=_VALUE_PLACEHOLDER,
 )
+
+
+def format_mcp_command_line(command: str, args: Sequence[str]) -> str:
+    """The one-line form of a STDIO server's command, quoted as this platform's shell reads it."""
+    if not command:
+        return ""
+    parts = [command, *args]
+    if get_platform().is_windows:
+        return join_windows_command_line(parts)
+    return shlex.join(parts)
 
 
 class MCPConnectionCard(CollapsibleConfigCard):
@@ -655,15 +674,6 @@ class MCPConnectionCard(CollapsibleConfigCard):
 
     def _removed_message(self) -> MCPConnectionCard.Removed:
         return self.Removed(self)
-
-    @staticmethod
-    def _format_command_line(command: str, args: list[str]) -> str:
-        if not command:
-            return ""
-        parts = [command, *args]
-        if get_platform().is_windows:
-            return join_windows_command_line(parts)
-        return shlex.join(parts)
 
     @staticmethod
     def _split_command_line(
@@ -1054,7 +1064,7 @@ class MCPConnectionCard(CollapsibleConfigCard):
         command_line_text = (
             self._command_line_text
             if self._command_line_text is not None
-            else self._format_command_line(cfg.command, cfg.args)
+            else format_mcp_command_line(cfg.command, cfg.args)
         )
         command = EnhancedTextArea(
             command_line_text,
@@ -1704,10 +1714,16 @@ class MCPConfigPanel(VerticalScroll):
         height: auto;
         margin: 0 1 0 0;
     }
-    MCPConfigPanel #mcp-add-btn {
+    MCPConfigPanel #mcp-add-btn, MCPConfigPanel #mcp-import-btn {
         min-width: 10;
         height: 1;
         margin: 0;
+    }
+    MCPConfigPanel #mcp-import-btn {
+        margin: 0 0 0 2;
+    }
+    MCPConfigPanel .mcp-header-actions {
+        height: auto;
     }
     MCPConfigPanel .mcp-header-bar {
         height: auto;
@@ -1738,6 +1754,7 @@ class MCPConfigPanel(VerticalScroll):
             for index, server in enumerate(servers)
         ]
         self._read_only = read_only
+        self._workspace_cwd = workspace_cwd or None
         self._additional_reserved_tool_names = additional_reserved_tool_names
         self._testing: set[int] = set()
         self._adapter = MCPAdapter(
@@ -1765,10 +1782,14 @@ class MCPConfigPanel(VerticalScroll):
         with Vertical(classes="mcp-header-bar"), Vertical(classes="mcp-field"):
             yield Label(render_str(localizer, _SERVERS.bind()), classes="mcp-section-title")
             yield Label(render_str(localizer, _SERVERS_DESCRIPTION.bind()), classes="mcp-section-desc")
-            add_button = ConfigAddButton(render_str(localizer, _ADD.bind()), id="mcp-add-btn")
-            add_button.disabled = self._read_only
-            add_button.display = not self._read_only
-            yield add_button
+            with Horizontal(classes="mcp-header-actions"):
+                for button in (
+                    ConfigAddButton(render_str(localizer, _ADD.bind()), id="mcp-add-btn"),
+                    ConfigAddButton(render_str(localizer, _IMPORT.bind()), id="mcp-import-btn"),
+                ):
+                    button.disabled = self._read_only
+                    button.display = not self._read_only
+                    yield button
         yield Vertical(id="mcp-cards")
 
     async def on_mount(self) -> None:
@@ -1813,6 +1834,28 @@ class MCPConfigPanel(VerticalScroll):
         self._rows = self._snapshot_rows(preserve_blank_names=True)
         self._rows.insert(0, _MCPServerRow(new_config, collapsed=False))
         await self._rebuild_cards()
+
+    @on(Button.Pressed, "#mcp-import-btn")
+    def _on_import(self, _event: Button.Pressed) -> None:
+        if self._read_only or self._refuse_while_testing(_WAIT_BEFORE_IMPORTING):
+            return
+        from chrys.app.tui.screens.agents.import_mcp_dialog import ImportMcpServersDialog
+
+        existing = [row.config for row in self._snapshot_rows(preserve_blank_names=True)]
+        dialog = ImportMcpServersDialog(
+            workspace_cwd=self._workspace_cwd,
+            existing=existing,
+            locale_controller=widget_locale_controller(self),
+        )
+        self.app.push_screen(dialog, callback=self._import_selected)
+
+    async def _import_selected(self, configs: list[MCPServerConfig] | None) -> None:
+        if not configs or self._read_only or self._refuse_while_testing(_WAIT_BEFORE_IMPORTING):
+            return
+        self._rows = self._snapshot_rows(preserve_blank_names=True)
+        self._rows[0:0] = [_MCPServerRow(config, collapsed=False) for config in configs]
+        await self._rebuild_cards()
+        self.post_message(CardListChanged())
 
     def _refuse_while_testing(self, reason: MessageDef) -> bool:
         """Tell the user why the card list can't change yet; tests hold card indexes until they finish."""

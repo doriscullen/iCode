@@ -1,0 +1,163 @@
+ImportMcpServersDialog {
+    align: center middle;
+}
+
+/* Sized like the agent config window it opens over, a little smaller so that window still frames it. */
+#mcp-import-container {
+    width: 90%;
+    min-width: 60;
+    max-width: 110;
+    height: 80%;
+    max-height: 56;
+    border: round $tui-border-primary $border-opacity;
+    border-title-color: $primary;
+    border-title-style: bold;
+    background: $surface;
+    padding: 0;
+}
+
+#mcp-import-body {
+    height: 1fr;
+}
+
+/* Left sidebar, as in the agent config window */
+#mcp-import-sidebar {
+    width: 20;
+    height: 1fr;
+    border-right: solid $tui-border-foreground 15%;
+}
+
+#mcp-import-sources {
+    height: 1fr;
+    border: none;
+    padding: 0 0 0 1;
+    scrollbar-size: 1 1;
+    scrollbar-gutter: stable;
+}
+
+/* Right panel: the servers, with the buttons that act on them below */
+#mcp-import-right {
+    width: 1fr;
+    height: 1fr;
+}
+
+#mcp-import-servers {
+    height: 1fr;
+    padding: 1 1 0 2;
+    scrollbar-size-vertical: 1;
+}
+
+#mcp-import-buttons {
+    align: right top;
+}
+
+#mcp-import-servers .mcp-import-card {
+    padding: 0 1 1 1;
+    margin: 0 1 1 0;
+}
+
+#mcp-import-servers .mcp-import-card-header {
+    height: 1;
+}
+
+/* The checkbox, as Skills' "Workspace relative" one; its label is the server name */
+#mcp-import-servers .mcp-import-row {
+    width: auto;
+    max-width: 70%;
+    height: 1;
+    border: none;
+    background: transparent;
+    padding: 0;
+}
+
+#mcp-import-servers .mcp-import-row:focus {
+    background: $foreground 8%;
+}
+
+#mcp-import-servers .mcp-import-row > .toggle--button {
+    color: $foreground 35%;
+    background: $foreground 6%;
+}
+
+#mcp-import-servers .mcp-import-row.-on > .toggle--button {
+    color: $success;
+    background: $secondary 12%;
+}
+
+#mcp-import-servers .mcp-import-row > .toggle--label {
+    color: $secondary;
+    text-style: bold;
+}
+
+#mcp-import-servers .mcp-import-card-meta {
+    width: 1fr;
+    height: 1;
+    color: $text-muted;
+    text-align: right;
+}
+
+/* A card that can't be ticked: dashed and bare, its settings faded; the reason it can't be stays readable. */
+#mcp-import-servers .mcp-import-card.-unavailable {
+    border: dashed $tui-border-foreground 30%;
+    background: transparent;
+}
+
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-row,
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-card-meta,
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-label,
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-value {
+    text-opacity: 50%;
+}
+
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-row > .toggle--label {
+    color: $text-muted;
+}
+
+#mcp-import-servers .mcp-import-card-body {
+    height: auto;
+}
+
+#mcp-import-servers .mcp-import-field-label {
+    height: 1;
+    color: $text-muted;
+    margin: 1 0 0 0;
+}
+
+#mcp-import-servers .mcp-import-field-value {
+    height: auto;
+    padding: 0 0 0 2;
+}
+
+#mcp-import-servers .mcp-import-note,
+#mcp-import-servers .mcp-import-warning {
+    height: auto;
+    margin: 1 0 0 0;
+}
+
+/* Why a server can't be imported: yellow like the import's other notices; red is kept for files that can't be read. */
+#mcp-import-servers .mcp-import-note {
+    color: $warning;
+    text-style: italic;
+}
+
+#mcp-import-servers .mcp-import-warning {
+    color: $warning;
+}
+
+/* Said once above the cards: what importing a folder-only server changes. */
+#mcp-import-servers .mcp-import-notice {
+    height: auto;
+    color: $warning;
+    margin: 0 1 1 0;
+}
+
+#mcp-import-servers .mcp-import-error {
+    height: auto;
+    color: $error;
+    margin: 0 1 1 0;
+}
+
+#mcp-import-servers .mcp-import-message {
+    height: auto;
+    color: $text-muted;
+}

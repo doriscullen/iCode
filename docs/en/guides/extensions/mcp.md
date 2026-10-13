@@ -43,6 +43,38 @@ HTTP redirects must keep the request method and stay on the same origin (scheme,
 
 An STDIO connection starts the specified program on the local machine. If the startup command downloads or runs third-party packages or scripts, confirm that their sources are trustworthy and review the relevant content first.
 
+## Import servers from other agents
+
+If you already set up MCP servers in another agent, you can copy them into the current iCode agent instead of typing them again. Claude Code is supported.
+
+1. On the "MCP" tab, click "Import from other agents" next to "+ Add".
+2. The left side of the window lists the supported agents iCode found on this computer. Click one to see the MCP servers it has configured on the right. Each server is shown as a card with the settings it will bring: the command it runs or the URL it connects to, and its environment variables or headers with their values.
+3. Tick the servers you want (click the checkbox or the server name), then click "Import" at the bottom right. You can tick servers from more than one agent before you import.
+
+For Claude Code, iCode lists the servers Claude Code uses, labeled as Claude Code labels them:
+
+- "user": servers you added for all projects, kept in `~/.claude.json` (or the file of that name in the folder `CLAUDE_CONFIG_DIR` names).
+- "local": servers you added only for one folder, kept in the same file. If the working folder is inside a Git repository, these are the servers you added for the repository's top folder, which Claude Code uses in every folder of the repository. Otherwise they are the servers you added for the working folder itself.
+- "project": servers in the `.mcp.json` file of the working folder or of any folder above it. Tools that install a server "just for this project" put it there.
+
+A "local" or "project" card shows the folder Claude Code uses the server in, and a note at the top of the list reminds you that iCode uses imported servers in every project. iCode starts a STDIO server in the current working folder, so a server that works on the project it is started in keeps doing so in each project.
+
+Entries Claude Code itself doesn't load, such as a URL with no `type` or an incomplete command, are not listed.
+
+Imported servers appear as new, expanded cards at the top of the list. Their "Description" says which agent they came from, followed by any warnings from the import, so you can still read them after the import window closes. Delete those lines once you have dealt with them. Nothing is saved yet: check the cards, click "Test" if you like, then click "Save".
+
+What to know about imported servers:
+
+- Values are copied as they are, including tokens and passwords in environment variables and headers. iCode saves them in the agent file, which only your user account can read.
+- An environment variable reference such as `${GITHUB_TOKEN}` is changed to iCode's form, `{{GITHUB_TOKEN}}`. iCode has no default values: in `${HOST:-localhost}`, the default `localhost` is dropped, and a warning names the setting and the variable. The warning doesn't repeat the default, so a token used as one isn't copied into the description. Set the variable before starting iCode, or the connection fails.
+- Claude Code sets `CLAUDE_PROJECT_DIR` to the project folder for the STDIO servers it starts; iCode doesn't. A warning names each environment variable or header that references it: set the variable before starting iCode, or write the folder path instead.
+- Claude Code never sends a few of its own credential variables, such as `ANTHROPIC_API_KEY`, to a remote server, even when a header names them. iCode has no such rule and would send the real value, so a warning points out each header that references one of them. Remove the header, or copy the credential into a variable with another name.
+- The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
+- Settings iCode has no equivalent for are not imported, and a warning names them. For Claude Code these are the headers helper command (iCode never runs it) and OAuth sign-in (iCode only sends the headers you enter); add the headers yourself. Any other setting iCode doesn't recognize is listed too.
+- Some servers can't be imported: those using a connection type other than STDIO or HTTP (such as SSE or WebSocket), those whose URL or command uses an environment variable, because iCode reads those fields as written, and those with a brace right next to an environment variable in an environment variable or header value (such as `{${TOKEN}}`), which iCode can't write the same way. Their cards are greyed out with a dashed border and say why. The `streamable-http` type is read as HTTP.
+- A server that the current agent already has, with the same command and arguments or the same URL, is listed last, already ticked and locked, even if its name differs. If an imported server has the same name as another server, "Save" reports it; rename one of them.
+- The same server may be listed more than once, for example as both a "user" and a "project" server, or in two agents. Once you tick one, the others with the same command and arguments or the same URL are locked, and their cards say which one is ticked, so the server is imported only once. Untick it to choose another.
+
 ## Configure instructions, tools, and request options
 
 The following settings apply to both HTTP and STDIO servers.

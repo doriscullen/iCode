@@ -31,6 +31,8 @@ MCP_INITIALLY_VISIBLE_TOOLS = msg(
 )
 MCP_HEADERS = msg("tui.mcp.headers", fallback="Headers")
 MCP_ENVIRONMENT_VARIABLES = msg("tui.mcp.environment_variables", fallback="Environment Variables")
+MCP_COMMAND = msg("tui.mcp.command", fallback="Command")
+MCP_URL = msg("tui.mcp.url", fallback="URL")
 
 # Composition primitives. Arbitrary display values use DisplayBlock at bind sites.
 CONTEXT_ERROR = msg(

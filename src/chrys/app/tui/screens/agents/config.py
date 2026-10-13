@@ -874,6 +874,7 @@ class AgentsConfigScreen(BaseDialog[str]):
             "mem-add-folder",
             "sk-add-btn",
             "mcp-add-btn",
+            "mcp-import-btn",
             "acp-add-arg",
             "acp-add-env",
             "acp-add-option",
@@ -1105,8 +1106,8 @@ class AgentsConfigScreen(BaseDialog[str]):
 
     @staticmethod
     def _is_config_mutation_button(button_id: str) -> bool:
-        # Not "mcp-delete-btn-": that press opens a confirmation, and the panel
-        # posts CardListChanged once a confirmed delete lands.
+        # Not "mcp-delete-btn-" or "mcp-import-btn": those presses open a dialog, and
+        # the panel posts CardListChanged once a confirmed delete or import lands.
         if button_id in {
             "sa-add-btn",
             "mem-add-file",
