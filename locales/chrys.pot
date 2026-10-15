@@ -7412,8 +7412,8 @@ msgstr ""
 msgid "tui.mcp.http_options"
 msgstr ""
 
-#. English: Import from other agents
-#. chrys-meta={"fingerprint":"23f5adf2adcdbcbf6b6c15e58ecde62c9b1cf1f97ef0f6c0c497318c2dc93f39","multiline":false,"placeholders":[]}
+#. English: Import from other applications
+#. chrys-meta={"fingerprint":"a8f9aab7e243fb6f3e99ecf3da8d717eef67f2dd86e31fcd83c7fa57c899037d","multiline":false,"placeholders":[]}
 #: src/chrys/app/tui/screens/agents/panels/mcp.py
 msgid "tui.mcp.import"
 msgstr ""
@@ -7567,8 +7567,8 @@ msgstr ""
 msgid "tui.mcp.import.source_error.unreadable"
 msgstr ""
 
-#. English: Import MCP Servers from Other Agents
-#. chrys-meta={"fingerprint":"4f9966d55a478504b641bf7d1ebe38bf233ed61b1a4bc6d9ae8bdab69acdc7d9","multiline":false,"placeholders":[]}
+#. English: Import from Other Applications
+#. chrys-meta={"fingerprint":"6017c4642f760f6e3f1b8833427869a7757f06d18d9e57d87b7313f3c0d23f4b","multiline":false,"placeholders":[]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.title"
 msgstr ""

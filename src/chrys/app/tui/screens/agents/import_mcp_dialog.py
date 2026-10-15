@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_TITLE = msg("tui.mcp.import.title", fallback="Import MCP Servers from Other Agents")
+_TITLE = msg("tui.mcp.import.title", fallback="Import from Other Applications")
 _IMPORT = msg("tui.mcp.import.button.import", fallback="Import")
 _CANCEL = msg("tui.mcp.import.button.cancel", fallback="Cancel")
 _DETECTING = msg("tui.mcp.import.detecting", fallback="Looking for agents...")

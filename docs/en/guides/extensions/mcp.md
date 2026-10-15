@@ -43,11 +43,11 @@ HTTP redirects must keep the request method and stay on the same origin (scheme,
 
 An STDIO connection starts the specified program on the local machine. If the startup command downloads or runs third-party packages or scripts, confirm that their sources are trustworthy and review the relevant content first.
 
-## Import servers from other agents
+## Import servers from other applications
 
-If you already set up MCP servers in another agent, you can copy them into the current iCode agent instead of typing them again. Claude Code, Codex, opencode and pi are supported.
+If you already set up MCP servers in another application, you can copy them into the current iCode agent instead of typing them again. Claude Code, Codex, opencode and pi are supported.
 
-1. On the "MCP" tab, click "Import from other agents" next to "+ Add".
+1. On the "MCP" tab, click "Import from other applications" next to "+ Add".
 2. The left side of the window lists the supported agents iCode found on this computer. Click one to see the MCP servers it has configured on the right. Each server is shown as a card with the settings it will bring: the command it runs or the URL it connects to, and its environment variables or headers with their values.
 3. Tick the servers you want (click the checkbox or the server name), then click "Import" at the bottom right. You can tick servers from more than one agent before you import.
 

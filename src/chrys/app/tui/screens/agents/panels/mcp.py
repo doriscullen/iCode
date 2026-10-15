@@ -232,7 +232,7 @@ _COMMAND_PLACEHOLDER = msg(
 _HTTP_OPTIONS = msg("tui.mcp.http_options", fallback="HTTP Options")
 _STDIO_OPTIONS = msg("tui.mcp.stdio_options", fallback="STDIO Options")
 _ADD = msg("tui.mcp.add", fallback="+ Add")
-_IMPORT = msg("tui.mcp.import", fallback="Import from other agents")
+_IMPORT = msg("tui.mcp.import", fallback="Import from other applications")
 _SERVERS = msg("tui.mcp.servers", fallback="MCP Servers")
 _SERVERS_DESCRIPTION = msg(
     "tui.mcp.servers_description",
