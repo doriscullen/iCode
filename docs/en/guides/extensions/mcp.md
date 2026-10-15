@@ -45,7 +45,7 @@ An STDIO connection starts the specified program on the local machine. If the st
 
 ## Import servers from other agents
 
-If you already set up MCP servers in another agent, you can copy them into the current iCode agent instead of typing them again. Claude Code, opencode and pi are supported.
+If you already set up MCP servers in another agent, you can copy them into the current iCode agent instead of typing them again. Claude Code, Codex, opencode and pi are supported.
 
 1. On the "MCP" tab, click "Import from other agents" next to "+ Add".
 2. The left side of the window lists the supported agents iCode found on this computer. Click one to see the MCP servers it has configured on the right. Each server is shown as a card with the settings it will bring: the command it runs or the URL it connects to, and its environment variables or headers with their values.
@@ -82,6 +82,25 @@ Entries Claude Code itself doesn't load, such as a URL with no `type` or an inco
 - The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
 - The headers helper command and OAuth settings are not imported, with a warning; add the headers yourself. Any other setting iCode doesn't recognize is listed too.
 - SSE and WebSocket servers can't be imported: iCode supports only STDIO and HTTP servers. The `streamable-http` type is read as HTTP.
+
+### Codex
+
+The importer follows [Codex 0.162.1](https://github.com/openai/codex/tree/rust-v0.162.1), using its source code and tests as the reference.
+
+- "user": servers under `[mcp_servers]` in `~/.codex/config.toml`, or `config.toml` in the folder `CODEX_HOME` names. A relative `CODEX_HOME` is resolved from the working folder.
+- "project": `.codex/config.toml` from the project root down to the working folder, with the nearer file taking precedence. The root is the nearest folder containing a `project_root_markers` entry (default: `.git`); without one, only the working folder is searched. Tables merge by key, including environment variables and headers; arrays replace earlier arrays. A warning names the other files contributing to a server.
+
+Project trust is read from the user file's `[projects]` entries. A folder's own decision takes precedence over the project root's, then the Git root's. Project servers without a trusted decision are shown but can't be imported. They do not override user servers, and a project file cannot grant itself trust.
+
+Also:
+
+- `command` selects STDIO and `url` selects HTTP. Both together are invalid, including when they come from different merged files. Invalid server entries are not listed; unreadable or malformed TOML files show an error.
+- `env` and `http_headers` values remain literal. `env_vars`, `env_http_headers` and `bearer_token_env_var` become `{{VARIABLE}}` references; their current secret values are not copied. Explicit environment values override forwarded variables; environment headers override static headers, and bearer auth overrides an Authorization header. Codex can skip optional references when a variable is unavailable; iCode requires a nonempty value, so these references have a warning.
+- Disabled servers stay disabled. `tool_timeout_sec` becomes "MCP Request Timeout", rounded up to seconds, defaulting to 300 seconds in this Codex version. A zero timeout cannot be preserved and is reported as omitted. iCode also uses its request timeout for connection setup; Codex's separate startup timeout is not carried over.
+- `enabled_tools` becomes the allowed tools list, with `disabled_tools` removed. If there is only a deny list, the server is imported with **no tools**, with a warning: choose the allowed tools yourself under "Available Tool Scope".
+- A custom `cwd`, OAuth credentials and settings, ChatGPT/enterprise sign-in, header helper commands, approval rules and other settings without an iCode equivalent are not carried over. Warnings name the omitted settings. No helper commands are run. Remote execution environments and remote-sourced variables cannot be imported as local servers.
+
+The importer reads local user and project files only. It does not read system, managed or cloud settings, selected profile files, session overrides, plugin servers, stored credentials, or the main checkout's trust for linked Git worktrees. Explicit variables on Codex's non-inheritable list are omitted with a warning. iCode still uses its own subprocess environment inheritance rules.
 
 ### opencode
 

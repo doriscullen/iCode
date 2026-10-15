@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""The MCP tab imports servers configured in other agents (Claude Code, opencode, pi) as unsaved cards."""
+"""The MCP tab imports servers configured in other agents as unsaved cards."""
 
 from __future__ import annotations
 
@@ -541,7 +541,7 @@ async def test_dialog_says_when_no_supported_agent_is_installed(tmp_path: Path) 
             pilot=pilot,
             description="no-agents message",
         )
-        assert "Supported: Claude Code, opencode, pi." in _pane_text(dialog)
+        assert "Supported: Claude Code, Codex, opencode, pi." in _pane_text(dialog)
         assert dialog.query_one("#mcp-import-sidebar").display is False
 
 
@@ -1000,3 +1000,46 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 f"Searches the docs\nImported from pi. There it is a project server, used only in {workspace}.",
             ),
         ]
+
+
+async def test_codex_servers_are_detected_previewed_and_imported(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    path = home / ".codex/config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '[mcp_servers.files]\ncommand = "server-files"\nenv_vars = ["TOKEN"]\n'
+        'enabled = false\ntool_timeout_sec = 42\nenabled_tools = ["read", "write"]\ndisabled_tools = ["write"]\n'
+        '[mcp_servers.remote]\ncommand = "server-remote"\nenvironment_id = "remote"\n',
+        encoding="utf-8",
+    )
+    results: list[list[MCPServerConfig] | None] = []
+    app = _PanelApp(MCPConfigPanel([]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = ImportMcpServersDialog(
+            workspace_cwd=str(workspace),
+            existing=[],
+            locale_controller=app.locale_controller,
+            context=ImportContext(str(workspace), home, _quiet_environ(tmp_path)),
+        )
+        app.push_screen(dialog, callback=results.append)
+        files, remote = await _wait_for_rows(dialog, pilot, 2)
+        sources = dialog.query_one("#mcp-import-sources", OptionList)
+        assert [str(sources.get_option_at_index(i).prompt) for i in range(sources.option_count)] == ["Codex"]
+        assert remote.disabled is True
+        assert "TOKEN = {{TOKEN}}" in str(_cards_in(dialog))
+        files.value = True
+        await _import_ticked(dialog, pilot)
+        await wait_for(lambda: results, pilot=pilot, description="Codex server imported")
+        (imported,) = results
+        assert imported is not None and len(imported) == 1
+        (server,) = imported
+        assert server.name == "files"
+        assert server.command == "server-files"
+        assert server.env == {"TOKEN": "{{TOKEN}}"}
+        assert server.enabled is False
+        assert server.request_timeout == 42
+        assert server.allowed_tools == ["read"]
+        assert server.description.startswith("Imported from Codex.")
+        assert "requires a nonempty value" in server.description

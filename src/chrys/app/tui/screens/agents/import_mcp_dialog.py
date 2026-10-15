@@ -143,6 +143,10 @@ _UNTRUSTED_PROJECT = msg(
     "tui.mcp.import.unsupported.untrusted_project",
     fallback="Can't import: {agent} doesn't trust this folder, so it doesn't run this server.",
 )
+_REMOTE_ENVIRONMENT = msg(
+    "tui.mcp.import.unsupported.remote_environment",
+    fallback="Can't import: this server uses a remote execution environment, which {app} can't reproduce.",
+)
 _COVERED = msg(
     "tui.mcp.import.covered",
     fallback="Same server as {name} ({agent}, {scope}), which is ticked. It is imported once.",
@@ -242,6 +246,20 @@ _VARIABLE_UNSET = msg(
         "but {app} fails to connect. Set {variable} before starting {app}."
     ),
 )
+_OPTIONAL_VARIABLE = msg(
+    "tui.mcp.import.warning.optional_variable",
+    fallback=(
+        "{field} references {variable}. {agent} can skip this reference when the variable is unavailable; "
+        "{app} requires a nonempty value. Set {variable} before starting {app}, or remove this setting."
+    ),
+)
+_DENY_LIST = msg(
+    "tui.mcp.import.warning.deny_list",
+    fallback=(
+        "{agent} blocks these tools: {tools}. {app} needs a list of allowed tools instead, so this server is "
+        "imported with no tools. Select the tools you want under Available Tool Scope."
+    ),
+)
 _UNKNOWN_FIELDS_IGNORED = msg(
     "tui.mcp.import.warning.unknown_fields_ignored",
     fallback="Not imported, {app} has no matching setting: {fields}.",
@@ -249,6 +267,7 @@ _UNKNOWN_FIELDS_IGNORED = msg(
 _UNREADABLE = msg("tui.mcp.import.source_error.unreadable", fallback="Couldn't read {path}.")
 _TOO_LARGE = msg("tui.mcp.import.source_error.too_large", fallback="{path} is too large to read.")
 _INVALID_JSON = msg("tui.mcp.import.source_error.invalid_json", fallback="{path} is not valid JSON.")
+_INVALID_TOML = msg("tui.mcp.import.source_error.invalid_toml", fallback="{path} is not valid TOML.")
 _NOT_AN_OBJECT = msg(
     "tui.mcp.import.source_error.not_an_object",
     fallback="{path} does not contain a settings object.",
@@ -256,6 +275,7 @@ _NOT_AN_OBJECT = msg(
 
 _SCOPE_LABELS = {"user": _SCOPE_USER, "local": _SCOPE_LOCAL, "project": _SCOPE_PROJECT, "global": _SCOPE_GLOBAL}
 _UNSUPPORTED_REASONS = {
+    UnsupportedReason.REMOTE_ENVIRONMENT: _REMOTE_ENVIRONMENT,
     UnsupportedReason.UNSUPPORTED_TRANSPORT: _UNSUPPORTED_TRANSPORT,
     UnsupportedReason.TEMPLATE_IN_URL: _TEMPLATE_IN_URL,
     UnsupportedReason.TEMPLATE_IN_COMMAND: _TEMPLATE_IN_COMMAND,
@@ -269,6 +289,7 @@ _INVALID_CONFIG = msg(
     fallback="{path} has settings {agent} rejects, so its servers are not listed.",
 )
 _SOURCE_ERRORS = {
+    SourceErrorKind.INVALID_TOML: _INVALID_TOML,
     SourceErrorKind.UNREADABLE: _UNREADABLE,
     SourceErrorKind.TOO_LARGE: _TOO_LARGE,
     SourceErrorKind.INVALID_JSON: _INVALID_JSON,
@@ -797,6 +818,10 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 reference = _CODEMODE_OFF.bind(agent=agent, app=APP_DISPLAY_NAME)
             case ImportWarningKind.VARIABLE_UNSET:
                 reference = _VARIABLE_UNSET.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.OPTIONAL_VARIABLE:
+                reference = _OPTIONAL_VARIABLE.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.DENY_LIST:
+                reference = _DENY_LIST.bind(agent=agent, tools=original, app=APP_DISPLAY_NAME)
         return self._render_message(reference)
 
     def _description(self, agent: str, candidate: McpImportCandidate) -> MessageRef:

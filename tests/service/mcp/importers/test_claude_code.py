@@ -58,7 +58,7 @@ def _by_name(candidates: tuple[McpImportCandidate, ...]) -> dict[str, McpImportC
 
 
 def test_every_importer_is_registered_in_display_order() -> None:
-    assert [source.source_id for source in IMPORT_SOURCES] == ["claude_code", "opencode", "pi"]
+    assert [source.source_id for source in IMPORT_SOURCES] == ["claude_code", "codex", "opencode", "pi"]
 
 
 def test_detect_needs_a_claude_config_or_project_file(home: Path, tmp_path: Path) -> None:

@@ -46,6 +46,7 @@ class UnsupportedReason(StrEnum):
     VALUE_FROM_COMMAND = "value_from_command"
     VARIABLE_NAME = "variable_name"
     UNTRUSTED_PROJECT = "untrusted_project"
+    REMOTE_ENVIRONMENT = "remote_environment"
 
 
 class ImportWarningKind(StrEnum):
@@ -65,6 +66,8 @@ class ImportWarningKind(StrEnum):
     TOOLS_LIMITED = "tools_limited"
     CODEMODE_OFF = "codemode_off"
     VARIABLE_UNSET = "variable_unset"
+    OPTIONAL_VARIABLE = "optional_variable"
+    DENY_LIST = "deny_list"
 
 
 class SourceErrorKind(StrEnum):
@@ -73,6 +76,7 @@ class SourceErrorKind(StrEnum):
     UNREADABLE = "unreadable"
     TOO_LARGE = "too_large"
     INVALID_JSON = "invalid_json"
+    INVALID_TOML = "invalid_toml"
     NOT_AN_OBJECT = "not_an_object"
     INVALID_CONFIG = "invalid_config"
 

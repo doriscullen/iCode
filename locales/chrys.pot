@@ -7543,6 +7543,12 @@ msgstr ""
 msgid "tui.mcp.import.source_error.invalid_json"
 msgstr ""
 
+#. English: {path} is not valid TOML.
+#. chrys-meta={"fingerprint":"22f7873499bff3b7d43afd147425701efbf02d07c4e51c4262ae7cb2d2732ce8","multiline":false,"placeholders":["path"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.source_error.invalid_toml"
+msgstr ""
+
 #. English: {path} does not contain a settings object.
 #. chrys-meta={"fingerprint":"65e1399ec73942b810e9cf7ad46d9117a9f681af02f71bbd0ce8a9bbb1c12f91","multiline":false,"placeholders":["path"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
@@ -7572,6 +7578,13 @@ msgstr ""
 #. chrys-meta={"fingerprint":"44ef0a21e3ab9998539632c652bc7e62376943848dc319706048e5107021b51c","multiline":false,"placeholders":["app"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.unsupported.file_reference"
+msgstr ""
+
+#. English: Can't import: this server uses a remote execution environment,
+#. which {app} can't reproduce.
+#. chrys-meta={"fingerprint":"74e52a394646c729717e027f8bdcbfe1c0f51bfd9551aa640ed6a338f8561d90","multiline":false,"placeholders":["app"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.unsupported.remote_environment"
 msgstr ""
 
 #. English: Can't import: the command uses an environment variable, which {app}
@@ -7669,6 +7682,14 @@ msgstr ""
 msgid "tui.mcp.import.warning.default_dropped"
 msgstr ""
 
+#. English: {agent} blocks these tools: {tools}. {app} needs a list of allowed
+#. tools instead, so this server is imported with no tools. Select the tools
+#. you want under Available Tool Scope.
+#. chrys-meta={"fingerprint":"0973a4cdfc2d672ba8d75abe62f0c1c6b34eae9edb25c772569a5d987193d42b","multiline":false,"placeholders":["agent","app","tools"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.deny_list"
+msgstr ""
+
 #. English: {agent} has this server turned off, so it is imported turned off.
 #. Tick {enabled} in its card to use it.
 #. chrys-meta={"fingerprint":"33c9d005c3ae2f60a99379b8bf44846c57a0c34ba1474651b0d3113685b667dc","multiline":false,"placeholders":["agent","enabled"]}
@@ -7704,6 +7725,14 @@ msgstr ""
 #. chrys-meta={"fingerprint":"9a21d543e55ef64e67ab8080ffa3d4f31ee6c9fbd001741d550bd80526550e32","multiline":false,"placeholders":["app"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.oauth_ignored"
+msgstr ""
+
+#. English: {field} references {variable}. {agent} can skip this reference when
+#. the variable is unavailable; {app} requires a nonempty value. Set {variable}
+#. before starting {app}, or remove this setting.
+#. chrys-meta={"fingerprint":"27aaad9b3e62ff245c8294f9ad2c46782ead11bc804895660e922ee60d76222d","multiline":false,"placeholders":["agent","app","field","variable"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.optional_variable"
 msgstr ""
 
 #. English: Not imported, {app} can't apply {agent}'s settings for single
