@@ -22,7 +22,7 @@ from chrys.foundation.platform.files import secure_open_regular_binary
 from chrys.foundation.text.encoding import decode_bytes
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -42,6 +42,10 @@ class UnsupportedReason(StrEnum):
     TEMPLATE_IN_URL = "template_in_url"
     TEMPLATE_IN_COMMAND = "template_in_command"
     TEMPLATE_NEXT_TO_BRACE = "template_next_to_brace"
+    FILE_REFERENCE = "file_reference"
+    VALUE_FROM_COMMAND = "value_from_command"
+    VARIABLE_NAME = "variable_name"
+    UNTRUSTED_PROJECT = "untrusted_project"
 
 
 class ImportWarningKind(StrEnum):
@@ -53,6 +57,14 @@ class ImportWarningKind(StrEnum):
     CREDENTIAL_VARIABLE = "credential_variable"
     CLAUDE_PROJECT_DIR = "claude_project_dir"
     UNKNOWN_FIELDS_IGNORED = "unknown_fields_ignored"
+    DISABLED = "disabled"
+    CWD_IGNORED = "cwd_ignored"
+    MERGED = "merged"
+    AUTH_PROVIDER_IGNORED = "auth_provider_ignored"
+    TOOL_RULES_IGNORED = "tool_rules_ignored"
+    TOOLS_LIMITED = "tools_limited"
+    CODEMODE_OFF = "codemode_off"
+    VARIABLE_UNSET = "variable_unset"
 
 
 class SourceErrorKind(StrEnum):
@@ -62,6 +74,7 @@ class SourceErrorKind(StrEnum):
     TOO_LARGE = "too_large"
     INVALID_JSON = "invalid_json"
     NOT_AN_OBJECT = "not_an_object"
+    INVALID_CONFIG = "invalid_config"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +83,15 @@ class ImportWarning:
 
     The UI saves warnings in the imported server's description, and an env or
     header value may hold a secret. ``variable`` names the placeholder whose
-    default was dropped, the credential variable a header references, or the
-    variable the source sets for its servers that iCode doesn't; ``original``
-    is the helper command that was not imported, or the comma-separated names
-    of the fields that were not imported.
+    default was dropped or that is unset, the credential variable a header
+    references, or the variable the source sets for its servers that iCode
+    doesn't. ``field`` names the env or header setting; for ``MERGED`` it lists
+    the env and header names that came from another file than the command or
+    URL, and for ``TOOLS_LIMITED`` the source setting that hides the tools.
+    ``original`` is the helper command that was not imported, the
+    comma-separated names of the fields, files or tool rules not imported,
+    the working folder or sign-in provider that was dropped, or the tools
+    still offered.
     """
 
     kind: ImportWarningKind
@@ -95,7 +113,9 @@ class McpImportCandidate:
     Entries the agent itself skips are not candidates. ``config`` is set
     exactly when the server can be imported; otherwise ``unsupported`` says why
     not, and ``entry`` keeps the server's settings as the source wrote them so
-    the UI can show them.
+    the UI can show them, in the keys ``command`` (the program), ``args``,
+    ``env``, ``url`` and ``headers``. A ``config.description`` set here is the
+    source's own description of the server.
     ``transport`` is the connection type the source declares, or infers when it
     declares none, for importable and unsupported servers alike; empty when
     the entry names none the importer can read. ``scope_path`` is the folder
@@ -159,10 +179,10 @@ class SourceReadError(Exception):
         self.kind = kind
 
 
-def read_json_object(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> dict[str, Any] | None:
-    """Read a JSON object from *path*; ``None`` when the file does not exist.
+def read_source_bytes(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> bytes | None:
+    """The bytes of *path*; ``None`` when the file does not exist.
 
-    Raises :class:`SourceReadError` when the file exists but can't be used.
+    Raises :class:`SourceReadError` when the file exists but can't be read.
     A link is followed, as the agent that owns the file follows it (dotfile
     managers link these files); a dangling link counts as no file.
     """
@@ -176,13 +196,47 @@ def read_json_object(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> dict[s
         raise SourceReadError(SourceErrorKind.UNREADABLE) from exc
     if len(raw) > max_bytes:
         raise SourceReadError(SourceErrorKind.TOO_LARGE)
+    return raw
+
+
+def decode_source(raw: bytes) -> str:
+    """*raw* as text; a file that isn't text can't be a config file."""
     try:
-        document = json.loads(decode_bytes(raw, errors="strict"))
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        return decode_bytes(raw, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SourceReadError(SourceErrorKind.INVALID_JSON) from exc
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    """The JSON object *text* holds; raises :class:`SourceReadError` otherwise."""
+    try:
+        document = json.loads(text)
+    except (ValueError, RecursionError) as exc:
         raise SourceReadError(SourceErrorKind.INVALID_JSON) from exc
     if not isinstance(document, dict):
         raise SourceReadError(SourceErrorKind.NOT_AN_OBJECT)
     return document
+
+
+def read_json_object(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> dict[str, Any] | None:
+    """Read a JSON object from *path*; ``None`` when the file does not exist.
+
+    Raises :class:`SourceReadError` when the file exists but can't be used.
+    """
+    raw = read_source_bytes(path, max_bytes=max_bytes)
+    return None if raw is None else parse_json_object(decode_source(raw))
+
+
+def git_root(path: str) -> str | None:
+    """The nearest folder at or above *path* holding ``.git``: a directory, or a file in a worktree or submodule."""
+    try:
+        folder = Path(os.path.realpath(path))
+    except OSError, ValueError:
+        return None
+    for candidate in (folder, *folder.parents):
+        if os.path.lexists(candidate / ".git"):
+            return str(candidate)
+    return None
 
 
 def has_dollar_template(value: str) -> bool:
@@ -195,19 +249,8 @@ def dollar_template_variables(value: str) -> list[str]:
 
 
 def dollar_templates_convertible(value: str) -> bool:
-    """Whether :func:`convert_dollar_templates` writes *value* so iCode reads it back as the source meant.
-
-    iCode escapes braces only in pairs: one ``{`` left from an odd run right
-    before a placeholder joins its ``{{``, and a ``}}`` right after one is read
-    together with its ``}}``. Neither can be written another way.
-    """
-    position = 0
-    for match in _DOLLAR_TEMPLATE_RE.finditer(value):
-        before = value[position : match.start()]
-        if (len(before) - len(before.rstrip("{"))) % 2 or value.startswith("}}", match.end()):
-            return False
-        position = match.end()
-    return True
+    """Whether :func:`convert_dollar_templates` writes *value* so iCode reads it back as the source meant."""
+    return templates_convertible(_dollar_parts(value)[0])
 
 
 def convert_dollar_templates(value: str) -> tuple[str, tuple[ImportWarning, ...]]:
@@ -217,18 +260,74 @@ def convert_dollar_templates(value: str) -> tuple[str, tuple[ImportWarning, ...]
     has no default syntax: ``${VAR:-default}`` becomes ``{{VAR}}`` with a
     warning naming the variable.
     """
-    parts: list[str] = []
+    parts, warnings = _dollar_parts(value)
+    return render_template(parts), warnings
+
+
+def _dollar_parts(value: str) -> tuple[list[TemplatePart], tuple[ImportWarning, ...]]:
+    parts: list[TemplatePart] = []
     warnings: list[ImportWarning] = []
     position = 0
     for match in _DOLLAR_TEMPLATE_RE.finditer(value):
-        parts.append(_escape_braces(value[position : match.start()]))
+        parts.append(value[position : match.start()])
         variable = match.group(1)
-        parts.append("{{" + variable + "}}")
+        parts.append(TemplateVariable(variable))
         if match.group(2) is not None:
             warnings.append(ImportWarning(ImportWarningKind.DEFAULT_DROPPED, variable))
         position = match.end()
-    parts.append(_escape_braces(value[position:]))
-    return "".join(parts), tuple(warnings)
+    parts.append(value[position:])
+    return parts, tuple(warnings)
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateVariable:
+    """A reference to an environment variable in a source value, written ``{{name}}`` for iCode."""
+
+    name: str
+
+
+type TemplatePart = str | TemplateVariable
+
+
+def templates_convertible(parts: Sequence[TemplatePart]) -> bool:
+    """Whether :func:`render_template` writes *parts* so iCode reads them back as the source meant.
+
+    iCode escapes braces only in pairs: one ``{`` left from an odd run right
+    before a placeholder joins its ``{{``, and a ``}}`` right after one is read
+    together with its ``}}``. Neither can be written another way.
+    """
+    merged = _merge_literals(parts)
+    for index, part in enumerate(merged):
+        if not isinstance(part, TemplateVariable):
+            continue
+        before = _literal_at(merged, index - 1)
+        after = _literal_at(merged, index + 1)
+        if (len(before) - len(before.rstrip("{"))) % 2 or after.startswith("}}"):
+            return False
+    return True
+
+
+def render_template(parts: Sequence[TemplatePart]) -> str:
+    """*parts* as an iCode value: variables as ``{{NAME}}``, literal ``{{``/``}}`` escaped."""
+    return "".join(
+        "{{" + part.name + "}}" if isinstance(part, TemplateVariable) else _escape_braces(part)
+        for part in _merge_literals(parts)
+    )
+
+
+def _literal_at(parts: Sequence[TemplatePart], index: int) -> str:
+    part = parts[index] if 0 <= index < len(parts) else ""
+    return part if isinstance(part, str) else ""
+
+
+def _merge_literals(parts: Sequence[TemplatePart]) -> list[TemplatePart]:
+    merged: list[TemplatePart] = []
+    for part in parts:
+        if isinstance(part, str) and merged and isinstance(merged[-1], str):
+            merged[-1] += part
+        elif part != "":
+            merged.append(part)
+    return merged
 
 
 def _escape_braces(text: str) -> str:

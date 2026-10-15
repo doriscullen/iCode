@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""The MCP tab imports servers configured in other agents (Claude Code, …) as unsaved cards."""
+"""The MCP tab imports servers configured in other agents (Claude Code, opencode, pi) as unsaved cards."""
 
 from __future__ import annotations
 
@@ -24,13 +24,24 @@ from chrys.app.tui.screens.agents.import_mcp_dialog import (
     _UNSUPPORTED_TRANSPORT,
     ImportMcpServersDialog,
     _ImportCard,
+    _source_error,
     is_already_added,
 )
 from chrys.app.tui.screens.agents.panels.mcp import MCPConfigPanel, MCPConnectionCard, format_mcp_command_line
 from chrys.app.tui.widgets import Checkbox
 from chrys.foundation.config.settings import Settings
 from chrys.foundation.i18n import Localizer
-from chrys.service.mcp.importers import ImportContext, McpImportCandidate, McpImportResult
+from chrys.foundation.i18n.formatting import format_message
+from chrys.service.mcp.importers import (
+    ImportContext,
+    ImportWarning,
+    ImportWarningKind,
+    McpImportCandidate,
+    McpImportResult,
+    McpSourceError,
+    SourceErrorKind,
+    UnsupportedReason,
+)
 from chrys.service.profiles.agents.schema import MCPServerConfig, ToolsConfig
 from tests.app.tui.screens._agent_config_support import (
     _DEFAULT_WAIT_TIMEOUT,
@@ -70,14 +81,28 @@ class _PanelApp(App):
         self.notifications.append(message)
 
 
+def _quiet_environ(tmp_path: Path) -> dict[str, str]:
+    """An environment in which no agent's config outside *tmp_path* is found, system-wide ones included."""
+    return {
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "OPENCODE_TEST_MANAGED_CONFIG_DIR": str(tmp_path / "opencode-managed"),
+        # Otherwise opencode's project search goes up past tmp_path, to the real home folder on Windows.
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+    }
+
+
 @pytest.fixture
 def claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point Claude Code's config dir (and home) at an empty temp dir."""
+    """Point every agent's config dir (and home) at an empty temp dir."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    for name, value in _quiet_environ(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "PI_CODING_AGENT_DIR"):
+        monkeypatch.setenv(name, "")
     return home
 
 
@@ -279,7 +304,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
             workspace_cwd=str(workspace),
             existing=[],
             locale_controller=app.locale_controller,
-            context=ImportContext(workspace_cwd=str(workspace), home=home),
+            context=ImportContext(workspace_cwd=str(workspace), home=home, environ=_quiet_environ(tmp_path)),
         )
         app.push_screen(dialog, callback=results.append)
         here, here_too, codegraph, everywhere = await _wait_for_rows(dialog, pilot, 4)
@@ -507,7 +532,7 @@ async def test_dialog_says_when_no_supported_agent_is_installed(tmp_path: Path) 
             workspace_cwd=None,
             existing=[],
             locale_controller=app.locale_controller,
-            context=ImportContext(workspace_cwd=None, home=tmp_path),
+            context=ImportContext(workspace_cwd=None, home=tmp_path, environ=_quiet_environ(tmp_path)),
         )
         app.push_screen(dialog)
 
@@ -516,7 +541,7 @@ async def test_dialog_says_when_no_supported_agent_is_installed(tmp_path: Path) 
             pilot=pilot,
             description="no-agents message",
         )
-        assert "Claude Code" in _pane_text(dialog)
+        assert "Supported: Claude Code, opencode, pi." in _pane_text(dialog)
         assert dialog.query_one("#mcp-import-sidebar").display is False
 
 
@@ -530,7 +555,7 @@ async def test_a_message_in_place_of_servers_follows_a_locale_switch(tmp_path: P
             existing=[],
             locale_controller=app.locale_controller,
             sources=[],
-            context=ImportContext(workspace_cwd=None, home=tmp_path),
+            context=ImportContext(workspace_cwd=None, home=tmp_path, environ=_quiet_environ(tmp_path)),
         )
         app.push_screen(dialog)
         english = Localizer("en").render(_NO_AGENTS.bind(agents=""))
@@ -584,7 +609,7 @@ async def test_ticks_survive_switching_agents_and_import_collects_every_agent(tm
             existing=[],
             locale_controller=app.locale_controller,
             sources=[first, second],
-            context=ImportContext(workspace_cwd=None, home=tmp_path),
+            context=ImportContext(workspace_cwd=None, home=tmp_path, environ=_quiet_environ(tmp_path)),
         )
         app.push_screen(dialog, callback=results.append)
         await wait_for(lambda: dialog.is_mounted, pilot=pilot, description="import dialog is open")
@@ -647,7 +672,7 @@ def _new_dialog(app: _PanelApp, sources: list[Any], tmp_path: Path) -> ImportMcp
         existing=[],
         locale_controller=app.locale_controller,
         sources=sources,
-        context=ImportContext(workspace_cwd=None, home=tmp_path),
+        context=ImportContext(workspace_cwd=None, home=tmp_path, environ=_quiet_environ(tmp_path)),
     )
 
 
@@ -860,3 +885,118 @@ async def test_imported_servers_mark_the_draft_dirty_and_duplicate_names_fail_sa
         await wait_for(lambda: errors, pilot=pilot, description="Save reports the duplicate server name")
         assert "shared" in errors[0]
         assert registry.get("mcp-agent").tools.mcp == [_stdio("shared")]
+
+
+@pytest.mark.parametrize(
+    "warning",
+    [ImportWarning(kind, "VAR", field="FIELD", original="ORIGINAL") for kind in ImportWarningKind]
+    + [ImportWarning(ImportWarningKind.MERGED, original="/a.json"), ImportWarning(ImportWarningKind.TOOLS_LIMITED)],
+    ids=lambda warning: f"{warning.kind.value}-{bool(warning.field)}-{bool(warning.original)}",
+)
+def test_every_import_warning_has_a_message(warning: ImportWarning) -> None:
+    dialog = ImportMcpServersDialog(workspace_cwd=None, existing=[], locale_controller=None, sources=[])
+
+    text = dialog._warning_text(warning, "opencode")
+
+    assert text and "{" not in text.replace("{{VAR}}", "")
+
+
+@pytest.mark.parametrize("reason", list(UnsupportedReason))
+def test_every_unsupported_reason_has_a_message(reason: UnsupportedReason) -> None:
+    dialog = ImportMcpServersDialog(workspace_cwd=None, existing=[], locale_controller=None, sources=[])
+    candidate = McpImportCandidate("s", "project", "/p", None, unsupported=reason)
+
+    text = dialog._unsupported_note(candidate, "pi")
+
+    assert text and text.startswith("Can't import:") and "{" not in text
+
+
+@pytest.mark.parametrize("kind", list(SourceErrorKind))
+def test_every_source_error_has_a_message(kind: SourceErrorKind) -> None:
+    text = format_message(_source_error(McpSourceError("/x/opencode.json", kind), "opencode"))
+
+    assert "/x/opencode.json" in text and "{" not in text
+
+
+async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_bring(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    opencode_config = home / ".config" / "opencode" / "opencode.jsonc"
+    opencode_config.parent.mkdir(parents=True)
+    opencode_config.write_text(
+        """{
+  // opencode allows comments
+  "mcp": {
+    "files": {"type": "local", "command": ["npx", "server-files"], "environment": {"T": "{env:FILES_TOKEN}"},
+              "enabled": false},
+  },
+}""",
+        encoding="utf-8",
+    )
+    pi_project = workspace / ".pi" / "mcp.json"
+    pi_project.parent.mkdir(parents=True)
+    pi_project.write_text(
+        json.dumps({"mcpServers": {"docs": {"url": "https://docs.test/mcp", "description": "Searches the docs"}}}),
+        encoding="utf-8",
+    )
+    environ = {**_quiet_environ(tmp_path), "XDG_CONFIG_HOME": str(home / ".config"), "FILES_TOKEN": "t"}
+    results: list[list[MCPServerConfig] | None] = []
+    app = _PanelApp(MCPConfigPanel([]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = ImportMcpServersDialog(
+            workspace_cwd=str(workspace),
+            existing=[],
+            locale_controller=app.locale_controller,
+            context=ImportContext(workspace_cwd=str(workspace), home=home, environ=environ),
+        )
+        app.push_screen(dialog, callback=results.append)
+        (files,) = await _wait_for_rows(dialog, pilot, 1)
+        sources = dialog.query_one("#mcp-import-sources", OptionList)
+        assert [str(sources.get_option_at_index(i).prompt) for i in range(sources.option_count)] == ["opencode", "pi"]
+        disabled = (
+            "opencode has this server turned off, so it is imported turned off. Tick Enabled in its card to use it."
+        )
+        assert _cards_in(dialog) == [
+            (
+                "files · global · STDIO",
+                [
+                    ("Command", format_mcp_command_line("npx", ["server-files"])),
+                    ("Environment Variables", "T = {{FILES_TOKEN}}"),
+                ],
+                True,
+            )
+        ]
+        assert [str(widget.render()) for widget in dialog.query(".mcp-import-warning")] == [disabled]
+        files.value = True
+
+        sources.highlighted = 1
+        await wait_for(
+            lambda: [title for title, _fields, _tickable in _cards_in(dialog)] == ["docs · project · HTTP"],
+            pilot=pilot,
+            description="pi's servers are shown",
+        )
+        (notice,) = dialog.query(".mcp-import-notice")
+        assert str(notice.render()) == (
+            "pi uses the servers marked project only in the folder their card names. "
+            "Once imported, iCode uses them in every project."
+        )
+        (docs,) = await _wait_for_rows(dialog, pilot, 1)
+        docs.value = True
+        await _import_ticked(dialog, pilot)
+
+        await wait_for(lambda: results, pilot=pilot, description="dialog dismissed with the ticked servers")
+        (imported,) = results
+        assert imported is not None
+        assert [(config.name, config.enabled, config.description) for config in imported] == [
+            (
+                "files",
+                False,
+                f"Imported from opencode. There it is a global server, used in every project.\n- {disabled}",
+            ),
+            (
+                "docs",
+                True,
+                f"Searches the docs\nImported from pi. There it is a project server, used only in {workspace}.",
+            ),
+        ]

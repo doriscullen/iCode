@@ -45,35 +45,81 @@ An STDIO connection starts the specified program on the local machine. If the st
 
 ## Import servers from other agents
 
-If you already set up MCP servers in another agent, you can copy them into the current iCode agent instead of typing them again. Claude Code is supported.
+If you already set up MCP servers in another agent, you can copy them into the current iCode agent instead of typing them again. Claude Code, opencode and pi are supported.
 
 1. On the "MCP" tab, click "Import from other agents" next to "+ Add".
 2. The left side of the window lists the supported agents iCode found on this computer. Click one to see the MCP servers it has configured on the right. Each server is shown as a card with the settings it will bring: the command it runs or the URL it connects to, and its environment variables or headers with their values.
 3. Tick the servers you want (click the checkbox or the server name), then click "Import" at the bottom right. You can tick servers from more than one agent before you import.
 
-For Claude Code, iCode lists the servers Claude Code uses, labeled as Claude Code labels them:
+Each card is labeled with where the agent keeps the server, such as "user" or "project". A server the agent uses only in one folder shows that folder on its card, and a note at the top of the list reminds you that iCode uses imported servers in every project. iCode starts a STDIO server in the current working folder, so a server that works on the project it is started in keeps doing so in each project.
+
+Imported servers appear as new, expanded cards at the top of the list. Their "Description" says which agent they came from, followed by any warnings from the import, so you can still read them after the import window closes. Delete those lines once you have dealt with them. Nothing is saved yet: check the cards, click "Test" if you like, then click "Save".
+
+What to know about imported servers, whichever agent they come from:
+
+- Values are copied as they are, including tokens and passwords in environment variables and headers. iCode saves them in the agent file, which only your user account can read.
+- Environment variable references are changed to iCode's form, `{{NAME}}`. Set each variable before starting iCode: iCode fails the connection when one is not set.
+- iCode never signs in to a server with OAuth: it only sends the headers you enter. If the other agent signed in to a server for you, add an `Authorization` header yourself.
+- Settings iCode has no equivalent for are not imported, and a warning names them, such as a working folder for the server (iCode always starts it in the current working folder).
+- Some servers can't be imported, for example those whose URL or command uses an environment variable, because iCode reads those fields as written, and those with a brace right next to an environment variable in an environment variable or header value (such as `{${TOKEN}}`), which iCode can't write the same way. Their cards are greyed out with a dashed border and say why.
+- A server that the current agent already has, with the same command and arguments or the same URL, is listed last, already ticked and locked, even if its name differs. If an imported server has the same name as another server, "Save" reports it; rename one of them.
+- The same server may be listed more than once, for example as both a "user" and a "project" server, or in two agents. Once you tick one, the others with the same command and arguments or the same URL are locked, and their cards say which one is ticked, so the server is imported only once. Untick it to choose another.
+- If a configuration file can't be read, or the agent itself would reject its MCP settings, a message at the top of the list names the file, and its servers are not listed.
+
+### Claude Code
+
+iCode lists the servers Claude Code uses, labeled as Claude Code labels them:
 
 - "user": servers you added for all projects, kept in `~/.claude.json` (or the file of that name in the folder `CLAUDE_CONFIG_DIR` names).
 - "local": servers you added only for one folder, kept in the same file. If the working folder is inside a Git repository, these are the servers you added for the repository's top folder, which Claude Code uses in every folder of the repository. Otherwise they are the servers you added for the working folder itself.
 - "project": servers in the `.mcp.json` file of the working folder or of any folder above it. Tools that install a server "just for this project" put it there.
 
-A "local" or "project" card shows the folder Claude Code uses the server in, and a note at the top of the list reminds you that iCode uses imported servers in every project. iCode starts a STDIO server in the current working folder, so a server that works on the project it is started in keeps doing so in each project.
+Entries Claude Code itself doesn't load, such as a URL with no `type` or an incomplete command, are not listed. Also:
 
-Entries Claude Code itself doesn't load, such as a URL with no `type` or an incomplete command, are not listed.
-
-Imported servers appear as new, expanded cards at the top of the list. Their "Description" says which agent they came from, followed by any warnings from the import, so you can still read them after the import window closes. Delete those lines once you have dealt with them. Nothing is saved yet: check the cards, click "Test" if you like, then click "Save".
-
-What to know about imported servers:
-
-- Values are copied as they are, including tokens and passwords in environment variables and headers. iCode saves them in the agent file, which only your user account can read.
-- An environment variable reference such as `${GITHUB_TOKEN}` is changed to iCode's form, `{{GITHUB_TOKEN}}`. iCode has no default values: in `${HOST:-localhost}`, the default `localhost` is dropped, and a warning names the setting and the variable. The warning doesn't repeat the default, so a token used as one isn't copied into the description. Set the variable before starting iCode, or the connection fails.
+- `${GITHUB_TOKEN}` becomes `{{GITHUB_TOKEN}}`. iCode has no default values: in `${HOST:-localhost}`, the default `localhost` is dropped, and a warning names the setting and the variable. The warning doesn't repeat the default, so a token used as one isn't copied into the description.
 - Claude Code sets `CLAUDE_PROJECT_DIR` to the project folder for the STDIO servers it starts; iCode doesn't. A warning names each environment variable or header that references it: set the variable before starting iCode, or write the folder path instead.
 - Claude Code never sends a few of its own credential variables, such as `ANTHROPIC_API_KEY`, to a remote server, even when a header names them. iCode has no such rule and would send the real value, so a warning points out each header that references one of them. Remove the header, or copy the credential into a variable with another name.
 - The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
-- Settings iCode has no equivalent for are not imported, and a warning names them. For Claude Code these are the headers helper command (iCode never runs it) and OAuth sign-in (iCode only sends the headers you enter); add the headers yourself. Any other setting iCode doesn't recognize is listed too.
-- Some servers can't be imported: those using a connection type other than STDIO or HTTP (such as SSE or WebSocket), those whose URL or command uses an environment variable, because iCode reads those fields as written, and those with a brace right next to an environment variable in an environment variable or header value (such as `{${TOKEN}}`), which iCode can't write the same way. Their cards are greyed out with a dashed border and say why. The `streamable-http` type is read as HTTP.
-- A server that the current agent already has, with the same command and arguments or the same URL, is listed last, already ticked and locked, even if its name differs. If an imported server has the same name as another server, "Save" reports it; rename one of them.
-- The same server may be listed more than once, for example as both a "user" and a "project" server, or in two agents. Once you tick one, the others with the same command and arguments or the same URL are locked, and their cards say which one is ticked, so the server is imported only once. Untick it to choose another.
+- The headers helper command and OAuth settings are not imported, with a warning; add the headers yourself. Any other setting iCode doesn't recognize is listed too.
+- SSE and WebSocket servers can't be imported: iCode supports only STDIO and HTTP servers. The `streamable-http` type is read as HTTP.
+
+### opencode
+
+opencode combines the settings of all its configuration files, later files winning, and iCode lists the servers as opencode ends up with them:
+
+- "global": `opencode.json`, `opencode.jsonc` and `config.json` in `~/.config/opencode` (or in `opencode` under `XDG_CONFIG_HOME`), the file `OPENCODE_CONFIG` names, the `~/.opencode` folder, the folder `OPENCODE_CONFIG_DIR` names, the settings in `OPENCODE_CONFIG_CONTENT`, and the settings your administrator installed for all users.
+- "project": `opencode.json` and `opencode.jsonc` in the working folder and in each folder above it, and in their `.opencode` folders, up to the top folder of the Git repository (outside a repository, up to the top of the disk). They are skipped when `OPENCODE_DISABLE_PROJECT_CONFIG` is set, as opencode skips them.
+
+When more than one file changes a server, for example a project file that turns off a server from the global file, the card shows the result and a warning names the other files. If those files add headers or environment variables to a server whose URL or command comes from another file, the warning names them too: they are sent to that server. Settings opencode gets from the internet, such as your organization's, are not read.
+
+Also:
+
+- `{env:GITHUB_TOKEN}` becomes `{{GITHUB_TOKEN}}`. opencode uses an empty value for a variable that is not set; iCode fails the connection instead, so a warning names each variable that is not set when you import.
+- A command or URL containing an environment reference can't be imported. A server whose entire URL is `{env:MCP_URL}` or `{file:url.txt}` is still listed, with the reason it can't be imported.
+- A server whose command, URL, environment variables or headers read a file with `{file:...}` can't be imported: iCode doesn't read files for values. Put the value in an environment variable and reference that in opencode instead, or add the server by hand.
+- A server opencode has turned off (`"enabled": false`) is imported turned off. Tick "Enabled" in its card to use it.
+- `timeout` in milliseconds becomes "MCP Request Timeout" in seconds, rounded up; without it, `experimental.mcp_timeout` is used. iCode also waits at most that long to connect.
+- If opencode hides all of a server's tools with `tools` or `permission` (for example `"tools": {"github_*": false}`), the server is imported with no tools, or only with the tools a later rule turns back on by name, and a warning says so. Rules for single tools that iCode can't apply, and rules set for one opencode agent only, are named in a warning; set "Available Tool Scope" yourself.
+- opencode also connects to a remote server over SSE when it doesn't support HTTP; iCode doesn't.
+
+### pi
+
+iCode lists the servers pi uses in the working folder:
+
+- "global": `mcp.json` in `~/.pi/agent`, or in the folder `PI_CODING_AGENT_DIR` names.
+- "project": `.pi/mcp.json` in the working folder itself. A project server replaces a global server of the same name. A project entry that only turns a global server on or off, or changes how its tools are offered, changes that global server, and a warning names the project file.
+
+pi reads project servers only when it trusts the folder. If you told pi not to trust the working folder, or pi is set never to trust a new folder (`"defaultProjectTrust": "never"`), the project servers are listed but can't be imported. If pi hasn't asked yet, they are listed as usual: you decide here.
+
+pi skips a configuration file with a comment, a trailing comma or a byte order mark at the start, and iCode reports such a file. Also:
+
+- `${GITHUB_TOKEN}` and `$GITHUB_TOKEN` become `{{GITHUB_TOKEN}}`, and `$$` becomes `$`. A value starting with `!` is the output of a command pi runs; iCode doesn't run commands for values, so such a server can't be imported.
+- Text pi treats literally, such as `${TOKEN:-default}` and literal braces in environment variables or headers, is preserved. pi doesn't support defaults in variable references.
+- `~` at the start of the command or an argument becomes your home folder.
+- A server pi has turned off is imported turned off. `timeout` in seconds is rounded up. The server's `description` comes first in the imported description.
+- How pi offers the server's tools becomes iCode's "Loading Strategy" and "Available Tool Scope": `codemode` (pi's default) and `deferred` become "On demand — load tools as needed", `direct` becomes "Full — load all available tools", and `hidden` becomes "No tools". In `toolExposure`, tools named one by one are added to the tool lists where iCode can express it; patterns such as `"write_*"` are named in a warning.
+- If pi is set not to turn on codemode (`"autoEnableCodemode": false`), pi can't call the tools of a `codemode` server unless you turn codemode on yourself; a warning says so. iCode loads them on demand.
+- OAuth settings and `auth` (pi sending the token of a service you logged in to with `/login`) are not imported, with a warning; add an `Authorization` header yourself. Servers that pi extensions add are not listed.
 
 ## Configure instructions, tools, and request options
 

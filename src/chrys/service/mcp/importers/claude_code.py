@@ -83,6 +83,7 @@ from chrys.service.mcp.importers.base import (
     convert_dollar_templates,
     dollar_template_variables,
     dollar_templates_convertible,
+    git_root,
     has_dollar_template,
     read_json_object,
 )
@@ -216,20 +217,8 @@ def _local_project(config: Mapping[str, Any], folder: str) -> tuple[str, dict[st
 
 def _project_folder(workspace_cwd: str) -> str:
     """The folder Claude Code keys the workspace's local servers by: its Git repository root, else itself."""
-    root = _git_root(workspace_cwd)
+    root = git_root(workspace_cwd)
     return workspace_cwd if root is None else root
-
-
-def _git_root(path: str) -> str | None:
-    """The nearest folder at or above *path* holding ``.git``: a directory, or a file in a worktree or submodule."""
-    try:
-        folder = Path(os.path.realpath(path))
-    except OSError, ValueError:
-        return None
-    for candidate in (folder, *folder.parents):
-        if os.path.lexists(candidate / ".git"):
-            return str(candidate)
-    return None
 
 
 def _project_entry(entries: list[tuple[str, dict[str, Any]]], folder: str) -> tuple[str, dict[str, Any]] | None:

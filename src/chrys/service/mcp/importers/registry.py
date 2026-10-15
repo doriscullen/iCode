@@ -11,13 +11,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from chrys.service.mcp.importers.claude_code import ClaudeCodeSource
+from chrys.service.mcp.importers.opencode import OpenCodeSource
+from chrys.service.mcp.importers.pi import PiSource
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from chrys.service.mcp.importers.base import ImportContext, McpImportSource
 
-IMPORT_SOURCES: tuple[McpImportSource, ...] = (ClaudeCodeSource(),)
+IMPORT_SOURCES: tuple[McpImportSource, ...] = (ClaudeCodeSource(), OpenCodeSource(), PiSource())
 
 
 def detected_sources(ctx: ImportContext, sources: Sequence[McpImportSource] | None = None) -> list[McpImportSource]:

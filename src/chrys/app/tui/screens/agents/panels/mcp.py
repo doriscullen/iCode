@@ -60,6 +60,9 @@ from chrys.app.tui.screens.agents.validation_messages import (
     MCP_COMMAND as _COMMAND,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
+    MCP_ENABLED as _ENABLED,
+)
+from chrys.app.tui.screens.agents.validation_messages import (
     MCP_ENVIRONMENT_VARIABLES as _ENVIRONMENT_VARIABLES,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
@@ -213,7 +216,6 @@ _REQUEST_TIMEOUT_PLACEHOLDER = msg(
     "tui.mcp.placeholder.request_timeout",
     fallback="Leave blank for default ({default})",
 )
-_ENABLED = msg("tui.mcp.enabled", fallback="Enabled")
 _TEST = msg("tui.mcp.test", fallback="Test")
 _TESTING = msg("tui.mcp.testing", fallback="Testing...")
 _URL_PLACEHOLDER = msg("tui.mcp.placeholder.url", fallback="https://api.example.com/mcp")

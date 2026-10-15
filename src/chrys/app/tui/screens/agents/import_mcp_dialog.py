@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Dialog that imports MCP servers configured in other agents (Claude Code, …).
+"""Dialog that imports MCP servers configured in other agents (Claude Code, opencode, pi).
 
 The left pane lists the agents detected on this machine; the right pane lists
 the MCP servers the highlighted agent has configured. Ticked servers are
@@ -28,6 +28,7 @@ from chrys.app.tui.screens.agents.panels.config_card import ConfigCard
 from chrys.app.tui.screens.agents.panels.mcp import format_mcp_command_line
 from chrys.app.tui.screens.agents.validation_messages import (
     MCP_COMMAND,
+    MCP_ENABLED,
     MCP_ENVIRONMENT_VARIABLES,
     MCP_HEADERS,
     MCP_URL,
@@ -45,6 +46,7 @@ from chrys.service.mcp.importers import (
     McpImportCandidate,
     McpImportResult,
     McpImportSource,
+    McpSourceError,
     SourceErrorKind,
     UnsupportedReason,
     detected_sources,
@@ -91,11 +93,19 @@ _SCOPED_NOTICE = msg(
         "Once imported, {app} uses them in every project."
     ),
 )
+_SCOPED_NOTICE_PROJECT = msg(
+    "tui.mcp.import.scoped_notice.project",
+    fallback=(
+        "{agent} uses the servers marked {project} only in the folder their card names. "
+        "Once imported, {app} uses them in every project."
+    ),
+)
 _SCOPE_FOLDER = msg("tui.mcp.import.field.folder", fallback="{agent} uses it only in")
 
 _SCOPE_USER = msg("tui.mcp.import.scope.user", fallback="user")
 _SCOPE_LOCAL = msg("tui.mcp.import.scope.local", fallback="local")
 _SCOPE_PROJECT = msg("tui.mcp.import.scope.project", fallback="project")
+_SCOPE_GLOBAL = msg("tui.mcp.import.scope.global", fallback="global")
 _UNSUPPORTED_TRANSPORT = msg(
     "tui.mcp.import.unsupported.transport",
     fallback="Can't import: {app} supports only STDIO and HTTP MCP servers.",
@@ -114,6 +124,24 @@ _TEMPLATE_NEXT_TO_BRACE = msg(
         "Can't import: an environment variable or header value has a brace right next to a variable, "
         "which {app} can't write the same way."
     ),
+)
+_FILE_REFERENCE = msg(
+    "tui.mcp.import.unsupported.file_reference",
+    fallback="Can't import: a setting takes its value from a file, which {app} doesn't read.",
+)
+_VALUE_FROM_COMMAND = msg(
+    "tui.mcp.import.unsupported.value_from_command",
+    fallback=(
+        "Can't import: an environment variable or header value is the output of a command, which {app} doesn't run."
+    ),
+)
+_VARIABLE_NAME = msg(
+    "tui.mcp.import.unsupported.variable_name",
+    fallback="Can't import: a setting uses an environment variable whose name {app} can't write.",
+)
+_UNTRUSTED_PROJECT = msg(
+    "tui.mcp.import.unsupported.untrusted_project",
+    fallback="Can't import: {agent} doesn't trust this folder, so it doesn't run this server.",
 )
 _COVERED = msg(
     "tui.mcp.import.covered",
@@ -156,6 +184,64 @@ _CLAUDE_PROJECT_DIR = msg(
         "{app} doesn't set it: set it before starting {app}, or write the folder path instead."
     ),
 )
+_DISABLED = msg(
+    "tui.mcp.import.warning.disabled",
+    fallback="{agent} has this server turned off, so it is imported turned off. Tick {enabled} in its card to use it.",
+)
+_CWD_IGNORED = msg(
+    "tui.mcp.import.warning.cwd_ignored",
+    fallback=(
+        "{agent} starts this server in {folder}. {app} starts it in the working folder, "
+        "so a server that needs that folder may not work."
+    ),
+)
+_MERGED = msg(
+    "tui.mcp.import.warning.merged",
+    fallback="{agent} combines this server's settings from more than one file. Also from: {files}.",
+)
+_MERGED_VALUES = msg(
+    "tui.mcp.import.warning.merged.values",
+    fallback=(
+        "{agent} combines this server's settings from more than one file. Also from: {files}. "
+        "{fields} come from a different file than the command or URL, and are sent to it too."
+    ),
+)
+_AUTH_PROVIDER_IGNORED = msg(
+    "tui.mcp.import.warning.auth_provider_ignored",
+    fallback=(
+        "{agent} sends this server the token of its {provider} sign-in; {app} doesn't. "
+        "Add an Authorization header under Headers yourself, or the server may refuse the connection."
+    ),
+)
+_TOOL_RULES_IGNORED = msg(
+    "tui.mcp.import.warning.tool_rules_ignored",
+    fallback=(
+        "Not imported, {app} can't apply {agent}'s settings for single tools: {rules}. "
+        "Set the available tools yourself if needed."
+    ),
+)
+_TOOLS_LIMITED_NONE = msg(
+    "tui.mcp.import.warning.tools_limited.none",
+    fallback="{agent} hides this server's tools ({rule}), so it is imported with no tools.",
+)
+_TOOLS_LIMITED_SOME = msg(
+    "tui.mcp.import.warning.tools_limited.some",
+    fallback="{agent} hides this server's tools ({rule}) except some, so it is imported with only: {tools}.",
+)
+_CODEMODE_OFF = msg(
+    "tui.mcp.import.warning.codemode_off",
+    fallback=(
+        "{agent} calls this server's tools only from codemode, which it doesn't turn on (autoEnableCodemode is "
+        "false), so it can't call them unless codemode is on. {app} loads them on demand."
+    ),
+)
+_VARIABLE_UNSET = msg(
+    "tui.mcp.import.warning.variable_unset",
+    fallback=(
+        "{field} references {variable}, which is not set now. {agent} then uses an empty value, "
+        "but {app} fails to connect. Set {variable} before starting {app}."
+    ),
+)
 _UNKNOWN_FIELDS_IGNORED = msg(
     "tui.mcp.import.warning.unknown_fields_ignored",
     fallback="Not imported, {app} has no matching setting: {fields}.",
@@ -168,13 +254,20 @@ _NOT_AN_OBJECT = msg(
     fallback="{path} does not contain a settings object.",
 )
 
-_SCOPE_LABELS = {"user": _SCOPE_USER, "local": _SCOPE_LOCAL, "project": _SCOPE_PROJECT}
+_SCOPE_LABELS = {"user": _SCOPE_USER, "local": _SCOPE_LOCAL, "project": _SCOPE_PROJECT, "global": _SCOPE_GLOBAL}
 _UNSUPPORTED_REASONS = {
     UnsupportedReason.UNSUPPORTED_TRANSPORT: _UNSUPPORTED_TRANSPORT,
     UnsupportedReason.TEMPLATE_IN_URL: _TEMPLATE_IN_URL,
     UnsupportedReason.TEMPLATE_IN_COMMAND: _TEMPLATE_IN_COMMAND,
     UnsupportedReason.TEMPLATE_NEXT_TO_BRACE: _TEMPLATE_NEXT_TO_BRACE,
+    UnsupportedReason.FILE_REFERENCE: _FILE_REFERENCE,
+    UnsupportedReason.VALUE_FROM_COMMAND: _VALUE_FROM_COMMAND,
+    UnsupportedReason.VARIABLE_NAME: _VARIABLE_NAME,
 }
+_INVALID_CONFIG = msg(
+    "tui.mcp.import.source_error.invalid_config",
+    fallback="{path} has settings {agent} rejects, so its servers are not listed.",
+)
 _SOURCE_ERRORS = {
     SourceErrorKind.UNREADABLE: _UNREADABLE,
     SourceErrorKind.TOO_LARGE: _TOO_LARGE,
@@ -186,6 +279,13 @@ _SOURCE_ERRORS = {
 type _CandidateState = Literal["importable", "unsupported", "added"]
 
 _STATE_ORDER: dict[_CandidateState, int] = {"importable": 0, "unsupported": 1, "added": 2}
+
+
+def _source_error(error: McpSourceError, agent: str) -> MessageRef:
+    path = sanitize_legacy_scalar(error.path)
+    if error.kind is SourceErrorKind.INVALID_CONFIG:
+        return _INVALID_CONFIG.bind(path=path, agent=agent)
+    return _SOURCE_ERRORS[error.kind].bind(path=path)
 
 
 def is_already_added(config: MCPServerConfig, existing: Sequence[MCPServerConfig]) -> bool:
@@ -484,20 +584,22 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         ticked = self._ticked.setdefault(source.source_id, set())
         # Problems reading the agent's files come first, where they are seen without scrolling.
         widgets: list[Widget] = [
-            Static(
-                Text(self._render_message(_SOURCE_ERRORS[error.kind].bind(path=sanitize_legacy_scalar(error.path)))),
-                classes="mcp-import-error",
-            )
+            Static(Text(self._render_message(_source_error(error, agent))), classes="mcp-import-error")
             for error in result.source_errors
         ]
         # Said once for the whole list: importing makes a folder-only server global.
         if any(candidate.scope_path for candidate in result.candidates):
-            notice = _SCOPED_NOTICE.bind(
-                agent=agent,
-                local=self._scope_label("local"),
-                project=self._scope_label("project"),
-                app=APP_DISPLAY_NAME,
-            )
+            if any(candidate.scope == "local" for candidate in result.candidates):
+                notice = _SCOPED_NOTICE.bind(
+                    agent=agent,
+                    local=self._scope_label("local"),
+                    project=self._scope_label("project"),
+                    app=APP_DISPLAY_NAME,
+                )
+            else:
+                notice = _SCOPED_NOTICE_PROJECT.bind(
+                    agent=agent, project=self._scope_label("project"), app=APP_DISPLAY_NAME
+                )
             widgets.append(Static(Text(self._render_message(notice)), classes="mcp-import-notice"))
         # Importable servers first, then those that can't be imported, then those this agent already has.
         states = [
@@ -520,7 +622,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 value=value,
                 disabled=state != "importable" or covered is not None,
             )
-            note = self._unsupported_note(candidate) if state == "unsupported" else None
+            note = self._unsupported_note(candidate, agent) if state == "unsupported" else None
             widgets.append(
                 _ImportCard(
                     index=index,
@@ -584,9 +686,11 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             if config is not None:
                 card.show_covered(self._covering(row.source_id, row.index, config))
 
-    def _unsupported_note(self, candidate: McpImportCandidate) -> str | None:
+    def _unsupported_note(self, candidate: McpImportCandidate, agent: str) -> str | None:
         if candidate.unsupported is None:
             return None
+        if candidate.unsupported is UnsupportedReason.UNTRUSTED_PROJECT:
+            return self._render_message(_UNTRUSTED_PROJECT.bind(agent=agent))
         return self._render_message(_UNSUPPORTED_REASONS[candidate.unsupported].bind(app=APP_DISPLAY_NAME))
 
     def _card_fields(self, candidate: McpImportCandidate, agent: str) -> list[_CardField]:
@@ -669,6 +773,30 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 reference = _CLAUDE_PROJECT_DIR.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
             case ImportWarningKind.UNKNOWN_FIELDS_IGNORED:
                 reference = _UNKNOWN_FIELDS_IGNORED.bind(fields=original, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.DISABLED:
+                reference = _DISABLED.bind(agent=agent, enabled=self._render_message(MCP_ENABLED.bind()))
+            case ImportWarningKind.CWD_IGNORED:
+                reference = _CWD_IGNORED.bind(agent=agent, folder=original, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.MERGED:
+                reference = (
+                    _MERGED_VALUES.bind(agent=agent, files=original, fields=field)
+                    if field
+                    else _MERGED.bind(agent=agent, files=original)
+                )
+            case ImportWarningKind.AUTH_PROVIDER_IGNORED:
+                reference = _AUTH_PROVIDER_IGNORED.bind(agent=agent, provider=original, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.TOOL_RULES_IGNORED:
+                reference = _TOOL_RULES_IGNORED.bind(agent=agent, rules=original, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.TOOLS_LIMITED:
+                reference = (
+                    _TOOLS_LIMITED_SOME.bind(agent=agent, rule=field, tools=original)
+                    if original
+                    else _TOOLS_LIMITED_NONE.bind(agent=agent, rule=field)
+                )
+            case ImportWarningKind.CODEMODE_OFF:
+                reference = _CODEMODE_OFF.bind(agent=agent, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.VARIABLE_UNSET:
+                reference = _VARIABLE_UNSET.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
         return self._render_message(reference)
 
     def _description(self, agent: str, candidate: McpImportCandidate) -> MessageRef:
@@ -713,7 +841,9 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 origin = self._render_message(self._description(source.display_name, candidate))
                 # The import's warnings stay with the server: the dialog that showed them is about to close.
                 notes = [f"- {self._warning_text(warning, source.display_name)}" for warning in candidate.warnings]
-                selected.append(replace(candidate.config, description="\n".join([origin, *notes])))
+                # The source's own description of the server comes first.
+                own = [candidate.config.description] if candidate.config.description else []
+                selected.append(replace(candidate.config, description="\n".join([*own, origin, *notes])))
         return selected
 
     @on(Button.Pressed, "#mcp-import-confirm")

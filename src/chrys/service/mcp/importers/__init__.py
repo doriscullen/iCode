@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Import MCP server configs from other agents (Claude Code, …) into an agent profile."""
+"""Import MCP server configs from other agents (Claude Code, opencode, pi) into an agent profile."""
 
 from __future__ import annotations
 
