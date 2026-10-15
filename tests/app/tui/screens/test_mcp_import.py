@@ -9,7 +9,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from textual.app import App, ComposeResult
@@ -52,6 +52,9 @@ from tests.app.tui.screens._agent_config_support import (
 )
 from tests.support.tui_helpers import click_when_settled
 from tests.support.waiting import wait_for
+
+if TYPE_CHECKING:
+    from textual.widget import Widget
 
 pytestmark = [pytest.mark.timeout(120), pytest.mark.usefixtures("isolated_chrys_config_dir")]
 
@@ -209,12 +212,23 @@ async def test_import_button_sits_beside_add_and_is_hidden_when_read_only() -> N
             assert button.disabled is read_only
 
 
-def _cards_in(dialog: ImportMcpServersDialog) -> list[tuple[str, list[tuple[str, str]], bool]]:
+type _FieldValue = str | list[tuple[str, str]]
+
+
+def _field_value(widget: Widget) -> _FieldValue:
+    """A single value's text, or the (name, value) rows of an env or headers grid."""
+    if widget.has_class("mcp-import-pairs"):
+        cells = [str(cell.render()) for cell in widget.children]
+        return list(zip(cells[::2], cells[1::2], strict=True))
+    return str(widget.render())
+
+
+def _cards_in(dialog: ImportMcpServersDialog) -> list[tuple[str, list[tuple[str, _FieldValue]], bool]]:
     """Each card's title, its (field label, value) pairs and whether it can be ticked, in pane order."""
     cards = []
     for card in dialog.query(_ImportCard):
         labels = [str(label.render()) for label in card.query(".mcp-import-field-label")]
-        values = [str(value.render()) for value in card.query(".mcp-import-field-value")]
+        values = [_field_value(value) for value in card.query(".mcp-import-field-value, .mcp-import-pairs")]
         title = f"{card.row.label} · {card.meta}"
         cards.append((title, list(zip(labels, values, strict=True)), not card.row.disabled))
     return cards
@@ -242,13 +256,13 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
                 "local · user · STDIO",
                 [
                     ("Command", format_mcp_command_line("npx", ["-y", "my server"])),
-                    ("Environment Variables", "API_KEY = {{KEY}}\nMODE = fast"),
+                    ("Environment Variables", [("API_KEY", "{{KEY}}"), ("MODE", "fast")]),
                 ],
                 True,
             ),
             (
                 "remote · user · HTTP",
-                [("URL", "https://x.test/mcp"), ("Headers", "Authorization = Bearer abc123")],
+                [("URL", "https://x.test/mcp"), ("Headers", [("Authorization", "Bearer abc123")])],
                 True,
             ),
             # Not importable, SSE included: shown as written, greyed out, with the reason.
@@ -267,6 +281,92 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
         assert _pane_text(dialog).count("Can't import: iCode supports only STDIO and HTTP") == 2
         # Every server here is one Claude Code uses in every project, so there is nothing to point out.
         assert not dialog.query(".mcp-import-notice")
+
+
+async def test_env_values_wrap_in_their_own_column_beside_a_capped_name_column(claude_home: Path) -> None:
+    long_name = "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE_AND_MORE"
+    long_value = "/Applications/" + "/".join(["Contents/Resources"] * 8)
+    _write_claude_servers(
+        claude_home,
+        {
+            "short": {"command": "a", "env": {"A": "1", "HOME_DIR": long_value}},
+            "long": {"command": "b", "env": {long_name: long_value, "B": ""}},
+        },
+    )
+    panel = MCPConfigPanel([])
+    app = _PanelApp(panel)
+    async with app.run_test(size=(120, 60)) as pilot:
+        dialog = await _open_dialog(app, panel, pilot)
+        await _wait_for_rows(dialog, pilot, 2)
+        short, long = dialog.query(".mcp-import-pairs")
+
+        def columns(grid: Widget) -> list[tuple[int, int]]:
+            """Each cell's (x, width), in row order: name, value, name, value..."""
+            return [(cell.region.x, cell.region.width) for cell in grid.children]
+
+        # Short names: the column is as wide as the longest name plus its padding.
+        await wait_for(
+            lambda: columns(short)[0][1] == len("HOME_DIR") + 2, pilot=pilot, description="names fit their column"
+        )
+        # A long name: the column stops at 45% of the grid, and the name wraps inside it.
+        cap = int(long.region.width * 0.45)
+        await wait_for(lambda: columns(long)[0][1] == cap, pilot=pilot, description="the name column is capped")
+        for grid in (short, long):
+            names, values = columns(grid)[::2], columns(grid)[1::2]
+            assert len(set(names)) == 1
+            assert len(set(values)) == 1
+            # A wrapped value stays in its column, and its name's cell is as tall as it.
+            cells = list(grid.children)
+            wrapped = next(i for i, cell in enumerate(cells) if str(cell.render()) == long_value)
+            assert cells[wrapped].region.height > 1
+            assert cells[wrapped - 1].region.height == cells[wrapped].region.height
+        assert values[0][0] > names[0][0] + cap
+
+
+async def test_cards_that_cant_be_ticked_open_folded_and_a_rebuild_keeps_the_users_folds(claude_home: Path) -> None:
+    _write_claude_servers(
+        claude_home,
+        {
+            "fs": {"command": "uvx", "args": ["mcp-fs"]},
+            "new": {"command": "uvx", "args": ["new"]},
+            "legacy": {"type": "sse", "url": "https://x.test/sse"},
+        },
+    )
+    panel = MCPConfigPanel([_stdio("fs", "uvx", "mcp-fs")])
+    app = _PanelApp(panel)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _cards(panel, pilot, 1)
+        dialog = await _open_dialog(app, panel, pilot)
+        await _wait_for_rows(dialog, pilot, 3)
+
+        def folds() -> list[tuple[str, bool, bool]]:
+            """Each card's server name, whether it is folded and whether its body shows, in pane order."""
+            return [
+                (str(card.row.label), card.collapsed, card.query_one(".config-card-body").display)
+                for card in dialog.query(_ImportCard)
+            ]
+
+        # The server that can't be imported and the one already added open folded to their header.
+        assert folds() == [("new", False, True), ("legacy", True, False), ("fs", True, False)]
+        # The settings sit in a section titled like the agent's MCP card, whatever the transport.
+        titles = [str(section.border_title) for section in dialog.query(".mcp-import-settings")]
+        assert titles == ["STDIO Options", "SSE Options", "STDIO Options"]
+
+        new, legacy, _fs = dialog.query(_ImportCard)
+        await click_when_settled(pilot, legacy.query_one(".mcp-import-fold"))
+        await click_when_settled(pilot, new.query_one(".mcp-import-fold"))
+        expected = [("new", True, False), ("legacy", False, True), ("fs", True, False)]
+        await wait_for(lambda: folds() == expected, pilot=pilot, description="the clicked cards fold and unfold")
+        # The fold toggle is not the checkbox.
+        assert new.row.value is False
+
+        # A pane rebuild (as after a locale switch) keeps the folds the user chose.
+        dialog.refresh_localization()
+        await wait_for(
+            lambda: not legacy.is_attached and len(dialog.query(_ImportCard)) == 3 and folds() == expected,
+            pilot=pilot,
+            description="the rebuilt cards keep their folds",
+        )
 
 
 async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_description(tmp_path: Path) -> None:
@@ -962,7 +1062,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 "files · global · STDIO",
                 [
                     ("Command", format_mcp_command_line("npx", ["server-files"])),
-                    ("Environment Variables", "T = {{FILES_TOKEN}}"),
+                    ("Environment Variables", [("T", "{{FILES_TOKEN}}")]),
                 ],
                 True,
             )
@@ -1028,7 +1128,7 @@ async def test_codex_servers_are_detected_previewed_and_imported(tmp_path: Path)
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         assert [str(sources.get_option_at_index(i).prompt) for i in range(sources.option_count)] == ["Codex"]
         assert remote.disabled is True
-        assert "TOKEN = {{TOKEN}}" in str(_cards_in(dialog))
+        assert "('TOKEN', '{{TOKEN}}')" in str(_cards_in(dialog))
         files.value = True
         await _import_ticked(dialog, pilot)
         await wait_for(lambda: results, pilot=pilot, description="Codex server imported")

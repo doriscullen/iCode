@@ -612,6 +612,7 @@ _message_ids: set[str | tuple[str, str]] = {
     "tui.mcp.import.detect_failed",
     "tui.mcp.import.detecting",
     "tui.mcp.import.field.folder",
+    "tui.mcp.import.field.transport_options",
     "tui.mcp.import.loading",
     "tui.mcp.import.no_agents",
     "tui.mcp.import.no_servers",

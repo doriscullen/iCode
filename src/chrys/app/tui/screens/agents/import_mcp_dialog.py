@@ -15,16 +15,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import on
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.content import Content
+from textual.message import Message
 from textual.widgets import Button, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from chrys.app.tui.binding_display import CANCEL_BINDING, localized_binding
 from chrys.app.tui.i18n import render_str
-from chrys.app.tui.screens.agents.panels.config_card import ConfigCard
+from chrys.app.tui.screens.agents.panels.config_card import CollapsibleConfigCard
 from chrys.app.tui.screens.agents.panels.mcp import format_mcp_command_line
 from chrys.app.tui.screens.agents.validation_messages import (
     MCP_COMMAND,
@@ -56,6 +58,7 @@ from chrys.service.profiles.agents.schema import MCPServerConfig
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from textual import events
     from textual.app import ComposeResult
     from textual.widget import Widget
 
@@ -101,6 +104,7 @@ _SCOPED_NOTICE_PROJECT = msg(
     ),
 )
 _SCOPE_FOLDER = msg("tui.mcp.import.field.folder", fallback="{agent} uses it only in")
+_TRANSPORT_OPTIONS = msg("tui.mcp.import.field.transport_options", fallback="{transport} Options")
 
 _SCOPE_USER = msg("tui.mcp.import.scope.user", fallback="user")
 _SCOPE_LOCAL = msg("tui.mcp.import.scope.local", fallback="local")
@@ -318,9 +322,9 @@ def is_already_added(config: MCPServerConfig, existing: Sequence[MCPServerConfig
     return any(_connection_key(config) == _connection_key(server) for server in existing)
 
 
-def _key_value_lines(values: Mapping[Any, Any]) -> tuple[str, ...]:
+def _key_value_pairs(values: Mapping[Any, Any]) -> tuple[tuple[str, str], ...]:
     return tuple(
-        f"{sanitize_legacy_scalar(str(key))} = {sanitize_legacy_scalar(str(value))}" for key, value in values.items()
+        (sanitize_legacy_scalar(str(key)), sanitize_legacy_scalar(str(value))) for key, value in values.items()
     )
 
 
@@ -349,18 +353,70 @@ class _ImportRow(Checkbox):
         self.index = index
 
 
+class _PairGrid(Grid):
+    """Names and values in two columns, so a long value wraps under itself, not under the names.
+
+    The name column is as wide as the longest name, but at most 45% of the
+    grid; a cell's own ``max-width`` would resolve against that cell, not the grid.
+    """
+
+    _NAME_SHARE = 0.45
+    # The name cells' horizontal padding.
+    _NAME_PADDING = 2
+
+    def __init__(self, pairs: Sequence[tuple[str, str]]) -> None:
+        super().__init__(classes="mcp-import-pairs")
+        self._pairs = pairs
+        self._longest = max(cell_len(key) for key, _value in pairs) + self._NAME_PADDING
+        self._name_width = 0
+
+    def compose(self) -> ComposeResult:
+        for key, value in self._pairs:
+            yield Static(Text(key), classes="mcp-import-pair-key")
+            yield Static(Text(value), classes="mcp-import-pair-value")
+
+    def on_resize(self, event: events.Resize) -> None:
+        width = max(1, min(self._longest, int(event.size.width * self._NAME_SHARE)))
+        # A height change resizes the grid too: only a new name width relays it out.
+        if width != self._name_width:
+            self._name_width = width
+            self.styles.grid_columns = f"{width} 1fr"
+
+
 @dataclass(frozen=True, slots=True)
 class _CardField:
+    """One setting: a single value, or (name, value) pairs such as env or headers."""
+
     label: str
-    lines: tuple[str, ...]
+    value: str = ""
+    pairs: tuple[tuple[str, str], ...] = ()
 
 
-class _ImportCard(ConfigCard):
-    """A server's settings, read-only, under a header that ticks it: its name, then where it came from.
+def _field_widgets(field: _CardField) -> ComposeResult:
+    yield Label(Content.from_text(field.label, markup=False), classes="mcp-import-field-label")
+    if field.pairs:
+        yield _PairGrid(field.pairs)
+    else:
+        yield Static(Text(field.value), classes="mcp-import-field-value")
 
-    An importable server is locked while a ticked one with the same connection
-    covers it; the covered note says which.
+
+class _ImportCard(CollapsibleConfigCard):
+    """A server's settings, read-only, under a header that folds it, ticks it, then says where it came from.
+
+    The connection settings sit in a titled section, as on the agent's MCP
+    card; the folder a source uses the server in sits above it. An importable
+    server is locked while a ticked one with the same connection covers it;
+    the covered note says which.
     """
+
+    class Folded(Message):
+        """Posted when the user folds or unfolds a card, so the pane can rebuild it the same way."""
+
+        def __init__(self, source_id: str, index: int, collapsed: bool) -> None:
+            self.source_id = source_id
+            self.index = index
+            self.collapsed = collapsed
+            super().__init__()
 
     def __init__(
         self,
@@ -369,21 +425,26 @@ class _ImportCard(ConfigCard):
         meta: str,
         row: _ImportRow,
         importable: bool,
-        fields: Sequence[_CardField],
+        scope_fields: Sequence[_CardField],
+        settings_title: str,
+        settings_fields: Sequence[_CardField],
         notes: Sequence[str],
         warnings: Sequence[str],
         covered: str | None = None,
+        collapsed: bool = False,
     ) -> None:
         self._meta = meta
         self._row = row
         self._importable = importable
-        self._fields = list(fields)
+        self._scope_fields = list(scope_fields)
+        self._settings_title = settings_title
+        self._settings_fields = list(settings_fields)
         self._notes = list(notes)
         self._warnings = list(warnings)
         self._covered_note = Static(Text(covered or ""), classes="mcp-import-note")
         self._covered_note.display = covered is not None
         classes = "mcp-import-card" + (" -unavailable" if row.disabled else "")
-        super().__init__(index, classes=classes, read_only=True)
+        super().__init__(index, collapsed=collapsed, classes=classes, read_only=True)
 
     @property
     def row(self) -> _ImportRow:
@@ -409,14 +470,27 @@ class _ImportCard(ConfigCard):
         """Where the server came from and how it connects, shown dimmed beside its name."""
         return self._meta
 
+    def set_collapsed(self, collapsed: bool, *, scroll_visible: bool = True) -> None:
+        changed = collapsed != self.collapsed
+        super().set_collapsed(collapsed, scroll_visible=scroll_visible)
+        if changed:
+            self.post_message(self.Folded(self._row.source_id, self._row.index, collapsed))
+
     def compose(self) -> ComposeResult:
         with Horizontal(classes="mcp-import-card-header"):
+            # The fold toggle alone: the checkbox beside it carries the name, and a click on the name ticks.
+            yield self._make_title("", classes="mcp-import-fold")
             yield self._row
             yield Label(Content.from_text(self._meta, markup=False), classes="mcp-import-card-meta")
-        with Vertical(classes="mcp-import-card-body"):
-            for field in self._fields:
-                yield Label(Content.from_text(field.label, markup=False), classes="mcp-import-field-label")
-                yield Static(Text("\n".join(field.lines)), classes="mcp-import-field-value")
+        with self.card_body():
+            for field in self._scope_fields:
+                yield from _field_widgets(field)
+            if self._settings_fields:
+                with Vertical(classes="mcp-import-settings") as section:
+                    if self._settings_title:
+                        section.border_title = Text(self._settings_title)
+                    for field in self._settings_fields:
+                        yield from _field_widgets(field)
             for note in self._notes:
                 yield Static(Text(note), classes="mcp-import-note")
             yield self._covered_note
@@ -452,6 +526,8 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         self._sources: list[McpImportSource] = []
         self._results: dict[str, McpImportResult | None] = {}
         self._ticked: dict[str, set[int]] = {}
+        # Cards the user folded or unfolded, so a pane rebuild (agent or locale switch) keeps them that way.
+        self._folded: dict[str, dict[int, bool]] = {}
         self._shown_source: str | None = None
         # The message the pane shows instead of servers, re-rendered when the locale changes.
         self._pane_message: MessageRef | None = None
@@ -644,6 +720,9 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 disabled=state != "importable" or covered is not None,
             )
             note = self._unsupported_note(candidate, agent) if state == "unsupported" else None
+            # A server that can't be ticked here opens folded to its header; one covered by a tick stays open,
+            # as its note says why it was just locked.
+            collapsed = self._folded.get(source.source_id, {}).get(index, state != "importable")
             widgets.append(
                 _ImportCard(
                     index=index,
@@ -651,7 +730,10 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     row=row,
                     importable=state == "importable",
                     covered=covered,
-                    fields=self._card_fields(candidate, agent),
+                    scope_fields=self._scope_fields(candidate, agent),
+                    settings_title=self._settings_title(candidate),
+                    settings_fields=self._settings_fields(candidate),
+                    collapsed=collapsed,
                     notes=[] if note is None else [note],
                     # What the conversion changed only matters for a server that will be imported.
                     warnings=[]
@@ -714,13 +796,19 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             return self._render_message(_UNTRUSTED_PROJECT.bind(agent=agent))
         return self._render_message(_UNSUPPORTED_REASONS[candidate.unsupported].bind(app=APP_DISPLAY_NAME))
 
-    def _card_fields(self, candidate: McpImportCandidate, agent: str) -> list[_CardField]:
-        """Where the source uses the server, if only in one folder, then its settings."""
-        fields: list[_CardField] = []
-        if candidate.scope_path:
-            label = self._render_message(_SCOPE_FOLDER.bind(agent=agent))
-            fields.append(_CardField(label, (sanitize_legacy_scalar(candidate.scope_path),)))
-        return fields + self._settings_fields(candidate)
+    def _scope_fields(self, candidate: McpImportCandidate, agent: str) -> list[_CardField]:
+        """Where the source uses the server, if only in one folder."""
+        if not candidate.scope_path:
+            return []
+        label = self._render_message(_SCOPE_FOLDER.bind(agent=agent))
+        return [_CardField(label, sanitize_legacy_scalar(candidate.scope_path))]
+
+    def _settings_title(self, candidate: McpImportCandidate) -> str:
+        """The settings section's title, as the agent's MCP card names it; none when the source names no transport."""
+        if not candidate.transport:
+            return ""
+        transport = sanitize_legacy_scalar(candidate.transport.upper())
+        return self._render_message(_TRANSPORT_OPTIONS.bind(transport=transport))
 
     def _settings_fields(self, candidate: McpImportCandidate) -> list[_CardField]:
         """The settings the source gave: the converted config, or as written when it can't be imported."""
@@ -754,12 +842,12 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
     ) -> list[_CardField]:
         fields: list[_CardField] = []
         if command:
-            fields.append(_CardField(self._render_message(MCP_COMMAND.bind()), (sanitize_legacy_scalar(command),)))
+            fields.append(_CardField(self._render_message(MCP_COMMAND.bind()), sanitize_legacy_scalar(command)))
         if url:
-            fields.append(_CardField(self._render_message(MCP_URL.bind()), (sanitize_legacy_scalar(url),)))
+            fields.append(_CardField(self._render_message(MCP_URL.bind()), sanitize_legacy_scalar(url)))
         for label, values in ((MCP_ENVIRONMENT_VARIABLES, env), (MCP_HEADERS, headers)):
             if isinstance(values, Mapping) and values:
-                fields.append(_CardField(self._render_message(label.bind()), _key_value_lines(values)))
+                fields.append(_CardField(self._render_message(label.bind()), pairs=_key_value_pairs(values)))
         return fields
 
     def _candidate_meta(self, candidate: McpImportCandidate) -> str:
@@ -829,6 +917,11 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         if candidate.scope_path:
             return _DESCRIPTION_SCOPED.bind(agent=agent, scope=scope, path=sanitize_legacy_scalar(candidate.scope_path))
         return _DESCRIPTION.bind(agent=agent, scope=scope)
+
+    @on(_ImportCard.Folded)
+    def _on_card_folded(self, event: _ImportCard.Folded) -> None:
+        event.stop()
+        self._folded.setdefault(event.source_id, {})[event.index] = event.collapsed
 
     @on(Checkbox.Changed, ".mcp-import-row")
     def _on_row_changed(self, event: Checkbox.Changed) -> None:

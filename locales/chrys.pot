@@ -7469,6 +7469,12 @@ msgstr ""
 msgid "tui.mcp.import.field.folder"
 msgstr ""
 
+#. English: {transport} Options
+#. chrys-meta={"fingerprint":"7f9c8523942c22b30fd2b172a6e0bbce85f23c8abe3c6b4238005f2b5b483fbd","multiline":false,"placeholders":["transport"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.field.transport_options"
+msgstr ""
+
 #. English: Reading MCP servers...
 #. chrys-meta={"fingerprint":"6cce02bdd8e08360fe1d15015e4624c46ae3144b9e956937f42e66cf2ec76b7f","multiline":false,"placeholders":[]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py

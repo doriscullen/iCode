@@ -60,6 +60,17 @@ ImportMcpServersDialog {
     height: 1;
 }
 
+/* Folded to its header, the card keeps no blank line under it. */
+#mcp-import-servers .mcp-import-card.-collapsed {
+    padding: 0 1;
+}
+
+/* The ▶/▼ before the checkbox; it folds the card, as on the agent's MCP cards. */
+#mcp-import-servers .mcp-import-fold {
+    padding: 0 1 0 0;
+    color: $text-muted;
+}
+
 /* The checkbox, as Skills' "Workspace relative" one; its label is the server name */
 #mcp-import-servers .mcp-import-row {
     width: auto;
@@ -105,7 +116,9 @@ ImportMcpServersDialog {
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-row,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-card-meta,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-label,
-#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-value {
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-value,
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-pair-key,
+#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-pair-value {
     text-opacity: 50%;
 }
 
@@ -113,8 +126,12 @@ ImportMcpServersDialog {
     color: $text-muted;
 }
 
-#mcp-import-servers .mcp-import-card-body {
+#mcp-import-servers .mcp-import-settings {
     height: auto;
+    margin: 1 0 0 0;
+    padding: 0 2 1 2;
+    border: solid $tui-border-foreground 15%;
+    border-title-color: $text-muted;
 }
 
 #mcp-import-servers .mcp-import-field-label {
@@ -123,9 +140,32 @@ ImportMcpServersDialog {
     margin: 1 0 0 0;
 }
 
+/* Values look like the config card's read-only inputs they become once imported. */
 #mcp-import-servers .mcp-import-field-value {
     height: auto;
-    padding: 0 0 0 2;
+    background: $foreground 8%;
+    padding: 0 1;
+}
+
+/* Env vars and headers: names in a column (its width set by _PairGrid), values beside them, rows apart
+   as on the agent's MCP card. */
+#mcp-import-servers .mcp-import-pairs {
+    grid-size: 2;
+    grid-columns: auto 1fr;
+    grid-gutter: 1 1;
+    height: auto;
+}
+
+/* A grid row is as tall as its taller cell; both cells fill it, so a row's shading is one band. */
+#mcp-import-servers .mcp-import-pair-key,
+#mcp-import-servers .mcp-import-pair-value {
+    height: 100%;
+    background: $foreground 8%;
+    padding: 0 1;
+}
+
+#mcp-import-servers .mcp-import-pair-key {
+    color: $text-muted;
 }
 
 #mcp-import-servers .mcp-import-note,
