@@ -1036,8 +1036,9 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
     )
     pi_project = workspace / ".pi" / "mcp.json"
     pi_project.parent.mkdir(parents=True)
+    description = "Searches the [bold]product docs[/bold]\nReads API references and examples."
     pi_project.write_text(
-        json.dumps({"mcpServers": {"docs": {"url": "https://docs.test/mcp", "description": "Searches the docs"}}}),
+        json.dumps({"mcpServers": {"docs": {"url": "https://docs.test/mcp", "description": description}}}),
         encoding="utf-8",
     )
     environ = {**_quiet_environ(tmp_path), "XDG_CONFIG_HOME": str(home / ".config"), "FILES_TOKEN": "t"}
@@ -1076,6 +1077,19 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
             pilot=pilot,
             description="pi's servers are shown",
         )
+        assert _cards_in(dialog) == [
+            (
+                "docs · project · HTTP",
+                [
+                    ("Description", description),
+                    ("pi uses it only in", str(workspace)),
+                    ("URL", "https://docs.test/mcp"),
+                ],
+                True,
+            )
+        ]
+        description_widget = dialog.query(".mcp-import-field-value").first(Static)
+        assert description_widget.region.height >= 2
         (notice,) = dialog.query(".mcp-import-notice")
         assert str(notice.render()) == (
             "pi uses the servers marked project only in the folder their card names. "
@@ -1097,7 +1111,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
             (
                 "docs",
                 True,
-                f"Searches the docs\nImported from pi. There it is a project server, used only in {workspace}.",
+                f"{description}\nImported from pi. There it is a project server, used only in {workspace}.",
             ),
         ]
 

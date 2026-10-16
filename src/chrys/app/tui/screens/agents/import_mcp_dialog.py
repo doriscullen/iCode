@@ -29,6 +29,7 @@ from chrys.app.tui.i18n import render_str
 from chrys.app.tui.screens.agents.panels.config_card import CollapsibleConfigCard
 from chrys.app.tui.screens.agents.panels.mcp import format_mcp_command_line
 from chrys.app.tui.screens.agents.validation_messages import (
+    DESCRIPTION,
     MCP_COMMAND,
     MCP_ENABLED,
     MCP_ENVIRONMENT_VARIABLES,
@@ -40,7 +41,7 @@ from chrys.app.tui.util.removal import remove_children_shielded
 from chrys.app.tui.widgets import Checkbox, DialogButtonRow, DialogButtonSpec
 from chrys.foundation.branding import APP_DISPLAY_NAME
 from chrys.foundation.i18n import MessageRef, msg
-from chrys.foundation.i18n.formatting import format_message, sanitize_legacy_scalar
+from chrys.foundation.i18n.formatting import format_message, sanitize_legacy_block, sanitize_legacy_scalar
 from chrys.service.mcp.importers import (
     ImportContext,
     ImportWarning,
@@ -404,7 +405,7 @@ class _ImportCard(CollapsibleConfigCard):
     """A server's settings, read-only, under a header that folds it, ticks it, then says where it came from.
 
     The connection settings sit in a titled section, as on the agent's MCP
-    card; the folder a source uses the server in sits above it. An importable
+    card; the source description and folder sit above it. An importable
     server is locked while a ticked one with the same connection covers it;
     the covered note says which.
     """
@@ -425,7 +426,7 @@ class _ImportCard(CollapsibleConfigCard):
         meta: str,
         row: _ImportRow,
         importable: bool,
-        scope_fields: Sequence[_CardField],
+        summary_fields: Sequence[_CardField],
         settings_title: str,
         settings_fields: Sequence[_CardField],
         notes: Sequence[str],
@@ -436,7 +437,7 @@ class _ImportCard(CollapsibleConfigCard):
         self._meta = meta
         self._row = row
         self._importable = importable
-        self._scope_fields = list(scope_fields)
+        self._summary_fields = list(summary_fields)
         self._settings_title = settings_title
         self._settings_fields = list(settings_fields)
         self._notes = list(notes)
@@ -483,7 +484,7 @@ class _ImportCard(CollapsibleConfigCard):
             yield self._row
             yield Label(Content.from_text(self._meta, markup=False), classes="mcp-import-card-meta")
         with self.card_body():
-            for field in self._scope_fields:
+            for field in self._summary_fields:
                 yield from _field_widgets(field)
             if self._settings_fields:
                 with Vertical(classes="mcp-import-settings") as section:
@@ -730,7 +731,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     row=row,
                     importable=state == "importable",
                     covered=covered,
-                    scope_fields=self._scope_fields(candidate, agent),
+                    summary_fields=self._summary_fields(candidate, agent),
                     settings_title=self._settings_title(candidate),
                     settings_fields=self._settings_fields(candidate),
                     collapsed=collapsed,
@@ -796,12 +797,19 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             return self._render_message(_UNTRUSTED_PROJECT.bind(agent=agent))
         return self._render_message(_UNSUPPORTED_REASONS[candidate.unsupported].bind(app=APP_DISPLAY_NAME))
 
-    def _scope_fields(self, candidate: McpImportCandidate, agent: str) -> list[_CardField]:
-        """Where the source uses the server, if only in one folder."""
-        if not candidate.scope_path:
-            return []
-        label = self._render_message(_SCOPE_FOLDER.bind(agent=agent))
-        return [_CardField(label, sanitize_legacy_scalar(candidate.scope_path))]
+    def _summary_fields(self, candidate: McpImportCandidate, agent: str) -> list[_CardField]:
+        """The source's description and, for folder-only servers, where it uses them."""
+        fields: list[_CardField] = []
+        if candidate.config is not None and candidate.config.description.strip():
+            fields.append(
+                _CardField(
+                    self._render_message(DESCRIPTION.bind()), sanitize_legacy_block(candidate.config.description)
+                )
+            )
+        if candidate.scope_path:
+            label = self._render_message(_SCOPE_FOLDER.bind(agent=agent))
+            fields.append(_CardField(label, sanitize_legacy_scalar(candidate.scope_path)))
+        return fields
 
     def _settings_title(self, candidate: McpImportCandidate) -> str:
         """The settings section's title, as the agent's MCP card names it; none when the source names no transport."""
