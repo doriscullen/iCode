@@ -22,6 +22,7 @@ from chrys.service.mcp.importers import (
     codex,
     detected_sources,
 )
+from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS
 from chrys.service.mcp.importers.codex import CodexSource
 from chrys.service.profiles.agents.schema import MCPServerConfig
 from tests.support.symlinks import symlink_or_skip
@@ -441,3 +442,12 @@ def test_empty_project_trust_entry_does_not_mask_root_trust(ctx: ImportContext) 
     _write(child / ".codex/config.toml", '[mcp_servers.s]\ncommand = "server"')
     (candidate,) = CodexSource().discover(ImportContext(str(child), ctx.home)).candidates
     assert candidate.config is not None
+
+
+def test_a_timeout_longer_than_icode_can_wait_is_capped(ctx: ImportContext) -> None:
+    _user(ctx, '[mcp_servers.slow]\ncommand = "server"\ntool_timeout_sec = 1e18\n')
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS

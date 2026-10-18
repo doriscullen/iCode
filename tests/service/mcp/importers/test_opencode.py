@@ -21,6 +21,7 @@ from chrys.service.mcp.importers import (
     SourceErrorKind,
     UnsupportedReason,
 )
+from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS
 from chrys.service.mcp.importers.opencode import OpenCodeSource
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -615,3 +616,12 @@ def test_the_home_opencode_folder_is_global_even_when_the_project_search_finds_i
     (candidate,) = _discover(home, managed, folder)
 
     assert (candidate.scope, candidate.scope_path) == ("global", "")
+
+
+def test_a_timeout_longer_than_icode_can_wait_is_capped(home: Path, managed: Path) -> None:
+    _global(home, {"mcp": {"slow": _local("cmd", timeout=10**300)}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None
+    assert candidate.config.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS

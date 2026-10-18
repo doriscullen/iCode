@@ -87,6 +87,7 @@ from chrys.service.mcp.importers.base import (
     json_number,
     read_source_bytes,
     render_template,
+    request_timeout_seconds,
     templates_convertible,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
@@ -524,7 +525,7 @@ def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpI
         "name": entry.name,
         "enabled": enabled,
         "description": config.get("description", ""),
-        "request_timeout": None if timeout is None else math.ceil(timeout),
+        "request_timeout": None if timeout is None else request_timeout_seconds(timeout),
         "allowed_tools": access.allowed_tools,
         "use_progressive_disclosure": access.on_demand,
         "always_load": access.always_load,

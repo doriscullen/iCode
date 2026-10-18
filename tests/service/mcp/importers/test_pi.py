@@ -22,7 +22,7 @@ from chrys.service.mcp.importers import (
     SourceErrorKind,
     UnsupportedReason,
 )
-from chrys.service.mcp.importers.base import render_template
+from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS, render_template
 from chrys.service.mcp.importers.pi import PiSource, _value_parts
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -466,3 +466,12 @@ def test_codemode_off_is_reported_when_nothing_reaches_the_tools(home: Path, wor
     _global(home, {"a": {"command": "cmd"}, "c": {"command": "cmd", "exposure": "deferred"}})
     candidates = _by_name(_discover(home, workspace))
     assert candidates["a"].warnings == ()
+
+
+def test_a_timeout_longer_than_icode_can_wait_is_capped(home: Path) -> None:
+    _global(home, {"slow": {"command": "cmd", "timeout": 1e300}})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.config is not None
+    assert candidate.config.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS

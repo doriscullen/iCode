@@ -15,6 +15,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -230,6 +231,16 @@ def read_json_object(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> dict[s
     """
     raw = read_source_bytes(path, max_bytes=max_bytes)
     return None if raw is None else parse_json_object(decode_source(raw))
+
+
+# The longest request timeout iCode's MCP client can wait, which it holds as a timedelta.
+# Whole days: ``timedelta.max.total_seconds()`` rounds up past what it holds.
+MAX_REQUEST_TIMEOUT_SECONDS = timedelta.max.days * 86_400
+
+
+def request_timeout_seconds(seconds: float) -> int:
+    """A finite timeout in *seconds* as iCode's request timeout: rounded up, at most what the client can wait."""
+    return min(math.ceil(seconds), MAX_REQUEST_TIMEOUT_SECONDS)
 
 
 def json_number(value: object) -> float | None:

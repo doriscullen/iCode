@@ -120,6 +120,7 @@ from chrys.service.mcp.importers.base import (
     json_number,
     read_source_bytes,
     render_template,
+    request_timeout_seconds,
     templates_convertible,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
@@ -858,7 +859,7 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
     if not enabled:
         warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     timeout = entry.get("timeout") if _is_positive_int(entry.get("timeout")) else merged.mcp_timeout
-    request_timeout = None if timeout is None else math.ceil(timeout / 1000)
+    request_timeout = None if timeout is None else request_timeout_seconds(timeout / 1000)
     # Keep tool_name_prefix empty, matching iCode's manual and Claude imports.
     # opencode v1.19.3 adds <server>_<tool> names automatically; iCode leaves
     # prefix selection to the user when tools collide with builtins or other servers.

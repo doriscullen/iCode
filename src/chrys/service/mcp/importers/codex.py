@@ -63,6 +63,7 @@ from chrys.service.mcp.importers.base import (
     git_root,
     read_source_bytes,
     render_template,
+    request_timeout_seconds,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -447,7 +448,7 @@ def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImpor
         headers=headers,
         enabled=value.get("enabled", True),
         allowed_tools=allowed,
-        request_timeout=math.ceil(timeout) if timeout else None,
+        request_timeout=request_timeout_seconds(timeout) if timeout else None,
     )
     return McpImportCandidate(
         name,

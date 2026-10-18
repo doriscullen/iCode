@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ from chrys.service.mcp.importers import (
     detected_sources,
 )
 from chrys.service.mcp.importers.base import (
+    MAX_REQUEST_TIMEOUT_SECONDS,
     SourceReadError,
     convert_dollar_templates,
     dollar_template_variables,
@@ -28,6 +31,7 @@ from chrys.service.mcp.importers.base import (
     has_dollar_template,
     json_number,
     read_json_object,
+    request_timeout_seconds,
 )
 from tests.support.symlinks import symlink_or_skip
 
@@ -234,3 +238,31 @@ def test_detected_sources_keeps_only_present_sources_in_order(tmp_path: Path) ->
 )
 def test_json_number_reads_a_number_as_javascript_holds_it(value: object, number: float | None) -> None:
     assert json_number(value) == number
+
+
+def test_the_longest_request_timeout_fits_the_mcp_clients_timedelta() -> None:
+    # The client builds timedelta(seconds=request_timeout) for every connection.
+    assert timedelta(seconds=request_timeout_seconds(1e300)) == timedelta(seconds=MAX_REQUEST_TIMEOUT_SECONDS)
+    assert request_timeout_seconds(12.1) == 13
+
+
+@dataclass(frozen=True)
+class _BrokenSource:
+    source_id: str = "broken"
+    display_name: str = "Broken"
+
+    def detect(self, ctx: ImportContext) -> bool:
+        raise PermissionError("config folder")
+
+    def discover(self, ctx: ImportContext) -> McpImportResult:
+        return McpImportResult()
+
+
+def test_a_source_whose_check_fails_leaves_the_others_offered(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    first = _FakeSource("first", "First", present=True)
+    last = _FakeSource("last", "Last", present=True)
+    ctx = ImportContext(workspace_cwd=None, home=tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger="chrys.service.mcp.importers.registry"):
+        assert detected_sources(ctx, [first, _BrokenSource(), last]) == [first, last]
+    assert [record.getMessage() for record in caplog.records] == ["Looking for Broken's MCP configuration failed"]
