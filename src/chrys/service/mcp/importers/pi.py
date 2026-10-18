@@ -2,8 +2,8 @@
 
 """Import MCP servers configured in pi, the coding agent.
 
-Baseline: pi 1.2.0 (tag ``v1.2.0`` of earendil-works/pi, commit 06a466935,
-2026-10-13). Each rule is tagged with the source it was read from:
+Baseline: pi 1.3.0 (tag ``v1.3.0`` of earendil-works/pi, commit 71023aec1,
+2026-10-15). Each rule is tagged with the source it was read from:
 ``[code: CA/core/mcp-servers.ts:248]`` with ``CA`` =
 ``packages/coding-agent/src``.
 
@@ -517,7 +517,7 @@ def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpI
         warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     timeout = config.get("timeout")
     # Keep tool_name_prefix empty, matching iCode's manual and Claude imports.
-    # pi v1.2.0 adds mcp__<server>__<tool> names automatically; iCode leaves
+    # pi v1.3.0 adds mcp__<server>__<tool> names automatically; iCode leaves
     # prefix selection to the user when tools collide with builtins or other servers.
     common: dict[str, Any] = {
         "name": entry.name,

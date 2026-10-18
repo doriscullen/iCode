@@ -2,10 +2,10 @@
 
 """Import local Codex MCP configuration without starting Codex or its servers.
 
-Baseline: https://github.com/openai/codex, tag ``rust-v0.162.1`` (0.162.1),
-commit ``092d3acd6bec3e3a14bdc7e7a2810ab628ab759d``. Source paths below are
+Baseline: https://github.com/openai/codex, tag ``rust-v0.163.0`` (0.163.0),
+commit ``83086188ae0614bd882818ff1aa23f3194962012``. Source paths below are
 relative to ``codex-rs`` at that commit; the release source is available at
-https://github.com/openai/codex/tree/rust-v0.162.1/codex-rs.
+https://github.com/openai/codex/tree/rust-v0.163.0/codex-rs.
 
 Read ``$CODEX_HOME/config.toml`` (default ``~/.codex/config.toml``), then
 ``.codex/config.toml`` from the nearest project root down to the workspace.
@@ -22,7 +22,7 @@ become iCode templates, never captured secrets. Explicit env beats env_vars;
 environment headers beat static headers; bearer auth beats Authorization
 [rmcp-client/src/utils.rs, codex-mcp/src/rmcp_client.rs]. Optional references
 get a warning because iCode requires them to be set. The default tool timeout
-is 300 seconds [codex-mcp/src/rmcp_client.rs:107]. Deny-only tool filters are
+is 300 seconds [codex-mcp/src/rmcp_client.rs:105]. Deny-only tool filters are
 imported with no tools, since iCode cannot express a deny list without a catalog.
 
 Not read: system/managed/cloud configuration, selected profile files,

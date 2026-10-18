@@ -2,7 +2,7 @@
 
 """Import MCP servers configured in opencode.
 
-Baseline: opencode 1.19.0 (tag ``v1.19.0``, commit 733b2c627e, 2026-10-11),
+Baseline: opencode 1.19.3 (tag ``v1.19.3``, commit e3c4eb2425, 2026-10-16),
 the release ``npm install opencode-ai`` installs; the ``v2.0.x`` tags of the
 same repository are an unreleased rewrite and are not followed. Each rule is
 tagged with the source it was read from, relative to the repository root:
@@ -860,7 +860,7 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
     timeout = entry.get("timeout") if _is_positive_int(entry.get("timeout")) else merged.mcp_timeout
     request_timeout = None if timeout is None else math.ceil(timeout / 1000)
     # Keep tool_name_prefix empty, matching iCode's manual and Claude imports.
-    # opencode v1.19.0 adds <server>_<tool> names automatically; iCode leaves
+    # opencode v1.19.3 adds <server>_<tool> names automatically; iCode leaves
     # prefix selection to the user when tools collide with builtins or other servers.
     if kind == "local":
         config = MCPServerConfig(

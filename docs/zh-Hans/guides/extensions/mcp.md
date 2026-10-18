@@ -70,11 +70,11 @@ STDIO 连接会在本机启动指定程序。如果启动命令会下载或运�
 
 iCode 会列出 Claude Code 使用的服务器，并沿用 Claude Code 的标注：
 
-- “用户”：为所有项目添加的服务器，保存在 `~/.claude.json`（或 `CLAUDE_CONFIG_DIR` 指定文件夹中的同名文件）中。
+- “用户”：为所有项目添加的服务器，保存在 `~/.claude.json`（或 `CLAUDE_CONFIG_DIR` 指定文件夹中的同名文件）中。如果 Claude Code 的设置文件夹（`~/.claude`，或 `CLAUDE_CONFIG_DIR` 指定的文件夹）中有旧版 Claude Code 留下的非空 `.config.json`，Claude Code 会改读这个文件，iCode 也一样。
 - “本地”：只为某一个文件夹添加的服务器，保存在同一个文件中。如果工作文件夹位于 Git 仓库中，列出的是为仓库顶层文件夹添加的服务器，Claude Code 在仓库内的任何文件夹中都使用它们；否则列出的是为工作文件夹本身添加的服务器。
 - “项目”：工作文件夹或其任一上级文件夹中 `.mcp.json` 文件里的服务器。“只为当前项目”安装服务器的工具会把它写在这里。
 
-Claude Code 自己不会加载的条目（例如有 URL 但没有 `type`，或命令不完整）不会列出。此外：
+Claude Code 自己不会加载的条目不会列出，例如有 URL 但没有 `type`、命令不完整、某项设置的类型不对，或名称是 Claude Code 留给自己服务器的（如 `workspace`）。此外：
 
 - `${GITHUB_TOKEN}` 会转换为 `{{GITHUB_TOKEN}}`。iCode 不支持默认值：`${HOST:-localhost}` 中的默认值 `localhost` 会被丢弃，提示中会写明是哪个配置项和哪个变量。提示不会重复默认值本身，因此用作默认值的令牌不会被复制到“描述”中。
 - Claude Code 会为它启动的 STDIO 服务器把 `CLAUDE_PROJECT_DIR` 设为项目文件夹，iCode 不会。每个引用了它的环境变量或请求头都会有提示：请在启动 iCode 前设置该变量，或改为写入文件夹路径。
@@ -82,10 +82,11 @@ Claude Code 自己不会加载的条目（例如有 URL 但没有 `type`，或�
 - 服务器的单次调用超时会保留：Claude Code 以毫秒为单位的 `timeout` 会向上取整，换算为 iCode 以秒为单位的“MCP 请求超时”。小于 1 秒的值会被忽略，Claude Code 也是如此。没有 `timeout` 但有 `request_timeout_ms` 的 HTTP 服务器改用该值，最长 5 分钟，与 Claude Code 一致。
 - 请求头辅助命令和 OAuth 设置不会导入，并会提示；请手动添加请求头。其他 iCode 不认识的设置也会列出。
 - SSE 和 WebSocket 服务器无法导入：iCode 只支持 STDIO 和 HTTP 服务器。`streamable-http` 类型按 HTTP 读取。
+- iCode 只通过可流式 HTTP（Streamable HTTP）连接 HTTP 服务器。只提供旧版 SSE 传输的服务器，即使 Claude Code 把它列为 HTTP 服务器，导入后也会连接失败；卡片无法提前显示这一点。如果“测试”失败，请确认该服务器是否提供可流式 HTTP 地址。
 
 ### Codex
 
-导入器以 [Codex 0.162.1](https://github.com/openai/codex/tree/rust-v0.162.1) 的源码和测试为依据。
+导入器以 [Codex 0.163.0](https://github.com/openai/codex/tree/rust-v0.163.0) 的源码和测试为依据。
 
 - “用户”：`~/.codex/config.toml` 中 `[mcp_servers]` 下的服务器，或 `CODEX_HOME` 指定文件夹中的 `config.toml`。相对的 `CODEX_HOME` 路径以当前工作文件夹为基准。
 - “项目”：从项目根目录到工作文件夹之间各层的 `.codex/config.toml`，较近的文件优先。项目根目录是最近的包含 `project_root_markers` 中任一标记的文件夹（默认标记为 `.git`）；没有标记时，只搜索工作文件夹本身。表按键合并，包括环境变量和请求头；数组整体替换。多个文件参与同一服务器的配置时，提示会列出其他文件。

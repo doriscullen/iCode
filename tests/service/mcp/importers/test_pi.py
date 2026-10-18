@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Tests for importing MCP servers configured in pi 1.2.0."""
+"""Tests for importing MCP servers configured in pi 1.3.0."""
 
 from __future__ import annotations
 

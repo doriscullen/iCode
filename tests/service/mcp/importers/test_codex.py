@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Codex importer behavior against openai/codex tag rust-v0.162.1."""
+"""Codex importer behavior against openai/codex tag rust-v0.163.0."""
 
 from __future__ import annotations
 

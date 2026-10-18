@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Tests for importing MCP servers configured in opencode 1.19.0."""
+"""Tests for importing MCP servers configured in opencode 1.19.3."""
 
 from __future__ import annotations
 

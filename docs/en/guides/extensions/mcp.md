@@ -70,11 +70,11 @@ What to know about imported servers, whichever agent they come from:
 
 iCode lists the servers Claude Code uses, labeled as Claude Code labels them:
 
-- "user": servers you added for all projects, kept in `~/.claude.json` (or the file of that name in the folder `CLAUDE_CONFIG_DIR` names).
+- "user": servers you added for all projects, kept in `~/.claude.json` (or the file of that name in the folder `CLAUDE_CONFIG_DIR` names). If Claude Code's settings folder (`~/.claude`, or the folder `CLAUDE_CONFIG_DIR` names) holds a non-empty `.config.json` left from an older Claude Code, Claude Code reads that file instead, and so does iCode.
 - "local": servers you added only for one folder, kept in the same file. If the working folder is inside a Git repository, these are the servers you added for the repository's top folder, which Claude Code uses in every folder of the repository. Otherwise they are the servers you added for the working folder itself.
 - "project": servers in the `.mcp.json` file of the working folder or of any folder above it. Tools that install a server "just for this project" put it there.
 
-Entries Claude Code itself doesn't load, such as a URL with no `type` or an incomplete command, are not listed. Also:
+Entries Claude Code itself doesn't load are not listed, such as a URL with no `type`, an incomplete command, a setting of the wrong type, or a name Claude Code keeps for its own servers, such as `workspace`. Also:
 
 - `${GITHUB_TOKEN}` becomes `{{GITHUB_TOKEN}}`. iCode has no default values: in `${HOST:-localhost}`, the default `localhost` is dropped, and a warning names the setting and the variable. The warning doesn't repeat the default, so a token used as one isn't copied into the description.
 - Claude Code sets `CLAUDE_PROJECT_DIR` to the project folder for the STDIO servers it starts; iCode doesn't. A warning names each environment variable or header that references it: set the variable before starting iCode, or write the folder path instead.
@@ -82,10 +82,11 @@ Entries Claude Code itself doesn't load, such as a URL with no `type` or an inco
 - The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
 - The headers helper command and OAuth settings are not imported, with a warning; add the headers yourself. Any other setting iCode doesn't recognize is listed too.
 - SSE and WebSocket servers can't be imported: iCode supports only STDIO and HTTP servers. The `streamable-http` type is read as HTTP.
+- iCode connects to an HTTP server over Streamable HTTP only. A server that offers only the older SSE transport fails to connect once imported, even when Claude Code lists it as an HTTP server; the card can't show this in advance. If "Test" fails, check whether the server offers a Streamable HTTP address.
 
 ### Codex
 
-The importer follows [Codex 0.162.1](https://github.com/openai/codex/tree/rust-v0.162.1), using its source code and tests as the reference.
+The importer follows [Codex 0.163.0](https://github.com/openai/codex/tree/rust-v0.163.0), using its source code and tests as the reference.
 
 - "user": servers under `[mcp_servers]` in `~/.codex/config.toml`, or `config.toml` in the folder `CODEX_HOME` names. A relative `CODEX_HOME` is resolved from the working folder.
 - "project": `.codex/config.toml` from the project root down to the working folder, with the nearer file taking precedence. The root is the nearest folder containing a `project_root_markers` entry (default: `.git`); without one, only the working folder is searched. Tables merge by key, including environment variables and headers; arrays replace earlier arrays. A warning names the other files contributing to a server.
