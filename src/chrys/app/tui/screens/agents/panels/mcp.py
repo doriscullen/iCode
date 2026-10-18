@@ -60,6 +60,9 @@ from chrys.app.tui.screens.agents.validation_messages import (
     MCP_COMMAND as _COMMAND,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
+    MCP_EMPTY as _EMPTY,
+)
+from chrys.app.tui.screens.agents.validation_messages import (
     MCP_ENABLED as _ENABLED,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
@@ -76,6 +79,9 @@ from chrys.app.tui.screens.agents.validation_messages import (
 )
 from chrys.app.tui.screens.agents.validation_messages import (
     MCP_TOOL_ACCESS_NONE as _TOOL_ACCESS_NONE_LABEL,
+)
+from chrys.app.tui.screens.agents.validation_messages import (
+    MCP_TRANSPORT_LABEL as _TRANSPORT,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
     MCP_URL as _URL,
@@ -183,7 +189,6 @@ _HEADER_VALUE_PLACEHOLDER = msg(
 )
 _VARIABLE_NAME_PLACEHOLDER = msg("tui.mcp.placeholder.variable_name", fallback="Variable name")
 _VALUE_PLACEHOLDER = msg("tui.mcp.placeholder.value", fallback="Value")
-_TRANSPORT = msg("tui.mcp.transport", fallback="Transport")
 _SERVER_NAME = msg("tui.mcp.server_name", fallback="Server Name")
 _SERVER_NAME_PLACEHOLDER = msg("tui.mcp.placeholder.server_name", fallback="Server name")
 _DESCRIPTION = msg("tui.mcp.description", fallback="Description")
@@ -238,7 +243,6 @@ _SERVERS_DESCRIPTION = msg(
     "tui.mcp.servers_description",
     fallback="Configure Model Context Protocol servers",
 )
-_EMPTY = msg("tui.mcp.empty", fallback="No MCP servers configured")
 _CONNECTION_SUCCESSFUL = msg("tui.mcp.connection_test.successful", fallback="Connection successful.")
 _CONNECTION_CONFIGURATION_CONFLICT = msg(
     "tui.mcp.connection_test.error.configuration_conflict",

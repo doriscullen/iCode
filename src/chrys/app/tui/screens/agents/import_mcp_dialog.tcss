@@ -72,9 +72,14 @@ ImportMcpServersDialog {
 }
 
 /* The checkbox, as Skills' "Workspace relative" one; its label is the server name */
+#mcp-import-servers .mcp-import-card-name {
+    width: 1fr;
+    height: 1;
+}
+
 #mcp-import-servers .mcp-import-row {
     width: auto;
-    max-width: 70%;
+    max-width: 100%;
     height: 1;
     border: none;
     background: transparent;
@@ -100,13 +105,6 @@ ImportMcpServersDialog {
     text-style: bold;
 }
 
-#mcp-import-servers .mcp-import-card-meta {
-    width: 1fr;
-    height: 1;
-    color: $text-muted;
-    text-align: right;
-}
-
 /* A card that can't be ticked: dashed and bare, its settings faded; the reason it can't be stays readable. */
 #mcp-import-servers .mcp-import-card.-unavailable {
     border: dashed $tui-border-foreground 30%;
@@ -114,7 +112,6 @@ ImportMcpServersDialog {
 }
 
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-row,
-#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-card-meta,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-label,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-value,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-pair-key,
@@ -147,19 +144,25 @@ ImportMcpServersDialog {
     padding: 0 1;
 }
 
-/* Env vars and headers: names in a column (its width set by _PairGrid), values beside them, rows apart
-   as on the agent's MCP card. */
+/* One line, cut at the edge, as in the card's one-line inputs (URL, env vars, headers). */
+#mcp-import-servers .mcp-import-field-value.-single-line,
+#mcp-import-servers .mcp-import-pair-key,
+#mcp-import-servers .mcp-import-pair-value {
+    height: 1;
+    text-wrap: nowrap;
+    text-overflow: clip;
+}
+
+/* Env vars and headers: names and values in two equal columns, rows apart, as on the agent's MCP card. */
 #mcp-import-servers .mcp-import-pairs {
     grid-size: 2;
-    grid-columns: auto 1fr;
+    grid-columns: 1fr 1fr;
     grid-gutter: 1 1;
     height: auto;
 }
 
-/* A grid row is as tall as its taller cell; both cells fill it, so a row's shading is one band. */
 #mcp-import-servers .mcp-import-pair-key,
 #mcp-import-servers .mcp-import-pair-value {
-    height: 100%;
     background: $foreground 8%;
     padding: 0 1;
 }
@@ -200,4 +203,9 @@ ImportMcpServersDialog {
 #mcp-import-servers .mcp-import-message {
     height: auto;
     color: $text-muted;
+}
+
+/* No servers: the hatched box of the agent's MCP tab, ending where the cards end. */
+#mcp-import-servers .mcp-import-empty {
+    margin: 0 1 1 0;
 }

@@ -7356,7 +7356,7 @@ msgstr ""
 
 #. English: No MCP servers configured
 #. chrys-meta={"fingerprint":"ffe25bec597af47e38bf067660ed3119eaa4cea5855c56fd3b70507415347677","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/panels/mcp.py
+#: src/chrys/app/tui/screens/agents/validation_messages.py
 msgid "tui.mcp.empty"
 msgstr ""
 
@@ -7463,10 +7463,22 @@ msgstr ""
 msgid "tui.mcp.import.detecting"
 msgstr ""
 
-#. English: {agent} uses it only in
-#. chrys-meta={"fingerprint":"c67eae54c2c512837666265b234c83a1bde16780d1d281f6594d1d327a4a742d","multiline":false,"placeholders":["agent"]}
+#. English: Scope in {agent}
+#. chrys-meta={"fingerprint":"d32ca91b1caf8005ae77be6ca0c0e2ef80141e70924e67ed38c1bf108130989f","multiline":false,"placeholders":["agent"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.field.folder"
+msgid "tui.mcp.import.field.scope"
+msgstr ""
+
+#. English: {scope}, used in every project
+#. chrys-meta={"fingerprint":"5b974ecdcab08e572cf39e4e896fee9b776b4d50e0f1ecc2edf684d2a0e79337","multiline":false,"placeholders":["scope"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.field.scope.every_project"
+msgstr ""
+
+#. English: {scope}, used only in {path}
+#. chrys-meta={"fingerprint":"c05c9a1092b3394541a33dedfd0c862225f53cea2ab9b74a99dc74350a882634","multiline":false,"placeholders":["path","scope"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.field.scope.only_in"
 msgstr ""
 
 #. English: {transport} Options
@@ -7485,12 +7497,6 @@ msgstr ""
 #. chrys-meta={"fingerprint":"cb251dba4a7e30b92da8392c3652e0487874331ab22894d3e29ae93d59942404","multiline":false,"placeholders":["agents"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.no_agents"
-msgstr ""
-
-#. English: No MCP servers configured in {agent}.
-#. chrys-meta={"fingerprint":"7c51876950199b3c2932222981ca3a5390db5d24ec4e956d1da5cd0cb6ae2d5e","multiline":false,"placeholders":["agent"]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.no_servers"
 msgstr ""
 
 #. English: Couldn't read the MCP servers of {agent}.
@@ -7523,16 +7529,17 @@ msgstr ""
 msgid "tui.mcp.import.scope.user"
 msgstr ""
 
-#. English: {agent} uses the servers marked {local} or {project} only in the
-#. folder their card names. Once imported, {app} uses them in every project.
-#. chrys-meta={"fingerprint":"8e2f72a9ed75713e7de307ac93d4c2eaa2e7547bdf2d1f7c7e1e6e0e50d760bb","multiline":false,"placeholders":["agent","app","local","project"]}
+#. English: {agent} uses the servers whose scope is {local} or {project} only
+#. in the folder their card names. Once imported, {app} uses them in every
+#. project.
+#. chrys-meta={"fingerprint":"862db5a851e972704f8b90ead3a6608ab70e0087d3992ff153319fe64530708b","multiline":false,"placeholders":["agent","app","local","project"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.scoped_notice"
 msgstr ""
 
-#. English: {agent} uses the servers marked {project} only in the folder their
-#. card names. Once imported, {app} uses them in every project.
-#. chrys-meta={"fingerprint":"a499b0960b92b26e85f3f32a26cb1b69d79a17c11cf99b337cf9c508585a067d","multiline":false,"placeholders":["agent","app","project"]}
+#. English: {agent} uses the servers whose scope is {project} only in the
+#. folder their card names. Once imported, {app} uses them in every project.
+#. chrys-meta={"fingerprint":"c7e3cb13b17ae7a5adfef91e2772f3688ca4dbb886475097a1ad2fc7ba5b1d51","multiline":false,"placeholders":["agent","app","project"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.scoped_notice.project"
 msgstr ""
@@ -8020,7 +8027,7 @@ msgstr ""
 
 #. English: Transport
 #. chrys-meta={"fingerprint":"3f7a0bc70e84dd2e6e3ca823a57284caadeb067c0e6c7c8f0535357221a794d6","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/panels/mcp.py
+#: src/chrys/app/tui/screens/agents/validation_messages.py
 msgid "tui.mcp.transport"
 msgstr ""
 
