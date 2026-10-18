@@ -11,6 +11,7 @@ profile is saved. Results carry codes, never prose, so the UI localizes them.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -229,6 +230,19 @@ def read_json_object(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> dict[s
     """
     raw = read_source_bytes(path, max_bytes=max_bytes)
     return None if raw is None else parse_json_object(decode_source(raw))
+
+
+def json_number(value: object) -> float | None:
+    """*value* as JavaScript holds a JSON number: a double, infinite for an int too long for one; None if not a number.
+
+    Agents written in JavaScript read config numbers so; converting a long int to a float in Python raises instead.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf if value > 0 else -math.inf
 
 
 def git_root(path: str) -> str | None:

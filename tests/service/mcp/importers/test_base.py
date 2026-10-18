@@ -26,6 +26,7 @@ from chrys.service.mcp.importers.base import (
     dollar_template_variables,
     dollar_templates_convertible,
     has_dollar_template,
+    json_number,
     read_json_object,
 )
 from tests.support.symlinks import symlink_or_skip
@@ -217,3 +218,19 @@ def test_detected_sources_keeps_only_present_sources_in_order(tmp_path: Path) ->
     ctx = ImportContext(workspace_cwd=None, home=tmp_path)
 
     assert detected_sources(ctx, [first, absent, last]) == [first, last]
+
+
+@pytest.mark.parametrize(
+    ("value", "number"),
+    [
+        (3000, 3000.0),
+        (12.5, 12.5),
+        (10**400, float("inf")),  # JavaScript reads it as Infinity; float() would raise
+        (-(10**400), float("-inf")),
+        (True, None),
+        ("3000", None),
+        (None, None),
+    ],
+)
+def test_json_number_reads_a_number_as_javascript_holds_it(value: object, number: float | None) -> None:
+    assert json_number(value) == number

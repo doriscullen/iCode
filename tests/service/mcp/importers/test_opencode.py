@@ -310,6 +310,11 @@ def test_jsonc_comments_and_trailing_commas_are_read(home: Path, managed: Path) 
         ('{"mcp": []}', SourceErrorKind.INVALID_CONFIG),
         ('{"mcp": {"bad": {"type": "local", "command": "cmd"}}}', SourceErrorKind.INVALID_CONFIG),
         ('{"mcp": {"bad": {"type": "remote", "url": "https://x.test", "timeout": 0}}}', SourceErrorKind.INVALID_CONFIG),
+        # Infinity to opencode; too long for a Python float.
+        (
+            '{"mcp": {"bad": {"type": "local", "command": ["cmd"], "timeout": 1%s}}}' % ("0" * 400),
+            SourceErrorKind.INVALID_CONFIG,
+        ),
         ('{"tools": {"x": "no"}}', SourceErrorKind.INVALID_CONFIG),
         ('{"permission": "sometimes"}', SourceErrorKind.INVALID_CONFIG),
         ('{"permissions": {}}', SourceErrorKind.INVALID_CONFIG),

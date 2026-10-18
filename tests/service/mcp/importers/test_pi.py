@@ -217,9 +217,11 @@ def test_settings_icode_lacks_are_reported(home: Path) -> None:
         {"command": "cmd", "args": "--flag"},
         {"command": "cmd", "env": {"A": 1}},
         {"command": "cmd", "timeout": 0},
+        {"command": "cmd", "timeout": 10**400},  # Infinity to pi; too long for a Python float
         {"command": "cmd", "exposure": "sometimes"},
         {"command": "cmd", "enabled": "no"},
         {"url": "https://x.test", "oauth": {"callbackPort": 0}},
+        {"url": "https://x.test", "oauth": {"callbackPort": 10**400}},
         {"url": "https://x.test", "oauth": {"clientRegistration": "cimd", "clientId": "x"}},
         {"url": "http://x.test", "auth": {"provider": "radius"}},
         {"enabled": False},

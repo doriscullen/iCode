@@ -117,6 +117,7 @@ from chrys.service.mcp.importers.base import (
     UnsupportedReason,
     decode_source,
     git_root,
+    json_number,
     read_source_bytes,
     render_template,
     templates_convertible,
@@ -683,9 +684,8 @@ def _optional(entry: dict[str, Any], key: str, kind: type) -> bool:
 
 
 def _is_positive_int(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return False
-    return math.isfinite(value) and value == int(value) and value > 0
+    number = json_number(value)
+    return number is not None and math.isfinite(number) and number.is_integer() and number > 0
 
 
 def _is_port(value: object) -> bool:

@@ -84,6 +84,7 @@ from chrys.service.mcp.importers.base import (
     TemplateVariable,
     UnsupportedReason,
     decode_source,
+    json_number,
     read_source_bytes,
     render_template,
     templates_convertible,
@@ -420,13 +421,13 @@ def _parse_url(value: str) -> Any:
 
 def _is_integral(value: object) -> bool:
     """A JSON number JavaScript's ``Number.isInteger`` accepts, ``3000.0`` included."""
-    return (
-        isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value == int(value)
-    )
+    number = json_number(value)
+    return number is not None and math.isfinite(number) and number.is_integer()
 
 
 def _is_positive_number(value: object) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+    number = json_number(value)
+    return number is not None and math.isfinite(number) and number > 0
 
 
 def _is_str_mapping(value: object) -> bool:
