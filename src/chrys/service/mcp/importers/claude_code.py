@@ -209,11 +209,11 @@ _FORBIDDEN_HOST_RE = re.compile(r"[\x00-\x20#/<>?@\[\]^|\x7f]")
 _URL_DROPPED_RE = re.compile(r"[\t\n\r]")
 _C0_AND_SPACE = "".join(chr(code) for code in range(0x21))
 
-# Variables Claude Code reads as empty in a remote server's url and headers, so a
-# project file or plugin can't send the user's own credentials to a server it
-# names [doc: mcp, "Credential variables that read as empty"]. The documented list
-# names examples; these are the ones it spells out. iCode has no such rule and would
-# send the real value.
+# Variables Claude Code reads as empty in a remote server's url and headers, whether
+# set or not and whatever their default, so a project file or plugin can't send the
+# user's own credentials to a server it names [doc: mcp, "Credential variables that
+# read as empty"]. The documented list names examples; these are the ones it spells
+# out. iCode has no such rule, so they are written as empty on import.
 CREDENTIAL_VARIABLES = frozenset(
     {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "HTTPS_PROXY", "NPM_TOKEN"}
 )
@@ -490,13 +490,17 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
     headers: dict[str, str] = entry.get("headers", {})
     if has_dollar_template(url):
         return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_IN_URL)
-    if not _convertible(headers):
+    if not _convertible(headers, read_as_empty=CREDENTIAL_VARIABLES):
         return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
-    converted_headers, warnings = _convert_mapping(headers)
+    converted_headers, warnings = _convert_mapping(headers, read_as_empty=CREDENTIAL_VARIABLES)
+    # A header a credential left blank carries nothing, as Claude Code sends it; the MCP card can't hold one.
+    converted_headers = {
+        key: value for key, value in converted_headers.items() if value.strip() or not headers[key].strip()
+    }
     warnings = (*warnings, *_credential_warnings(headers), *_project_dir_warnings(headers))
     if "headersHelper" in entry:
-        helper: str = entry["headersHelper"]
-        warnings = (*warnings, ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED, original=helper))
+        # The command may hold a credential, and warnings are saved in the description: name the setting only.
+        warnings = (*warnings, ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED))
     if "oauth" in entry:
         warnings = (*warnings, ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     warnings = (*warnings, *_unknown_fields(entry, _HTTP_FIELDS))
@@ -510,26 +514,32 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
     return McpImportCandidate(name, scope, source_path, config, warnings=warnings, transport="http")
 
 
-def _convertible(values: dict[str, str]) -> bool:
-    return all(dollar_templates_convertible(value) for value in values.values())
+def _convertible(values: dict[str, str], *, read_as_empty: frozenset[str] = frozenset()) -> bool:
+    return all(dollar_templates_convertible(value, read_as_empty=read_as_empty) for value in values.values())
 
 
-def _convert_mapping(values: dict[str, str]) -> tuple[dict[str, str], tuple[ImportWarning, ...]]:
+def _convert_mapping(
+    values: dict[str, str], *, read_as_empty: frozenset[str] = frozenset()
+) -> tuple[dict[str, str], tuple[ImportWarning, ...]]:
     # Warnings name the setting, never its value: they are saved in the description, and the value may be a secret.
     converted: dict[str, str] = {}
     warnings: list[ImportWarning] = []
     for key, value in values.items():
-        converted[key], value_warnings = convert_dollar_templates(value)
+        converted[key], value_warnings = convert_dollar_templates(value, read_as_empty=read_as_empty)
         warnings.extend(replace(warning, field=key) for warning in value_warnings)
     return converted, tuple(warnings)
 
 
 def _credential_warnings(headers: dict[str, str]) -> Iterable[ImportWarning]:
-    """One warning per header that references a variable Claude Code never sends to a remote server."""
+    """One warning per header that references a variable Claude Code, and so the import, writes as empty."""
     for key, value in headers.items():
-        for variable in dollar_template_variables(value):
-            if variable in CREDENTIAL_VARIABLES:
-                yield ImportWarning(ImportWarningKind.CREDENTIAL_VARIABLE, variable, field=key)
+        for variable in _credential_variables(value):
+            yield ImportWarning(ImportWarningKind.CREDENTIAL_VARIABLE, variable, field=key)
+
+
+def _credential_variables(value: str) -> list[str]:
+    # In any case: on Windows ${anthropic_api_key} would resolve to the real ANTHROPIC_API_KEY.
+    return [variable for variable in dollar_template_variables(value) if variable.upper() in CREDENTIAL_VARIABLES]
 
 
 def _project_dir_warnings(values: dict[str, str]) -> Iterable[ImportWarning]:

@@ -551,14 +551,15 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
             "ROOT references CLAUDE_PROJECT_DIR, which Claude Code sets to the project folder for the servers it "
             "starts. iCode doesn't set it: set it before starting iCode, or write the folder path instead."
         )
+        # The command may hold a credential: the warning, saved in the description, never names it.
         helper = (
-            "The headers helper command ./get-headers.sh is not imported: iCode doesn't run it. "
+            "The headers helper command is not imported: iCode doesn't run it. "
             "Add the headers it produces under Headers yourself."
         )
         credential = (
-            "Authorization references ANTHROPIC_API_KEY, which Claude Code never sends to a remote server. "
-            "iCode does send its real value: remove the header, or copy the credential into a variable with "
-            "another name and reference that."
+            "Authorization references ANTHROPIC_API_KEY, which Claude Code sends to a remote server as empty, "
+            "so iCode imports it as empty too; a header left blank is not imported. To send this credential, "
+            "copy it into a variable with another name and reference that."
         )
         oauth = (
             "The OAuth sign-in settings are not imported: iCode doesn't sign in to MCP servers with OAuth. "
@@ -579,8 +580,13 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
             f"{_USER_ORIGIN}\n- {dropped_token}\n- {helper}",
             f"{_USER_ORIGIN}\n- {credential}\n- {oauth}\n- {unknown}",
         ]
-        # A dropped default may be a secret: the saved description never repeats it.
-        assert not any("sk-live-abc" in str(config.description) for config in panel.get_config())
+        # A dropped default may be a secret, and so may the helper command: the saved description repeats neither.
+        assert not any(
+            "sk-live-abc" in config.description or "get-headers.sh" in config.description
+            for config in panel.get_config()
+        )
+        # The credential is sent empty, as Claude Code sends it (the card trims the value it holds).
+        assert panel.get_config()[2].headers == {"Authorization": "Bearer"}
 
 
 async def test_import_lists_claude_servers_and_adds_ticked_ones_as_unsaved_cards(claude_home: Path) -> None:
@@ -1225,7 +1231,6 @@ async def test_codex_servers_are_detected_previewed_and_imported(tmp_path: Path)
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         assert [str(sources.get_option_at_index(i).prompt) for i in range(sources.option_count)] == ["Codex"]
         assert remote.disabled is True
-        assert "('TOKEN', '{{TOKEN}}')" in str(_cards_in(dialog))
         files.value = True
         await _import_ticked(dialog, pilot)
         await wait_for(lambda: results, pilot=pilot, description="Codex server imported")
@@ -1234,12 +1239,11 @@ async def test_codex_servers_are_detected_previewed_and_imported(tmp_path: Path)
         (server,) = imported
         assert server.name == "files"
         assert server.command == "server-files"
-        assert server.env == {"TOKEN": "{{TOKEN}}"}
+        assert server.env == {}
         assert server.enabled is False
         assert server.request_timeout == 42
         assert server.allowed_tools == ["read"]
         assert server.description.startswith("Imported from Codex.")
-        assert "requires a nonempty value" in server.description
 
 
 def _option_list_lines(option_list: OptionList) -> list[str]:

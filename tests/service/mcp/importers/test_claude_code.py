@@ -667,8 +667,8 @@ def test_oauth_settings_are_reported_as_not_imported(home: Path) -> None:
 
 
 def test_headers_naming_a_credential_claude_code_withholds_are_flagged(home: Path) -> None:
-    # Claude Code reads these variables as empty in a remote server's headers; iCode would send
-    # the real value [doc: mcp, "Credential variables that read as empty"].
+    # Claude Code reads these variables as empty in a remote server's headers, set or not and whatever
+    # their default, so they are imported empty [doc: mcp, "Credential variables that read as empty"].
     _write_json(
         home / ".claude.json",
         {
@@ -689,9 +689,9 @@ def test_headers_naming_a_credential_claude_code_withholds_are_flagged(home: Pat
     (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
 
     assert candidate.config is not None
-    assert candidate.config.headers["Authorization"] == "Bearer {{ANTHROPIC_AUTH_TOKEN}}"
+    # A header left with nothing is dropped: it would carry nothing, and the MCP card can't hold it.
+    assert candidate.config.headers == {"Authorization": "Bearer ", "X-Own": "{{MY_TOKEN}}"}
     assert candidate.warnings == (
-        ImportWarning(ImportWarningKind.DEFAULT_DROPPED, "HTTPS_PROXY", field="X-Proxy"),
         ImportWarning(ImportWarningKind.CREDENTIAL_VARIABLE, "ANTHROPIC_AUTH_TOKEN", field="Authorization"),
         ImportWarning(ImportWarningKind.CREDENTIAL_VARIABLE, "HTTPS_PROXY", field="X-Proxy"),
     )
@@ -824,7 +824,8 @@ def test_headers_helper_is_reported_as_not_imported(home: Path) -> None:
     (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
 
     assert candidate.config is not None
-    assert candidate.warnings == (ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED, original="get-token.sh"),)
+    # The command may hold a credential, and the warning is saved in the description.
+    assert candidate.warnings == (ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED),)
 
 
 @pytest.mark.parametrize(
@@ -990,3 +991,37 @@ def test_linked_config_files_are_read_through_the_link(home: Path, tmp_path: Pat
 
     assert [candidate.name for candidate in result.candidates] == ["project-server", "user-server"]
     assert result.source_errors == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "imported"),
+    [
+        ("Bearer ${ANTHROPIC_API_KEY:-fallback}", "Bearer "),  # its default is ignored too
+        ("Bearer ${anthropic_api_key}", "Bearer "),  # Windows would resolve it to the real key
+        # Judged once emptied: the braces left are ones iCode can write, so the server isn't locked.
+        ("{${ANTHROPIC_API_KEY}}", "{}"),
+    ],
+)
+def test_a_credential_variable_is_written_as_empty_wherever_it_appears(home: Path, value: str, imported: str) -> None:
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"remote": {"type": "http", "url": "https://x.test", "headers": {"X-Key": value}}}},
+    )
+
+    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"X-Key": imported}
+
+
+def test_a_header_written_blank_is_kept_for_the_user_to_see(home: Path) -> None:
+    # Only a header a credential emptied is left out; one written blank stays, and saving names it.
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"remote": {"type": "http", "url": "https://x.test", "headers": {"X-Blank": ""}}}},
+    )
+
+    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"X-Blank": ""}

@@ -168,7 +168,7 @@ _DEFAULT_DROPPED = msg(
 _HEADERS_HELPER_IGNORED = msg(
     "tui.mcp.import.warning.headers_helper_ignored",
     fallback=(
-        "The headers helper command {command} is not imported: {app} doesn't run it. "
+        "The headers helper command is not imported: {app} doesn't run it. "
         "Add the headers it produces under Headers yourself."
     ),
 )
@@ -182,9 +182,9 @@ _OAUTH_IGNORED = msg(
 _CREDENTIAL_VARIABLE = msg(
     "tui.mcp.import.warning.credential_variable",
     fallback=(
-        "{field} references {variable}, which {agent} never sends to a remote server. {app} does send "
-        "its real value: remove the header, or copy the credential into a variable with another name "
-        "and reference that."
+        "{field} references {variable}, which {agent} sends to a remote server as empty, so {app} "
+        "imports it as empty too; a header left blank is not imported. To send this credential, copy it "
+        "into a variable with another name and reference that."
     ),
 )
 _CLAUDE_PROJECT_DIR = msg(
@@ -885,7 +885,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     app=APP_DISPLAY_NAME,
                 )
             case ImportWarningKind.HEADERS_HELPER_IGNORED:
-                reference = _HEADERS_HELPER_IGNORED.bind(command=original, app=APP_DISPLAY_NAME)
+                reference = _HEADERS_HELPER_IGNORED.bind(app=APP_DISPLAY_NAME)
             case ImportWarningKind.OAUTH_IGNORED:
                 reference = _OAUTH_IGNORED.bind(app=APP_DISPLAY_NAME)
             case ImportWarningKind.CREDENTIAL_VARIABLE:

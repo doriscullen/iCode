@@ -5,12 +5,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from chrys.foundation.platform import get_platform
 from chrys.foundation.util.env_templates import resolve_env_templates
 from chrys.service.mcp.importers import (
     IMPORT_SOURCES,
@@ -19,7 +17,6 @@ from chrys.service.mcp.importers import (
     McpSourceError,
     SourceErrorKind,
     UnsupportedReason,
-    codex,
     detected_sources,
 )
 from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS
@@ -90,25 +87,22 @@ enabled = false
     assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.DISABLED]
 
 
-def test_env_references_stay_dynamic_and_explicit_values_win(ctx: ImportContext) -> None:
+def test_forwarded_variables_are_left_to_the_inherited_environment(ctx: ImportContext) -> None:
+    # Codex forwards each one only while it is set; iCode's stdio servers inherit the environment,
+    # where a {{VAR}} reference would fail the connection whenever the variable is unset.
     _user(
         ctx,
         """
 [mcp_servers.files]
 command = "server"
-env_vars = ["TOKEN", {name = "OTHER", source = "local"}, "OVERRIDE"]
+env_vars = ["TOKEN", {name = "OTHER", source = "local"}, "OVERRIDE", "BAD-NAME", "NODE_REPL_AUTH_TOKEN"]
 env = { OVERRIDE = "literal {{text}}" }
 """,
     )
-    context = ImportContext(ctx.workspace_cwd, ctx.home, {"TOKEN": "do-not-copy-this-secret"})
-    (candidate,) = CodexSource().discover(context).candidates
+    (candidate,) = CodexSource().discover(ctx).candidates
     assert candidate.config is not None
-    assert candidate.config.env == {"TOKEN": "{{TOKEN}}", "OTHER": "{{OTHER}}", "OVERRIDE": "literal {{{{text}}}}"}
-    assert "do-not-copy-this-secret" not in repr(candidate)
-    assert [(warning.kind, warning.variable) for warning in candidate.warnings] == [
-        (ImportWarningKind.OPTIONAL_VARIABLE, "TOKEN"),
-        (ImportWarningKind.OPTIONAL_VARIABLE, "OTHER"),
-    ]
+    assert candidate.config.env == {"OVERRIDE": "literal {{{{text}}}}"}
+    assert candidate.warnings == ()
 
 
 def test_http_header_precedence_literal_escaping_and_bearer_token(
@@ -248,7 +242,6 @@ def test_invalid_entries_are_not_candidates(ctx: ImportContext, entry: str) -> N
 @pytest.mark.parametrize(
     "entry",
     [
-        'command = "server"\nenv_vars = ["BAD-NAME"]',
         'url = "https://example.test"\nbearer_token_env_var = "BAD-NAME"',
         'url = "https://example.test"\nenv_http_headers = {"X-Key" = "BAD-NAME"}',
     ],
@@ -396,7 +389,6 @@ def test_codex_filtered_variables_are_not_copied(ctx: ImportContext) -> None:
         """
 [mcp_servers.s]
 command = "server"
-env_vars = ["NODE_REPL_AUTH_TOKEN"]
 env = { openai_identity_token_file = "secret-location", NORMAL = "value" }
 """,
     )
@@ -404,22 +396,7 @@ env = { openai_identity_token_file = "secret-location", NORMAL = "value" }
     assert candidate.config is not None
     assert candidate.config.env == {"NORMAL": "value"}
     assert "secret-location" not in repr(candidate)
-    assert {warning.original for warning in candidate.warnings} == {
-        "env.openai_identity_token_file",
-        "env_vars.NODE_REPL_AUTH_TOKEN",
-    }
-
-
-def test_windows_explicit_env_overrides_forwarded_variable_caselessly(
-    ctx: ImportContext, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    platform = replace(get_platform(), os_name="windows")
-    monkeypatch.setattr(codex, "get_platform", lambda: platform)
-    _user(ctx, '[mcp_servers.s]\ncommand = "server"\nenv_vars = ["TOKEN"]\nenv = {token = "literal"}')
-    (candidate,) = CodexSource().discover(ctx).candidates
-    assert candidate.config is not None
-    assert candidate.config.env == {"token": "literal"}
-    assert candidate.warnings == ()
+    assert {warning.original for warning in candidate.warnings} == {"env.openai_identity_token_file"}
 
 
 def test_trust_accepts_original_symlink_spelling(ctx: ImportContext, tmp_path: Path) -> None:

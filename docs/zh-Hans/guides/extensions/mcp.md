@@ -78,9 +78,9 @@ Claude Code 自己不会加载的条目不会列出，例如有 URL 但没有 `t
 
 - `${GITHUB_TOKEN}` 会转换为 `{{GITHUB_TOKEN}}`。iCode 不支持默认值：`${HOST:-localhost}` 中的默认值 `localhost` 会被丢弃，提示中会写明是哪个配置项和哪个变量。提示不会重复默认值本身，因此用作默认值的令牌不会被复制到“描述”中。
 - Claude Code 会为它启动的 STDIO 服务器把 `CLAUDE_PROJECT_DIR` 设为项目文件夹，iCode 不会。每个引用了它的环境变量或请求头都会有提示：请在启动 iCode 前设置该变量，或改为写入文件夹路径。
-- Claude Code 从不把它自身的几个凭据变量（如 `ANTHROPIC_API_KEY`）发给远程服务器，即使请求头中引用了它们。iCode 没有这条规则，会发送真实值，因此每个引用了这类变量的请求头都会有提示。请删除该请求头，或把凭据复制到另一个名字的变量中。
+- Claude Code 在远程服务器的请求头中会把几个凭据变量（如 `ANTHROPIC_API_KEY`）读作空值，这样项目的 `.mcp.json` 就无法把你的凭据发给它指定的服务器。iCode 导入时也把它们写成空值，每个引用了这类变量的请求头都会有提示；变成空的请求头会被去掉。如需发送这类凭据，请把它复制到另一个名字的变量中再引用。
 - 服务器的单次调用超时会保留：Claude Code 以毫秒为单位的 `timeout` 会向上取整，换算为 iCode 以秒为单位的“MCP 请求超时”。小于 1 秒的值会被忽略，Claude Code 也是如此。没有 `timeout` 但有 `request_timeout_ms` 的 HTTP 服务器改用该值，最长 5 分钟，与 Claude Code 一致。
-- 请求头辅助命令和 OAuth 设置不会导入，并会提示；请手动添加请求头。其他 iCode 不认识的设置也会列出。
+- 请求头辅助命令和 OAuth 设置不会导入，并会提示；请手动添加请求头。提示中不会重复该命令，因为命令里可能含有凭据。其他 iCode 不认识的设置也会列出。
 - SSE 和 WebSocket 服务器无法导入：iCode 只支持 STDIO 和 HTTP 服务器。`streamable-http` 类型按 HTTP 读取。
 - iCode 只通过可流式 HTTP（Streamable HTTP）连接 HTTP 服务器。只提供旧版 SSE 传输的服务器，即使 Claude Code 把它列为 HTTP 服务器，导入后也会连接失败；卡片无法提前显示这一点。如果“测试”失败，请确认该服务器是否提供可流式 HTTP 地址。
 
@@ -96,7 +96,7 @@ Claude Code 自己不会加载的条目不会列出，例如有 URL 但没有 `t
 此外：
 
 - `command` 表示 STDIO，`url` 表示 HTTP。两者同时存在时无效，即使它们来自不同文件的合并。无效的服务器条目不会列出；文件无法读取或 TOML 格式错误时会显示错误。
-- `env` 和 `http_headers` 中的值保持为字面量。`env_vars`、`env_http_headers` 和 `bearer_token_env_var` 转为 `{{VARIABLE}}` 引用，不复制当前凭据值。显式环境变量覆盖转发变量，环境变量请求头覆盖静态请求头，Bearer 认证覆盖 Authorization 请求头。Codex 在变量不可用时可以跳过可选引用，而 iCode 要求非空值，因此这类引用会有提示。
+- `env` 和 `http_headers` 中的值保持为字面量。STDIO 服务器的 `env_vars` 不会复制：Codex 只在变量已设置时才转发，而 iCode 启动 STDIO 服务器时会传入自身的环境变量，服务器能拿到 iCode 环境中的变量。`env_http_headers` 和 `bearer_token_env_var` 转为 `{{VARIABLE}}` 引用，不复制当前凭据值。环境变量请求头覆盖静态请求头，Bearer 认证覆盖 Authorization 请求头。Codex 在变量不可用时可以跳过可选请求头，而 iCode 要求非空值，因此这类请求头会有提示。
 - 已禁用的服务器保持禁用。`tool_timeout_sec` 转为“MCP 请求超时”，向上取整到秒；此 Codex 版本的默认值为 300 秒。零超时无法保留，会提示未导入。iCode 也用请求超时限制连接建立；Codex 独立的启动超时不会导入。
 - `enabled_tools` 转为可用工具列表，并扣除 `disabled_tools`。只有禁用列表时，会导入为**无工具**并显示提示：请在“可用工具范围”中自行选择允许的工具。
 - 自定义 `cwd`、OAuth 凭据及设置、ChatGPT／企业登录、请求头辅助命令、审批规则及其他无对应功能的设置不会导入，提示会列出这些设置。不执行任何辅助命令。远程执行环境或取自远程环境的变量不能作为本地服务器导入。

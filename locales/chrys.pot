@@ -7672,10 +7672,11 @@ msgstr ""
 msgid "tui.mcp.import.warning.codemode_off"
 msgstr ""
 
-#. English: {field} references {variable}, which {agent} never sends to a
-#. remote server. {app} does send its real value: remove the header, or copy
-#. the credential into a variable with another name and reference that.
-#. chrys-meta={"fingerprint":"606a4e539b142a55309f7ab4588e999db67f5c9a3c34908b24031d7fbaaf8cb2","multiline":false,"placeholders":["agent","app","field","variable"]}
+#. English: {field} references {variable}, which {agent} sends to a remote
+#. server as empty, so {app} imports it as empty too; a header left blank is
+#. not imported. To send this credential, copy it into a variable with another
+#. name and reference that.
+#. chrys-meta={"fingerprint":"fc03e8ff6ebb0a7e3bfd3c786185591fcf41dbae92a5e3f77908261dde05dbe7","multiline":false,"placeholders":["agent","app","field","variable"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.credential_variable"
 msgstr ""
@@ -7710,9 +7711,9 @@ msgstr ""
 msgid "tui.mcp.import.warning.disabled"
 msgstr ""
 
-#. English: The headers helper command {command} is not imported: {app} doesn't
-#. run it. Add the headers it produces under Headers yourself.
-#. chrys-meta={"fingerprint":"18418c74a3e1cff8f7a289c959bb4d24e2aa46c1f8d8cba0e717c80b8049312f","multiline":false,"placeholders":["app","command"]}
+#. English: The headers helper command is not imported: {app} doesn't run it.
+#. Add the headers it produces under Headers yourself.
+#. chrys-meta={"fingerprint":"17fb38b02ebe713b0b83d9f4c196099bc6f5c9b2ab4715573577233978a9c0be","multiline":false,"placeholders":["app"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.headers_helper_ignored"
 msgstr ""

@@ -7857,13 +7857,14 @@ msgstr "{field} 引用了 {variable}，{agent} 会为它启动的服务器把它
 msgid "tui.mcp.import.warning.codemode_off"
 msgstr "{agent} 只能在 codemode 中调用这个服务器的工具，但它没有开启 codemode（autoEnableCodemode 为 false），所以除非开启 codemode，否则无法调用这些工具。{app} 会按需加载这些工具。"
 
-#. English: {field} references {variable}, which {agent} never sends to a
-#. remote server. {app} does send its real value: remove the header, or copy
-#. the credential into a variable with another name and reference that.
-#. chrys-meta={"fingerprint":"606a4e539b142a55309f7ab4588e999db67f5c9a3c34908b24031d7fbaaf8cb2","multiline":false,"placeholders":["agent","app","field","variable"]}
+#. English: {field} references {variable}, which {agent} sends to a remote
+#. server as empty, so {app} imports it as empty too; a header left blank is
+#. not imported. To send this credential, copy it into a variable with another
+#. name and reference that.
+#. chrys-meta={"fingerprint":"fc03e8ff6ebb0a7e3bfd3c786185591fcf41dbae92a5e3f77908261dde05dbe7","multiline":false,"placeholders":["agent","app","field","variable"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.credential_variable"
-msgstr "{field} 引用了 {variable}，{agent} 从不把它发给远程服务器，而 {app} 会发送它的真实值。请删除这个请求头，或把该凭据复制到另一个名字的变量中再引用。"
+msgstr "{field} 引用了 {variable}，{agent} 发给远程服务器时会把它当作空值，因此 {app} 导入时也写成空值；变成空的请求头不会导入。如需发送这个凭据，请把它复制到另一个名字的变量中再引用。"
 
 #. English: {agent} starts this server in {folder}. {app} starts it in the
 #. working folder, so a server that needs that folder may not work.
@@ -7895,12 +7896,12 @@ msgstr "{agent} 禁用了这些工具：{tools}。{app} 需要允许使用的工
 msgid "tui.mcp.import.warning.disabled"
 msgstr "{agent} 中已关闭这个服务器，因此导入后也处于关闭状态。要使用它，请在其卡片中勾选“{enabled}”。"
 
-#. English: The headers helper command {command} is not imported: {app} doesn't
-#. run it. Add the headers it produces under Headers yourself.
-#. chrys-meta={"fingerprint":"18418c74a3e1cff8f7a289c959bb4d24e2aa46c1f8d8cba0e717c80b8049312f","multiline":false,"placeholders":["app","command"]}
+#. English: The headers helper command is not imported: {app} doesn't run it.
+#. Add the headers it produces under Headers yourself.
+#. chrys-meta={"fingerprint":"17fb38b02ebe713b0b83d9f4c196099bc6f5c9b2ab4715573577233978a9c0be","multiline":false,"placeholders":["app"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.headers_helper_ignored"
-msgstr "未导入请求头辅助命令 {command}：{app} 不会运行它。请把它生成的请求头手动添加到“请求头”中。"
+msgstr "未导入请求头辅助命令：{app} 不会运行它。请把它生成的请求头手动添加到“请求头”中。"
 
 #. English: {agent} combines this server's settings from more than one file.
 #. Also from: {files}.

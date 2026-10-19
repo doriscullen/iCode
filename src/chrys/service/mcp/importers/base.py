@@ -277,33 +277,41 @@ def dollar_template_variables(value: str) -> list[str]:
     return list(dict.fromkeys(match.group(1) for match in _DOLLAR_TEMPLATE_RE.finditer(value)))
 
 
-def dollar_templates_convertible(value: str) -> bool:
+def dollar_templates_convertible(value: str, *, read_as_empty: frozenset[str] = frozenset()) -> bool:
     """Whether :func:`convert_dollar_templates` writes *value* so iCode reads it back as the source meant."""
-    return templates_convertible(_dollar_parts(value)[0])
+    return templates_convertible(_dollar_parts(value, read_as_empty)[0])
 
 
-def convert_dollar_templates(value: str) -> tuple[str, tuple[ImportWarning, ...]]:
+def convert_dollar_templates(
+    value: str, *, read_as_empty: frozenset[str] = frozenset()
+) -> tuple[str, tuple[ImportWarning, ...]]:
     """Rewrite ``${VAR}`` placeholders as iCode's ``{{VAR}}`` for a field iCode resolves.
 
     Literal ``{{``/``}}`` are escaped so iCode reads them back unchanged. iCode
     has no default syntax: ``${VAR:-default}`` becomes ``{{VAR}}`` with a
-    warning naming the variable.
+    warning naming the variable. A variable in *read_as_empty*, which the source
+    never expands there, becomes nothing, its default included. Its names are
+    upper case and matched in any case, as Windows looks variables up.
     """
-    parts, warnings = _dollar_parts(value)
+    parts, warnings = _dollar_parts(value, read_as_empty)
     return render_template(parts), warnings
 
 
-def _dollar_parts(value: str) -> tuple[list[TemplatePart], tuple[ImportWarning, ...]]:
+def _dollar_parts(
+    value: str, read_as_empty: frozenset[str] = frozenset()
+) -> tuple[list[TemplatePart], tuple[ImportWarning, ...]]:
     parts: list[TemplatePart] = []
     warnings: list[ImportWarning] = []
     position = 0
     for match in _DOLLAR_TEMPLATE_RE.finditer(value):
         parts.append(value[position : match.start()])
         variable = match.group(1)
+        position = match.end()
+        if variable.upper() in read_as_empty:
+            continue
         parts.append(TemplateVariable(variable))
         if match.group(2) is not None:
             warnings.append(ImportWarning(ImportWarningKind.DEFAULT_DROPPED, variable))
-        position = match.end()
     parts.append(value[position:])
     return parts, tuple(warnings)
 

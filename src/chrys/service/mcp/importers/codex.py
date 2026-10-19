@@ -17,12 +17,13 @@ Untrusted and undecided project layers are shown locked, not merged
 recursively; arrays and scalars replace [config/src/merge.rs].
 
 Transport inference and validation follow config/src/mcp_types.rs. Values
-in ``env`` and ``http_headers`` are literal; named environment references
-become iCode templates, never captured secrets. Explicit env beats env_vars;
-environment headers beat static headers; bearer auth beats Authorization
-[rmcp-client/src/utils.rs, codex-mcp/src/rmcp_client.rs]. Optional references
-get a warning because iCode requires them to be set. The default tool timeout
-is 300 seconds [codex-mcp/src/rmcp_client.rs:105]. Deny-only tool filters are
+in ``env`` and ``http_headers`` are literal; header references to environment
+variables become iCode templates, never captured secrets. A stdio server's
+``env_vars``, which Codex forwards only while set, are left to the environment
+iCode's stdio servers inherit. Environment headers beat static headers; bearer
+auth beats Authorization [rmcp-client/src/utils.rs, codex-mcp/src/rmcp_client.rs].
+Optional header references get a warning because iCode requires them to be set.
+The default tool timeout is 300 seconds [codex-mcp/src/rmcp_client.rs:105]. Deny-only tool filters are
 imported with no tools, since iCode cannot express a deny list without a catalog.
 
 Not read: system/managed/cloud configuration, selected profile files,
@@ -48,7 +49,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from chrys.foundation.platform import get_platform
 from chrys.service.mcp.importers.base import (
     ImportContext,
     ImportWarning,
@@ -385,25 +385,16 @@ def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImpor
             del env[key]
             warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=f"env.{key}"))
     headers = {key.lower(): render_template([literal]) for key, literal in value.get("http_headers", {}).items()}
-    references = {
-        item if isinstance(item, str) else item["name"]: item if isinstance(item, str) else item["name"]
-        for item in variables
-    }
-    if not stdio:
-        references = {key.lower(): variable for key, variable in value.get("env_http_headers", {}).items()}
-    target = env if stdio else headers
+    # A stdio server's env_vars are left out: Codex forwards each one only while it is set, and iCode's
+    # stdio servers inherit the environment, where a {{VAR}} reference would fail the connection
+    # whenever the variable is unset.
+    references = {} if stdio else {key.lower(): variable for key, variable in value.get("env_http_headers", {}).items()}
     for key, variable in references.items():
-        if stdio:
-            if key.upper() in _NON_INHERITABLE:
-                warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=f"env_vars.{key}"))
-                continue
-            if key in env or (get_platform().is_windows and any(key.lower() == name.lower() for name in env)):
-                continue
-        if not stdio and key == "authorization" and "bearer_token_env_var" in value:
+        if key == "authorization" and "bearer_token_env_var" in value:
             continue
         if not _VARIABLE.fullmatch(variable):
             return unsupported(UnsupportedReason.VARIABLE_NAME)
-        target[key] = render_template([TemplateVariable(variable)])
+        headers[key] = render_template([TemplateVariable(variable)])
         warnings.append(ImportWarning(ImportWarningKind.OPTIONAL_VARIABLE, variable=variable, field=key))
     if "bearer_token_env_var" in value:
         variable = value["bearer_token_env_var"]
