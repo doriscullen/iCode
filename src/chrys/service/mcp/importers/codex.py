@@ -64,6 +64,7 @@ from chrys.service.mcp.importers.base import (
     read_source_bytes,
     render_template,
     request_timeout_seconds,
+    trim_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -384,7 +385,10 @@ def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImpor
         if key.upper() in _NON_INHERITABLE:
             del env[key]
             warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=f"env.{key}"))
-    headers = {key.lower(): render_template([literal]) for key, literal in value.get("http_headers", {}).items()}
+    headers = {
+        key.lower(): trim_header_value(render_template([literal]))
+        for key, literal in value.get("http_headers", {}).items()
+    }
     # A stdio server's env_vars are left out: Codex forwards each one only while it is set, and iCode's
     # stdio servers inherit the environment, where a {{VAR}} reference would fail the connection
     # whenever the variable is unset.

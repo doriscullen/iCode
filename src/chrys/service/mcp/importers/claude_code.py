@@ -5,8 +5,9 @@
 Baseline: Claude Code 2.1.302, checked 2026-10-19 against
 code.claude.com/docs/en/{mcp,managed-mcp,settings-reference}. Each rule is
 tagged with its evidence: ``[doc: page, "section"]``, ``[observed 2.1.302]``
-(behavior the docs leave out, seen by running that release) or
-``[binary 2.1.302]`` (read from that release's config schema; internal).
+(behavior the docs leave out, seen by running that release; a few were seen
+in 2.1.303) or ``[binary 2.1.302]`` (read from that release's config schema;
+internal).
 
 What is read [doc: mcp, "MCP installation scopes"]:
 
@@ -47,9 +48,16 @@ Runtime differences an imported server may notice:
 - Working folder: iCode starts stdio servers in the workspace folder, so a
   server that finds its project from its working folder, as codegraph does,
   keeps working.
+- Unset variables: Claude Code passes a ``${VAR}`` it can't expand on as
+  written, with a missing-variable warning in ``claude mcp list`` [doc: mcp,
+  "Unset variables without a default"; observed 2.1.303]; iCode fails the
+  connection on an unset ``{{VAR}}``.
 - ``CLAUDE_PROJECT_DIR``: Claude Code sets it in a stdio server's environment
-  [doc: mcp, "Option 3: Add a local stdio server"]; iCode doesn't. A value
-  referencing it gets a warning; a server reading it itself can't be detected.
+  [doc: mcp, "Option 3: Add a local stdio server"]; iCode doesn't. It is not in
+  Claude Code's own environment, so a reference to it in the config is not
+  expanded but passed on as written, or as its default [same section; observed
+  2.1.303]. A value referencing it gets a warning, since iCode fails the
+  connection while it is unset; a server reading it itself can't be detected.
 - ``roots/list``: Claude Code answers it with the session's folders
   [doc: mcp, "Option 3: Add a local stdio server"]; iCode doesn't advertise
   roots, so a server asking falls back to its working folder or fails.
@@ -100,6 +108,7 @@ from chrys.service.mcp.importers.base import (
     has_dollar_template,
     parse_json_object,
     read_source_bytes,
+    trim_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -218,8 +227,8 @@ CREDENTIAL_VARIABLES = frozenset(
     {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "HTTPS_PROXY", "NPM_TOKEN"}
 )
 
-# Set by Claude Code in the environment of the stdio servers it starts, never by iCode
-# [doc: mcp, "Option 3: Add a local stdio server"].
+# Set by Claude Code in the environment of the stdio servers it starts, never by iCode, and not
+# expanded in their settings [doc: mcp, "Option 3: Add a local stdio server"; observed 2.1.303].
 CLAUDE_PROJECT_DIR = "CLAUDE_PROJECT_DIR"
 
 
@@ -493,10 +502,10 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
     if not _convertible(headers, read_as_empty=CREDENTIAL_VARIABLES):
         return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
     converted_headers, warnings = _convert_mapping(headers, read_as_empty=CREDENTIAL_VARIABLES)
+    # Claude Code sends each value trimmed, so ``Bearer ${NPM_TOKEN}`` goes as ``Bearer`` [observed 2.1.303].
     # A header a credential left blank carries nothing, as Claude Code sends it; the MCP card can't hold one.
-    converted_headers = {
-        key: value for key, value in converted_headers.items() if value.strip() or not headers[key].strip()
-    }
+    trimmed = {key: trim_header_value(value) for key, value in converted_headers.items()}
+    converted_headers = {key: value for key, value in trimmed.items() if value.strip() or not headers[key].strip()}
     warnings = (*warnings, *_credential_warnings(headers), *_project_dir_warnings(headers))
     if "headersHelper" in entry:
         # The command may hold a credential, and warnings are saved in the description: name the setting only.

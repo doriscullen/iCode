@@ -122,6 +122,7 @@ from chrys.service.mcp.importers.base import (
     render_template,
     request_timeout_seconds,
     templates_convertible,
+    trim_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -839,7 +840,9 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
             return unsupported(UnsupportedReason.VARIABLE_NAME)
         if not templates_convertible(parts):
             return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
-        converted[key] = render_template(parts)
+        rendered = render_template(parts)
+        # opencode's fetch trims a header value; iCode's HTTP client refuses one it doesn't.
+        converted[key] = trim_header_value(rendered) if values_key == "headers" else rendered
         variables.extend((key, part.name) for part in parts if isinstance(part, TemplateVariable))
 
     warnings: list[ImportWarning] = [
@@ -860,9 +863,8 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
         warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     timeout = entry.get("timeout") if _is_positive_int(entry.get("timeout")) else merged.mcp_timeout
     request_timeout = None if timeout is None else request_timeout_seconds(timeout / 1000)
-    # Keep tool_name_prefix empty, matching iCode's manual and Claude imports.
-    # opencode v1.19.3 adds <server>_<tool> names automatically; iCode leaves
-    # prefix selection to the user when tools collide with builtins or other servers.
+    # The source's own config, no tool name prefix: the dialog gives every import one
+    # (base.with_tool_name_prefix), the name opencode puts before its tools.
     if kind == "local":
         config = MCPServerConfig(
             name=name,

@@ -130,6 +130,30 @@ def test_local_and_remote_servers_are_converted(home: Path, managed: Path) -> No
     assert candidates["docs"].transport == "http"
 
 
+def test_header_values_are_imported_trimmed_as_opencode_sends_them(home: Path, managed: Path) -> None:
+    # opencode's fetch strips spaces, tabs and line breaks from both ends of a header value (observed with
+    # opencode 1.19.3); iCode's HTTP client refuses to send them.
+    _global(
+        home,
+        {
+            "mcp": {
+                "docs": _remote(
+                    "https://docs.test/mcp", headers={"Authorization": "Bearer ", "X-Pad": " \tpadded {env:T}\r\n"}
+                ),
+                "files": _local("cmd", environment={"PAD": " kept "}),
+            }
+        },
+    )
+
+    candidates = _by_name(_discover(home, managed, T="t"))
+
+    docs, files = candidates["docs"].config, candidates["files"].config
+    assert docs is not None and files is not None
+    assert docs.headers == {"Authorization": "Bearer", "X-Pad": "padded {{T}}"}
+    # Environment values are passed to the process as written.
+    assert files.env == {"PAD": " kept "}
+
+
 def test_converted_values_resolve_as_opencode_substitutes_them(monkeypatch: pytest.MonkeyPatch) -> None:
     from chrys.service.mcp.importers.base import render_template
     from chrys.service.mcp.importers.opencode import _env_parts

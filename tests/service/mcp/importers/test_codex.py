@@ -133,6 +133,29 @@ bearer_token_env_var = "BEARER"
     assert resolve_env_templates(config.headers["x-raw"], location="header") == "${TOKEN} {{literal}}"
 
 
+def test_header_values_are_imported_trimmed_as_servers_receive_them(ctx: ImportContext) -> None:
+    # Codex sends a static header's leading and trailing spaces and tabs [rmcp-client/src/utils.rs], which a
+    # server doesn't read as part of the value (RFC 9110, "Field Values"); iCode's HTTP client refuses to send them.
+    _user(
+        ctx,
+        """
+[mcp_servers.remote]
+url = "https://example.test/mcp"
+http_headers = { Authorization = "Bearer ", "X-Pad" = " \\tpadded {{literal}}\\t " }
+
+[mcp_servers.local]
+command = "server"
+env = { PAD = " kept " }
+""",
+    )
+    candidates = {candidate.name: candidate.config for candidate in CodexSource().discover(ctx).candidates}
+    remote, local = candidates["remote"], candidates["local"]
+    assert remote is not None and local is not None
+    assert remote.headers == {"authorization": "Bearer", "x-pad": "padded {{{{literal}}}}"}
+    # Environment values are passed to the process as written.
+    assert local.env == {"PAD": " kept "}
+
+
 def test_tool_allow_list_applies_deny_list_afterwards(ctx: ImportContext) -> None:
     _user(
         ctx,

@@ -142,6 +142,29 @@ def test_values_resolve_in_icode_as_pi_resolves_them(
     assert resolve_env_templates(render_template(parts), location="test") == expected
 
 
+def test_header_values_are_imported_trimmed_as_pi_sends_them(home: Path) -> None:
+    # pi's fetch strips spaces, tabs and line breaks from both ends of a header value (observed with pi 1.3.0);
+    # iCode's HTTP client refuses to send them.
+    _global(
+        home,
+        {
+            "docs": {
+                "url": "https://docs.test/mcp",
+                "headers": {"Authorization": "Bearer ", "X-Pad": " \tpadded $T\r\n"},
+            },
+            "files": {"command": "cmd", "env": {"PAD": " kept "}},
+        },
+    )
+
+    candidates = _by_name(_discover(home))
+
+    docs, files = candidates["docs"].config, candidates["files"].config
+    assert docs is not None and files is not None
+    assert docs.headers == {"Authorization": "Bearer", "X-Pad": "padded {{T}}"}
+    # Environment values are passed to the process as written.
+    assert files.env == {"PAD": " kept "}
+
+
 @pytest.mark.parametrize("transport", ["stdio", "http"])
 @pytest.mark.parametrize("value", ["${}}", "${A:-default}}", "{{${1A}}}"])
 def test_imported_values_preserve_literal_braces_across_parsed_parts(
@@ -217,7 +240,7 @@ def test_settings_icode_lacks_are_reported(home: Path) -> None:
         {"command": "cmd", "args": "--flag"},
         {"command": "cmd", "env": {"A": 1}},
         {"command": "cmd", "timeout": 0},
-        {"command": "cmd", "timeout": 10**400},  # Infinity to pi; too long for a Python float
+        {"command": "cmd", "timeout": -(10**400)},  # -Infinity to pi; too long for a Python float
         {"command": "cmd", "exposure": "sometimes"},
         {"command": "cmd", "enabled": "no"},
         {"url": "https://x.test", "oauth": {"callbackPort": 0}},
@@ -475,3 +498,20 @@ def test_a_timeout_longer_than_icode_can_wait_is_capped(home: Path) -> None:
 
     assert candidate.config is not None
     assert candidate.config.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize("timeout", ["1" + "0" * 400, "1e400"], ids=["overlong-integer", "overlong-exponent"])
+def test_a_timeout_pi_reads_as_infinity_is_listed_without_a_limit(home: Path, timeout: str) -> None:
+    # pi reads both as Infinity, accepts it as positive and sets no time limit
+    # [code: CA/core/mcp-servers.ts:267; packages/mcp/src/client.ts:553-559]; observed with pi 1.3.0.
+    _write(
+        home / ".pi" / "agent" / "mcp.json",
+        '{"mcpServers": {"endless": {"command": "cmd", "timeout": ' + timeout + '}, "kept": {"command": "cmd"}}}',
+    )
+
+    candidates = _by_name(_discover(home))
+
+    assert list(candidates) == ["endless", "kept"]
+    endless = candidates["endless"].config
+    assert endless is not None
+    assert endless.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS

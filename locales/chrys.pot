@@ -7656,10 +7656,12 @@ msgstr ""
 msgid "tui.mcp.import.warning.auth_provider_ignored"
 msgstr ""
 
-#. English: {field} references {variable}, which {agent} sets to the project
-#. folder for the servers it starts. {app} doesn't set it: set it before
-#. starting {app}, or write the folder path instead.
-#. chrys-meta={"fingerprint":"7c36225e0e9898784d1f4ba926be63b5e0f6b25fafbd8212ccc37478278bf33d","multiline":false,"placeholders":["agent","app","field","variable"]}
+#. English: {field} references {variable}, which {agent} sets for the servers
+#. it starts but doesn't fill in here: the server gets the reference as
+#. written, or its default. {app} doesn't set {variable} and fails the
+#. connection unless you set it before starting {app}. Write the folder path
+#. instead.
+#. chrys-meta={"fingerprint":"344276c24956eddc62b51106860b8d570ad3d23fff67a09bf3e6b7017ecad985","multiline":false,"placeholders":["agent","app","field","variable"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.claude_project_dir"
 msgstr ""
@@ -8022,7 +8024,7 @@ msgstr ""
 
 #. English: Tool Name Prefix
 #. chrys-meta={"fingerprint":"3cfce96272a0f3180ac236795645948c3e6034eee4461839c2f07a1e3ed0eb0f","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/panels/mcp.py
+#: src/chrys/app/tui/screens/agents/validation_messages.py
 msgid "tui.mcp.tool_name_prefix"
 msgstr ""
 

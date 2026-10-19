@@ -690,7 +690,8 @@ def test_headers_naming_a_credential_claude_code_withholds_are_flagged(home: Pat
 
     assert candidate.config is not None
     # A header left with nothing is dropped: it would carry nothing, and the MCP card can't hold it.
-    assert candidate.config.headers == {"Authorization": "Bearer ", "X-Own": "{{MY_TOKEN}}"}
+    # Claude Code sends the rest trimmed, Authorization as "Bearer" [observed 2.1.303].
+    assert candidate.config.headers == {"Authorization": "Bearer", "X-Own": "{{MY_TOKEN}}"}
     assert candidate.warnings == (
         ImportWarning(ImportWarningKind.CREDENTIAL_VARIABLE, "ANTHROPIC_AUTH_TOKEN", field="Authorization"),
         ImportWarning(ImportWarningKind.CREDENTIAL_VARIABLE, "HTTPS_PROXY", field="X-Proxy"),
@@ -996,8 +997,8 @@ def test_linked_config_files_are_read_through_the_link(home: Path, tmp_path: Pat
 @pytest.mark.parametrize(
     ("value", "imported"),
     [
-        ("Bearer ${ANTHROPIC_API_KEY:-fallback}", "Bearer "),  # its default is ignored too
-        ("Bearer ${anthropic_api_key}", "Bearer "),  # Windows would resolve it to the real key
+        ("Bearer ${ANTHROPIC_API_KEY:-fallback}", "Bearer"),  # its default is ignored too
+        ("Bearer ${anthropic_api_key}", "Bearer"),  # Windows would resolve it to the real key
         # Judged once emptied: the braces left are ones iCode can write, so the server isn't locked.
         ("{${ANTHROPIC_API_KEY}}", "{}"),
     ],
@@ -1012,6 +1013,33 @@ def test_a_credential_variable_is_written_as_empty_wherever_it_appears(home: Pat
 
     assert candidate.config is not None
     assert candidate.config.headers == {"X-Key": imported}
+
+
+def test_header_values_are_imported_trimmed_as_claude_code_sends_them(home: Path) -> None:
+    # Claude Code's fetch strips spaces, tabs and line breaks from both ends of a header value
+    # [observed 2.1.303: "Bearer ${NPM_TOKEN}" sent as "Bearer"]; iCode's HTTP client refuses to send them.
+    _write_json(
+        home / ".claude.json",
+        {
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "url": "https://x.test",
+                    "headers": {"Authorization": "Bearer ${NPM_TOKEN}", "X-Pad": " \tpadded ${MY_TOKEN}\r\n"},
+                },
+                "local": {"command": "cmd", "env": {"PAD": " kept "}},
+            }
+        },
+    )
+
+    candidates = _by_name(ClaudeCodeSource().discover(_context(home)).candidates)
+
+    remote = candidates["remote"].config
+    assert remote is not None
+    assert remote.headers == {"Authorization": "Bearer", "X-Pad": "padded {{MY_TOKEN}}"}
+    # Environment values are passed to the process as written.
+    local = candidates["local"].config
+    assert local is not None and local.env == {"PAD": " kept "}
 
 
 def test_a_header_written_blank_is_kept_for_the_user_to_see(home: Path) -> None:

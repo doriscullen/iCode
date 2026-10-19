@@ -49,6 +49,14 @@ CA/extensions/mcp/tools.ts:41-46], which is iCode's on-demand loading;
 ``toolExposure`` entries naming one tool become iCode's tool lists where they
 can; patterns and the rest are named in a warning.
 
+pi accepts a ``timeout`` too long for a JavaScript number, which it reads as
+Infinity [code: CA/core/mcp-servers.ts:267]. That one, and one whose
+milliseconds overflow to Infinity, set no time limit [code:
+CA/extensions/mcp/runtime.ts:210-212; packages/mcp/src/client.ts:553-559],
+and are imported as the longest iCode waits. A finite timeout above
+2,147,483,647 ms, Node's timer limit, makes pi time out every request at once;
+iCode waits the time given instead, capped the same way.
+
 Not read: servers extensions register, and the ``--no-mcp`` flag and the
 ``-builtin:mcp`` setting that turn MCP off. Runtime differences: pi starts a
 stdio server in its ``cwd`` (default: the folder pi starts in), iCode always
@@ -89,6 +97,7 @@ from chrys.service.mcp.importers.base import (
     render_template,
     request_timeout_seconds,
     templates_convertible,
+    trim_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -427,8 +436,9 @@ def _is_integral(value: object) -> bool:
 
 
 def _is_positive_number(value: object) -> bool:
+    """A JSON number pi takes as a positive one: Infinity, from a number too long for a double, included."""
     number = json_number(value)
-    return number is not None and math.isfinite(number) and number > 0
+    return number is not None and number > 0
 
 
 def _is_str_mapping(value: object) -> bool:
@@ -498,7 +508,9 @@ def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpI
             return unsupported(UnsupportedReason.VALUE_FROM_COMMAND)
         if not templates_convertible(parts):
             return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
-        converted[key] = render_template(parts)
+        rendered = render_template(parts)
+        # pi's fetch trims a header value; iCode's HTTP client refuses one it doesn't.
+        converted[key] = trim_header_value(rendered) if values_key == "headers" else rendered
 
     warnings: list[ImportWarning] = []
     cwd = config.get("cwd")
@@ -518,9 +530,8 @@ def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpI
     if not enabled:
         warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     timeout = config.get("timeout")
-    # Keep tool_name_prefix empty, matching iCode's manual and Claude imports.
-    # pi v1.3.0 adds mcp__<server>__<tool> names automatically; iCode leaves
-    # prefix selection to the user when tools collide with builtins or other servers.
+    # The source's own config, no tool name prefix: the dialog gives every import one
+    # (base.with_tool_name_prefix), as pi names tools mcp__<server>__<tool>.
     common: dict[str, Any] = {
         "name": entry.name,
         "enabled": enabled,

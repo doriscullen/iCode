@@ -34,6 +34,7 @@ from chrys.app.tui.screens.agents.validation_messages import (
     MCP_ENABLED,
     MCP_ENVIRONMENT_VARIABLES,
     MCP_HEADERS,
+    MCP_TOOL_NAME_PREFIX,
     MCP_TRANSPORT_LABEL,
     MCP_URL,
 )
@@ -54,6 +55,7 @@ from chrys.service.mcp.importers import (
     SourceErrorKind,
     UnsupportedReason,
     detected_sources,
+    with_tool_name_prefix,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -190,8 +192,9 @@ _CREDENTIAL_VARIABLE = msg(
 _CLAUDE_PROJECT_DIR = msg(
     "tui.mcp.import.warning.claude_project_dir",
     fallback=(
-        "{field} references {variable}, which {agent} sets to the project folder for the servers it starts. "
-        "{app} doesn't set it: set it before starting {app}, or write the folder path instead."
+        "{field} references {variable}, which {agent} sets for the servers it starts but doesn't fill in here: "
+        "the server gets the reference as written, or its default. {app} doesn't set {variable} and fails the "
+        "connection unless you set it before starting {app}. Write the folder path instead."
     ),
 )
 _DISABLED = msg(
@@ -395,8 +398,10 @@ class _ImportCard(CollapsibleConfigCard):
 
     The header holds only the name. The transport, the source description and
     the server's scope in the source come first, then the connection settings
-    in a titled section. An importable server is locked while a ticked one with
-    the same connection covers it; the covered note says which.
+    in a titled section and, below them as on the agent's MCP card, the tool
+    name prefix the import gives the server. An importable server is locked
+    while a ticked one with the same connection covers it; the covered note
+    says which.
     """
 
     class Folded(Message):
@@ -417,6 +422,7 @@ class _ImportCard(CollapsibleConfigCard):
         summary_fields: Sequence[_CardField],
         settings_title: str,
         settings_fields: Sequence[_CardField],
+        naming_fields: Sequence[_CardField],
         notes: Sequence[str],
         warnings: Sequence[str],
         covered: str | None = None,
@@ -427,6 +433,7 @@ class _ImportCard(CollapsibleConfigCard):
         self._summary_fields = list(summary_fields)
         self._settings_title = settings_title
         self._settings_fields = list(settings_fields)
+        self._naming_fields = list(naming_fields)
         self._notes = list(notes)
         self._warnings = list(warnings)
         self._covered = covered
@@ -478,6 +485,8 @@ class _ImportCard(CollapsibleConfigCard):
                         section.border_title = Text(self._settings_title)
                     for field in self._settings_fields:
                         yield from _field_widgets(field)
+            for field in self._naming_fields:
+                yield from _field_widgets(field)
             for note in self._notes:
                 yield Static(Text(note), classes="mcp-import-note")
             yield self._covered_note
@@ -728,6 +737,8 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     summary_fields=self._summary_fields(candidate, agent),
                     settings_title=self._settings_title(candidate),
                     settings_fields=self._settings_fields(candidate),
+                    # Only a server that will be imported gets one.
+                    naming_fields=self._naming_fields(candidate) if state == "importable" else [],
                     collapsed=collapsed,
                     notes=[] if note is None else [note],
                     # What the conversion changed only matters for a server that will be imported.
@@ -847,6 +858,16 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             env=entry.get("env"),
             headers=entry.get("headers"),
         )
+
+    def _naming_fields(self, candidate: McpImportCandidate) -> list[_CardField]:
+        """The tool name prefix the import gives the server; none when it gets none."""
+        if candidate.config is None:
+            return []
+        prefix = with_tool_name_prefix(candidate.config).tool_name_prefix
+        if not prefix:
+            return []
+        label = self._render_message(MCP_TOOL_NAME_PREFIX.bind())
+        return [_CardField(label, sanitize_legacy_scalar(prefix), single_line=True)]
 
     def _fields(
         self,
@@ -968,12 +989,14 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 if key in taken:
                     continue
                 taken.add(key)
+                # Named after its server, as the source names its tools, so two servers' tools don't clash.
+                config = with_tool_name_prefix(candidate.config)
                 origin = self._render_message(self._description(source.display_name, candidate))
                 # The import's warnings stay with the server: the dialog that showed them is about to close.
                 notes = [f"- {self._warning_text(warning, source.display_name)}" for warning in candidate.warnings]
                 # The source's own description of the server comes first.
-                own = [candidate.config.description] if candidate.config.description else []
-                selected.append(replace(candidate.config, description="\n".join([*own, origin, *notes])))
+                own = [config.description] if config.description else []
+                selected.append(replace(config, description="\n".join([*own, origin, *notes])))
         return selected
 
     @on(Button.Pressed, "#mcp-import-confirm")

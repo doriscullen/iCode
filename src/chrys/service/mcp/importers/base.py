@@ -10,11 +10,12 @@ profile is saved. Results carry codes, never prose, so the UI localizes them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from chrys.foundation.platform.files import secure_open_regular_binary
 from chrys.foundation.text.encoding import decode_bytes
+from chrys.service.mcp.validation import MCP_PROGRESSIVE_CONTROL_TOOL_NAMES, validate_mcp_tool_name_prefix
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -239,8 +241,73 @@ MAX_REQUEST_TIMEOUT_SECONDS = timedelta.max.days * 86_400
 
 
 def request_timeout_seconds(seconds: float) -> int:
-    """A finite timeout in *seconds* as iCode's request timeout: rounded up, at most what the client can wait."""
+    """A positive timeout in *seconds* as iCode's request timeout: rounded up, at most what the client can wait.
+
+    An infinite one, a source's "no time limit", is the longest the client can wait.
+    """
+    # Compared, not passed to math.isinf, which can't take an int too long for a float.
+    if seconds == math.inf:
+        return MAX_REQUEST_TIMEOUT_SECONDS
     return min(math.ceil(seconds), MAX_REQUEST_TIMEOUT_SECONDS)
+
+
+# HTTP whitespace, which fetch strips from both ends of a header value before sending it: Claude Code,
+# opencode and pi send their headers so. Codex sends the spaces and tabs, which a server doesn't read as
+# part of the value [RFC 9110, "Field Values"]. iCode's HTTP client refuses to send a value that starts
+# or ends with any of them.
+_HTTP_WHITESPACE = " \t\r\n"
+
+
+def trim_header_value(value: str) -> str:
+    """A header value as an importer writes it, without the HTTP whitespace at either end, as servers receive it."""
+    return value.strip(_HTTP_WHITESPACE)
+
+
+# Characters Claude Code and opencode replace with ``_`` when they write a server name into its
+# tools' names [code: opencode packages/opencode/src/mcp/catalog.ts:117-119; binary Claude Code 2.1.303].
+_TOOL_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+# A name with nothing a prefix can keep gets ``mcp_`` and this many hex digits of its hash.
+_NAMELESS_PREFIX_HASH_LENGTH = 8
+# An imported prefix is at most 24 characters, so ``<prefix>_`` takes at most 25 of an exposed tool
+# name's 64 and leaves at least 39 for the tool's own name: a longer one keeps its first 17
+# characters, then ``-`` and 6 hex digits of the name's hash (17 + 1 + 6 = 24).
+_MAX_IMPORTED_PREFIX_LENGTH = 24
+_LONG_PREFIX_HEAD_LENGTH = 17
+_LONG_PREFIX_HASH_LENGTH = 6
+
+
+def with_tool_name_prefix(config: MCPServerConfig) -> MCPServerConfig:
+    """*config* with its server name as its tool name prefix, unless it has a prefix already.
+
+    The agents iCode imports from name a server's tools after it (opencode
+    ``<server>_<tool>``, Claude Code ``mcp__<server>__<tool>``), so their users
+    run several servers with the same tool names; without a prefix, iCode
+    fails the agent's start on them. The prefix is the name as opencode writes
+    it, every character other than a letter, digit, ``_`` or ``-`` as ``_``
+    (two for one beyond U+FFFF, as JavaScript counts), less the ``_`` and ``-``
+    at either end, which a prefix can't have; iCode then names the tools
+    ``<prefix>_<tool>``, as opencode does. A name with nothing left gets
+    ``mcp_`` and a hash of the name, so two such servers still differ. A
+    prefix longer than 24 characters keeps its first 17, less any ``_`` and
+    ``-`` they end with, then ``-`` and a hash of the name, so the server's
+    tool names still fit iCode's 64 characters and two long names with the
+    same start still differ. A prefix iCode would still refuse is not set.
+    """
+    if config.tool_name_prefix:
+        return config
+    prefix = _TOOL_NAME_UNSAFE_RE.sub(lambda match: "__" if ord(match.group()) > 0xFFFF else "_", config.name)
+    prefix = prefix.strip("_-")
+    # A lone surrogate, which JSON can hold, has no UTF-8 form of its own.
+    digest = hashlib.sha256(config.name.encode("utf-8", "surrogatepass")).hexdigest()
+    if len(prefix) > _MAX_IMPORTED_PREFIX_LENGTH:
+        head = prefix[:_LONG_PREFIX_HEAD_LENGTH].rstrip("_-")
+        prefix = f"{head}-{digest[:_LONG_PREFIX_HASH_LENGTH]}" if head else ""
+    if not prefix:
+        prefix = f"mcp_{digest[:_NAMELESS_PREFIX_HASH_LENGTH]}"
+    generated = MCP_PROGRESSIVE_CONTROL_TOOL_NAMES if config.use_progressive_disclosure else ()
+    if validate_mcp_tool_name_prefix(prefix, generated_suffixes=generated) is not None:
+        return config
+    return replace(config, tool_name_prefix=prefix)
 
 
 def json_number(value: object) -> float | None:

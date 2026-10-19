@@ -81,6 +81,9 @@ from chrys.app.tui.screens.agents.validation_messages import (
     MCP_TOOL_ACCESS_NONE as _TOOL_ACCESS_NONE_LABEL,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
+    MCP_TOOL_NAME_PREFIX as _TOOL_NAME_PREFIX,
+)
+from chrys.app.tui.screens.agents.validation_messages import (
     MCP_TRANSPORT_LABEL as _TRANSPORT,
 )
 from chrys.app.tui.screens.agents.validation_messages import (
@@ -211,7 +214,6 @@ _TOOL_LOADING = msg("tui.mcp.tool_loading", fallback="Tool Loading")
 _LOADING_STRATEGY = msg("tui.mcp.loading_strategy", fallback="Loading Strategy")
 _INITIAL_TOOLS_PLACEHOLDER = msg("tui.mcp.placeholder.initial_tools", fallback="search, read_file")
 _NAMING_AND_LIMITS = msg("tui.mcp.naming_and_limits", fallback="Naming & Limits")
-_TOOL_NAME_PREFIX = msg("tui.mcp.tool_name_prefix", fallback="Tool Name Prefix")
 _TOOL_NAME_PREFIX_PLACEHOLDER = msg(
     "tui.mcp.placeholder.tool_name_prefix",
     fallback="e.g. github → tools named github_<tool>",

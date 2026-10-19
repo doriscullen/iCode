@@ -35,6 +35,7 @@ MCP_COMMAND = msg("tui.mcp.command", fallback="Command")
 MCP_URL = msg("tui.mcp.url", fallback="URL")
 MCP_ENABLED = msg("tui.mcp.enabled", fallback="Enabled")
 MCP_TRANSPORT_LABEL = msg("tui.mcp.transport", fallback="Transport")
+MCP_TOOL_NAME_PREFIX = msg("tui.mcp.tool_name_prefix", fallback="Tool Name Prefix")
 MCP_EMPTY = msg("tui.mcp.empty", fallback="No MCP servers configured")
 
 # Composition primitives. Arbitrary display values use DisplayBlock at bind sites.

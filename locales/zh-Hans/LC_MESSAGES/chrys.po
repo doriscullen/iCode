@@ -7841,13 +7841,15 @@ msgstr "无法导入：某项设置使用了 {app} 无法写出其名称的环�
 msgid "tui.mcp.import.warning.auth_provider_ignored"
 msgstr "{agent} 会把它的 {provider} 登录令牌发送给这个服务器；{app} 不会。请在“请求头”中手动添加 Authorization 请求头，否则服务器可能拒绝连接。"
 
-#. English: {field} references {variable}, which {agent} sets to the project
-#. folder for the servers it starts. {app} doesn't set it: set it before
-#. starting {app}, or write the folder path instead.
-#. chrys-meta={"fingerprint":"7c36225e0e9898784d1f4ba926be63b5e0f6b25fafbd8212ccc37478278bf33d","multiline":false,"placeholders":["agent","app","field","variable"]}
+#. English: {field} references {variable}, which {agent} sets for the servers
+#. it starts but doesn't fill in here: the server gets the reference as
+#. written, or its default. {app} doesn't set {variable} and fails the
+#. connection unless you set it before starting {app}. Write the folder path
+#. instead.
+#. chrys-meta={"fingerprint":"344276c24956eddc62b51106860b8d570ad3d23fff67a09bf3e6b7017ecad985","multiline":false,"placeholders":["agent","app","field","variable"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.claude_project_dir"
-msgstr "{field} 引用了 {variable}，{agent} 会为它启动的服务器把它设为项目文件夹。{app} 不会设置它：请在启动 {app} 前设置它，或改为写入文件夹路径。"
+msgstr "{field} 引用了 {variable}。{agent} 会为它启动的服务器设置该变量，但不会在这里替换它：服务器收到的是原样的引用，或它的默认值。{app} 不会设置 {variable}，除非在启动 {app} 前设置它，否则连接会失败。请改为写入文件夹路径。"
 
 #. English: {agent} calls this server's tools only from codemode, which it
 #. doesn't turn on (autoEnableCodemode is false), so it can't call them unless
@@ -8207,7 +8209,7 @@ msgstr "按需加载 — 需要时再加载工具"
 
 #. English: Tool Name Prefix
 #. chrys-meta={"fingerprint":"3cfce96272a0f3180ac236795645948c3e6034eee4461839c2f07a1e3ed0eb0f","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/panels/mcp.py
+#: src/chrys/app/tui/screens/agents/validation_messages.py
 msgid "tui.mcp.tool_name_prefix"
 msgstr "工具名称前缀"
 

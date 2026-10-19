@@ -14,6 +14,7 @@ from chrys.service.mcp.importers.base import (
     McpSourceError,
     SourceErrorKind,
     UnsupportedReason,
+    with_tool_name_prefix,
 )
 from chrys.service.mcp.importers.registry import IMPORT_SOURCES, detected_sources
 
@@ -29,4 +30,5 @@ __all__ = [
     "SourceErrorKind",
     "UnsupportedReason",
     "detected_sources",
+    "with_tool_name_prefix",
 ]

@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -268,6 +268,10 @@ def _scope(agent: str, value: str) -> tuple[str, str]:
     return (f"Scope in {agent}", value)
 
 
+def _prefix(value: str) -> tuple[str, str]:
+    return ("Tool Name Prefix", value)
+
+
 _CLAUDE_USER = _scope("Claude Code", "user, used in every project")
 
 
@@ -296,6 +300,8 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
                     _CLAUDE_USER,
                     ("Command", format_mcp_command_line("npx", ["-y", "my server"])),
                     ("Environment Variables", [("API_KEY", "{{KEY}}"), ("MODE", "fast")]),
+                    # The prefix the import gives it, below the settings, as the agent's MCP card shows it.
+                    _prefix("local"),
                 ],
                 True,
             ),
@@ -306,10 +312,11 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
                     _CLAUDE_USER,
                     ("URL", "https://x.test/mcp"),
                     ("Headers", [("Authorization", "Bearer abc123")]),
+                    _prefix("remote"),
                 ],
                 True,
             ),
-            # Not importable, SSE included: shown as written, greyed out, with the reason the transport gives.
+            # Not importable, with no prefix, SSE included: shown as written, greyed out, with the reason the transport gives.
             ("legacy", [_transport("SSE"), _CLAUDE_USER, ("URL", "https://x.test/sse")], False),
             ("socket", [_transport("WS"), _CLAUDE_USER, ("URL", "wss://x.test/mcp")], False),
             # No type: STDIO, as Claude Code reads it, even though it can't be imported.
@@ -473,20 +480,35 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
         project = _scope("Claude Code", f"project, used only in {workspace}")
         # The scope names the folder in the card's body, where a long path can wrap, not beside the name.
         assert _cards_in(dialog) == [
-            ("here", [_transport("HTTP"), local, ("URL", "https://x.test/mcp")], True),
+            ("here", [_transport("HTTP"), local, ("URL", "https://x.test/mcp"), _prefix("here")], True),
             (
                 "here-too",
-                [_transport("STDIO"), local, ("Command", format_mcp_command_line("uvx", ["here-too"]))],
+                [
+                    _transport("STDIO"),
+                    local,
+                    ("Command", format_mcp_command_line("uvx", ["here-too"])),
+                    _prefix("here-too"),
+                ],
                 True,
             ),
             (
                 "codegraph",
-                [_transport("STDIO"), project, ("Command", format_mcp_command_line("codegraph", ["serve", "--mcp"]))],
+                [
+                    _transport("STDIO"),
+                    project,
+                    ("Command", format_mcp_command_line("codegraph", ["serve", "--mcp"])),
+                    _prefix("codegraph"),
+                ],
                 True,
             ),
             (
                 "everywhere",
-                [_transport("STDIO"), _CLAUDE_USER, ("Command", format_mcp_command_line("uvx", ["everywhere"]))],
+                [
+                    _transport("STDIO"),
+                    _CLAUDE_USER,
+                    ("Command", format_mcp_command_line("uvx", ["everywhere"])),
+                    _prefix("everywhere"),
+                ],
                 True,
             ),
         ]
@@ -548,8 +570,9 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
             "{{TOKEN}}. Set TOKEN before starting iCode, or the connection fails."
         )
         project_dir = (
-            "ROOT references CLAUDE_PROJECT_DIR, which Claude Code sets to the project folder for the servers it "
-            "starts. iCode doesn't set it: set it before starting iCode, or write the folder path instead."
+            "ROOT references CLAUDE_PROJECT_DIR, which Claude Code sets for the servers it starts but doesn't fill "
+            "in here: the server gets the reference as written, or its default. iCode doesn't set CLAUDE_PROJECT_DIR "
+            "and fails the connection unless you set it before starting iCode. Write the folder path instead."
         )
         # The command may hold a credential: the warning, saved in the description, never names it.
         helper = (
@@ -928,6 +951,57 @@ async def test_two_servers_ticked_at_once_with_one_connection_are_imported_once(
         assert [config.name for config in imported] == ["github"]
 
 
+async def test_imported_servers_are_named_after_their_server_so_their_tools_dont_clash(tmp_path: Path) -> None:
+    # Servers whose source names their tools after them, so they may share tool names; one has a prefix already.
+    candidates = (
+        _candidate("lab-cc-helper", "user", _stdio("lab-cc-helper", "helper")),
+        _candidate("my files.v2", "user", _stdio("my files.v2", "files")),
+        _candidate("文件系统", "user", _stdio("文件系统", "fs")),
+        _candidate("github", "user", replace(_stdio("github", "gh"), tool_name_prefix="gh")),
+        # Too long for a prefix that leaves room for the tools' names: shortened, with a hash of the name.
+        _candidate("s" * 50, "user", replace(_stdio("s" * 50, "long"), use_progressive_disclosure=True)),
+        McpImportCandidate("legacy", "user", "/user", None, UnsupportedReason.UNSUPPORTED_TRANSPORT, transport="sse"),
+    )
+    results: list[list[MCPServerConfig] | None] = []
+    app = _PanelApp(MCPConfigPanel([]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = _open_with(app, [_ListedSource("first", "First Agent", candidates)], tmp_path, results)
+        rows = await _wait_for_rows(dialog, pilot, 6)
+
+        # Each card says the prefix it will get; one that can't be imported shows none.
+        assert [
+            (name, [value for label, value in fields if label == "Tool Name Prefix"])
+            for name, fields, _tickable in _cards_in(dialog)
+        ] == [
+            ("lab-cc-helper", ["lab-cc-helper"]),
+            ("my files.v2", ["my_files_v2"]),
+            ("文件系统", ["mcp_47b61747"]),
+            ("github", ["gh"]),
+            ("s" * 50, ["sssssssssssssssss-089f83"]),
+            ("legacy", []),
+        ]
+
+        for row in rows[:5]:
+            row.value = True
+        await _import_ticked(dialog, pilot)
+        await wait_for(lambda: results, pilot=pilot, description="dialog dismissed with the ticked servers")
+        (imported,) = results
+        assert imported is not None
+        assert [(config.name, config.tool_name_prefix) for config in imported] == [
+            ("lab-cc-helper", "lab-cc-helper"),
+            ("my files.v2", "my_files_v2"),
+            ("文件系统", "mcp_47b61747"),
+            ("github", "gh"),
+            ("s" * 50, "sssssssssssssssss-089f83"),
+        ]
+        # Nothing else of the server changes.
+        assert [replace(config, tool_name_prefix="", description="") for config in imported] == [
+            replace(candidate.config, tool_name_prefix="")
+            for candidate in candidates[:5]
+            if candidate.config is not None
+        ]
+
+
 async def test_switching_back_before_the_pane_worker_starts_shows_the_highlighted_agent(tmp_path: Path) -> None:
     gate = threading.Event()
     first = _ListedSource("first", "First Agent", (_candidate("a", "user", _stdio("a", "first")),))
@@ -1147,6 +1221,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                     _scope("opencode", "global, used in every project"),
                     ("Command", format_mcp_command_line("npx", ["server-files"])),
                     ("Environment Variables", [("T", "{{FILES_TOKEN}}")]),
+                    _prefix("files"),
                 ],
                 True,
             )
@@ -1164,6 +1239,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                     ("Description", description),
                     _scope("pi", f"project, used only in {workspace}"),
                     ("URL", "https://docs.test/mcp"),
+                    _prefix("docs"),
                 ],
                 True,
             )
@@ -1171,13 +1247,14 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
         description_widget = dialog.query(".mcp-import-field-value")[1]
         # The two lines wrap once the switched pane is laid out.
         await wait_for(lambda: description_widget.region.height >= 2, pilot=pilot, description="the description wraps")
-        # Transport and description in the MCP card's order, then the scope, then the transport's options box.
+        # Transport and description in the MCP card's order, then the scope, then the transport's options box,
+        # then the tool name prefix, below the options as on the MCP card.
         (card,) = dialog.query(_ImportCard)
         order = [
             "box" if widget.has_class("mcp-import-settings") else str(widget.render())
             for widget in card.query(".mcp-import-field-label, .mcp-import-settings")
         ]
-        assert order == ["Transport", "Description", "Scope in pi", "box", "URL"]
+        assert order == ["Transport", "Description", "Scope in pi", "box", "URL", "Tool Name Prefix"]
         assert str(card.query_one(".mcp-import-settings").border_title) == "HTTP Options"
         (notice,) = dialog.query(".mcp-import-notice")
         assert str(notice.render()) == (
@@ -1191,15 +1268,17 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
         await wait_for(lambda: results, pilot=pilot, description="dialog dismissed with the ticked servers")
         (imported,) = results
         assert imported is not None
-        assert [(config.name, config.enabled, config.description) for config in imported] == [
+        assert [(config.name, config.enabled, config.tool_name_prefix, config.description) for config in imported] == [
             (
                 "files",
                 False,
+                "files",
                 f"Imported from opencode. There it is a global server, used in every project.\n- {disabled}",
             ),
             (
                 "docs",
                 True,
+                "docs",
                 f"{description}\nImported from pi. There it is a project server, used only in {workspace}.",
             ),
         ]
@@ -1309,6 +1388,7 @@ async def test_a_server_whose_source_names_no_transport_has_no_transport_field(t
                 [
                     _scope("Plain Agent", "user, used in every project"),
                     ("Command", format_mcp_command_line("uvx", [])),
+                    _prefix("untyped"),
                 ],
                 True,
             )
