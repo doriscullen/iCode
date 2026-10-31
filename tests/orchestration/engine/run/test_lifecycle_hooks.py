@@ -466,7 +466,13 @@ async def test_user_interrupt_hook_is_detached_from_turn_drain(tmp_path: Path) -
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def _run_and_wait(_hook: HookConfig, _payload: dict[str, Any]) -> HookResult:
+    async def _run_and_wait(
+        _hook: HookConfig,
+        _payload: dict[str, Any],
+        *,
+        payload_text: str | None = None,
+        result: HookResult | None = None,
+    ) -> HookResult:
         entered.set()
         await release.wait()
         return HookResult(hook_id=hook.id, exit_code=0)
@@ -564,7 +570,7 @@ async def test_prompt_submit_blocked_error_preserves_reason_ownership(
         session=host.session, current=host.current, bus=host._bus, fsm=host._fsm
     ).handle_decision(
         HookDecision(blocked=True, block_reason=reason),
-        injected=None,
+        refused_input="prompt",
     )
 
     assert blocked is True

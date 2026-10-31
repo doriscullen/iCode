@@ -29,7 +29,6 @@ from chrys.foundation.events.types import (
     InvocationCompactionFinished,
     InvocationCompactionStarted,
     InvocationContextPressure,
-    InvocationMessage,
     InvocationRetryAttempt,
     InvocationStarted,
     Warning,
@@ -58,14 +57,13 @@ from chrys.foundation.util.sub_agent_context import (
     sub_agent_parent_result_metadata,
 )
 from chrys.kernel import (
+    RESPONSE_READY_KWARG,
     Agent,
     FunctionTool,
     LoopRecorder,
     Message,
     StallExhaustedAction,
 )
-from chrys.orchestration.invoker.acp_protocol import AcpPermissionBroker
-from chrys.orchestration.invoker.acp_spec import resolve_acp_spec
 from chrys.orchestration.invoker.attempts import AgentRunKwargs, WireRecipe
 from chrys.orchestration.invoker.child_history import service_storage_side
 from chrys.orchestration.invoker.contracts import SubAgentFailureReason, SubAgentStatus, Unbind
@@ -85,16 +83,14 @@ from chrys.orchestration.invoker.runtime import (
     create_runtime,
     create_validation,
 )
-from chrys.orchestration.sub_agents.acp_policy import AcpSubAgentPolicy
 from chrys.orchestration.sub_agents.kernel_policy import KernelSubAgentPolicy
-from chrys.service.acp_client import AcpConfigError
 from chrys.service.agent_middleware import (
     ApprovalMiddleware,
-    IntermediateTextBuffer,
     SleepMiddleware,
     SubAgentEventMiddleware,
     SubAgentStatsMiddleware,
 )
+from chrys.service.agent_middleware.control.hook_commit import HookCommitMiddleware
 from chrys.service.approval.policy import ApprovalMode, ApprovalPolicy
 from chrys.service.approval.turn_context import TurnContextHolder
 from chrys.service.context.compaction.last_words_state import DropRoundBreakerState
@@ -134,6 +130,8 @@ if TYPE_CHECKING:
     from chrys.foundation.config.settings import Settings
     from chrys.foundation.events.bus import EventBus
     from chrys.foundation.models.session_env import SessionEnvironment
+    from chrys.orchestration.invoker.acp_protocol import AcpPermissionBroker
+    from chrys.orchestration.sub_agents.acp_policy import AcpSubAgentPolicy
     from chrys.service.approval.judge import ApprovalJudge
     from chrys.service.context.compaction import PreCompactInfo
     from chrys.service.context.compaction.last_words import CompactionStatus
@@ -311,6 +309,7 @@ class SubAgentTools:
         tool_result_ceiling_tokens: int | None = None,
         allow_user_interaction: bool = True,
         human_failure_decisions: bool = True,
+        shows_answer_text: bool = True,
     ) -> None:
         self._max_total = max_total_concurrency
         self._bus = event_bus
@@ -351,6 +350,8 @@ class SubAgentTools:
         # Whether a failed child pauses for the user's Retry/Abort on its card; a caller whose
         # surface shows no such card ends the child instead, its error becoming the tool result.
         self._human_failure_decisions = human_failure_decisions
+        # Whether a frontend shows a kernel child's answer text: only then does text it wrote stop a retry.
+        self._shows_answer_text = shows_answer_text
         self._turn_context = turn_context or TurnContextHolder()
         self._agent_active: dict[str, int] = {}  # tool_name → active count
         self._agent_max: dict[str, int] = {}  # tool_name → per-agent limit
@@ -374,7 +375,6 @@ class SubAgentTools:
         # this registry so the right sub-agent receives the decision.
         self._controllers: dict[str, SubAgentToolShell] = {}
         self._pending_cleanup_paths: set[Path] = set()
-        self._intermediate_buffers: dict[str, IntermediateTextBuffer] = {}
         self._invocation_emitters: dict[str, BoundEmitter] = {}
 
     def _emitter_for(self, invocation_id: str) -> BoundEmitter:
@@ -431,37 +431,8 @@ class SubAgentTools:
                 route_parts=(tool_name, profile.name),
                 model_profile=sub_active_profile,
             )
-            agent_display_name = profile.display_name or profile.name
-
-            async def _on_intermediate_async(text: str) -> None:
-                invocation_id = invocation_routing_key.get()
-                buffer = self._intermediate_buffers.get(invocation_id)
-                if buffer is None:
-                    return
-                emitter = self._emitter_for(invocation_id)
-                buffer.new_batch()
-                if self._bus is not None:
-                    await emitter.publish(
-                        InvocationMessage(
-                            is_final=False,
-                            is_intermediate=True,
-                            origin=emitter.origin,
-                            agent_name=agent_display_name,
-                            text=text,
-                            session_id=self._session_id,
-                        )
-                    )
-
-            def _on_intermediate_sync(text: str) -> None:
-                invocation_id = invocation_routing_key.get()
-                buffer = self._intermediate_buffers.get(invocation_id)
-                if buffer is not None:
-                    buffer.store(text)
-
             client = await create_client(
                 sub_active_profile,
-                on_intermediate_text_async=_on_intermediate_async,
-                on_intermediate_text_sync=_on_intermediate_sync,
                 session_id=sub_agent_session_id,
                 parent_session_id=self._session_id,
                 use_route_session_context=True,
@@ -533,8 +504,9 @@ class SubAgentTools:
             # tools (compress_context, recall_context, list_compressed_contexts)
             # are disabled — sub-agents are single-turn and don't need cross-turn
             # context management.
+            # The registered template runs no invocation of its own, so no origin to name.
             async def _on_pre_compact(info: PreCompactInfo) -> None:
-                await self._fire_pre_compact_hook(tool_name, info)
+                await self._fire_pre_compact_hook(tool_name, info, origin=None)
 
             def _publish_context_pressure(
                 reason: str,
@@ -720,7 +692,7 @@ class SubAgentTools:
                 )
 
                 async def _on_pre_compact(info: PreCompactInfo, *, _tool_name: str = tool_name) -> None:
-                    await self._fire_pre_compact_hook(_tool_name, info)
+                    await self._fire_pre_compact_hook(_tool_name, info, origin=emitter.origin)
 
                 def _publish_invocation_context_pressure(
                     reason: str,
@@ -906,7 +878,13 @@ class SubAgentTools:
         profile: AgentProfile,
         runtime: SessionEnvironment,
     ) -> FunctionTool:
+        from chrys.orchestration.invoker.acp_protocol import AcpPermissionBroker
+        from chrys.orchestration.sub_agents.acp_policy import AcpSubAgentPolicy
+        from chrys.service.acp_client import AcpConfigError
+
         async def _invoke_acp(prompt: str) -> str:
+            from chrys.orchestration.invoker.acp_spec import resolve_acp_spec
+
             if self._total_active >= self._max_total:
                 return tool_error(
                     "sub_agent_concurrency_limit",
@@ -1466,8 +1444,6 @@ class SubAgentTools:
                 )
                 emitter = BoundEmitter(self._bus, origin)
                 self._invocation_emitters[invocation_id] = emitter
-                intermediate_buffer = IntermediateTextBuffer()
-                self._intermediate_buffers[invocation_id] = intermediate_buffer
                 invocation_session_id = _derive_invocation_session_id(invocation_id)
                 invocation_token = invocation_routing_key.set(invocation_id)
                 # In-process: the child's events inline into this writer under
@@ -1582,7 +1558,6 @@ class SubAgentTools:
                         serialize_implicit_windows=self._serialize_implicit_windows,
                         stats=log_stats,
                         tool_result_ceiling_tokens=self._tool_result_ceiling_tokens,
-                        intermediate_buffer=intermediate_buffer,
                     )
                     middleware.append(sub_event_mw)
                     # AskUser middleware — sub-agent ask_user calls show the
@@ -1635,6 +1610,8 @@ class SubAgentTools:
                         self._bus, session_id=self._session_id, background_tasks=self._background_tasks
                     )
                     middleware.append(sleep_mw)
+                    # Innermost: runs the version the event middleware's hooks checked, or nothing.
+                    middleware.append(HookCommitMiddleware())
                 if sub_event_mw is None:
                     middleware.append(SubAgentStatsMiddleware(log_stats))
                 # Wire usage callback so token counts flow to TUI via
@@ -1647,6 +1624,12 @@ class SubAgentTools:
                 # so calibration/overhead/LAST_WORDS state cannot leak between
                 # same-tool concurrent runs.
                 ctx = invocation_ctx
+                # Run-scoped middleware is concatenated AFTER the agent's own
+                # chat middleware, so the last listed sits innermost: the
+                # validation middleware judges each landed response, and the
+                # usage middleware under it counts every one of them first.
+                validation_middleware = create_validation(conversation)
+                middleware.append(validation_middleware)
                 if ctx:
                     parent_cb = self._on_sub_agent_usage
                     total_usage_tokens = 0
@@ -1708,40 +1691,6 @@ class SubAgentTools:
                         use_local_context_estimate_for_hosted_usage=(ctx.use_local_context_estimate_for_hosted_usage),
                     )
                     middleware.append(per_invocation_usage)
-
-                # Response-validation middleware — appended AFTER all other
-                # per-invocation middleware so it ends up innermost in the
-                # chat pipeline (closest to ``_inner_get_response``).  Run-
-                # scoped middleware is concatenated AFTER the agent's own
-                # chat middleware, so listing it last here means it sits
-                # last overall.  Retries are therefore invisible to outer
-                # instrumentation — the per-invocation usage middleware
-                # above, and the agent-level system_reminder / ctx.middleware
-                # — which each fire exactly once per turn.
-                # ``publish_retry`` surfaces client-mode validation retries
-                # as ``InvocationRetryAttempt`` keyed to this invocation;
-                # service-side failures raise to the whole-run retry loop,
-                # which publishes its own retry events.
-                if self._bus is not None:
-
-                    async def _publish_validation_retry(info: RetryAttemptInfo) -> None:
-                        await emitter.publish(
-                            InvocationRetryAttempt(
-                                scope="wire",
-                                origin=emitter.origin,
-                                agent_name=self._display_names.get(tool_name, tool_name),
-                                message=f"Invalid response: {info.reason}",
-                                attempt=info.attempt,
-                                max_attempts=info.max_attempts,
-                                delay_seconds=int(info.delay_seconds),
-                                session_id=self._session_id,
-                            )
-                        )
-
-                    validation_middleware = create_validation(conversation, publish_retry=_publish_validation_retry)
-                else:
-                    validation_middleware = create_validation(conversation, publish_retry=None)
-                middleware.append(validation_middleware)
 
                 run_kwargs: AgentRunKwargs = {}
                 sub_session = invocation_agent.create_session()
@@ -1816,11 +1765,11 @@ class SubAgentTools:
                     tool_event_middleware=sub_event_mw,
                     stream=stream,
                     stream_attempt_timeout=stream_attempt_timeout,
+                    shows_answer_text=self._shows_answer_text,
                     sleep_middleware=sleep_mw,
                     pass_start_hooks=(
                         *((begin_web_pass,) if begin_web_pass is not None else ()),
                         _begin_hosted_pass,
-                        validation_middleware.reset_service_retry_state,
                     ),
                     hosted_commits_probe=validation_middleware.hosted_commits_observed,
                     begin_hosted_baseline=validation_middleware.begin_pass_hosted_baseline,
@@ -1842,6 +1791,9 @@ class SubAgentTools:
                     ) -> Awaitable[None]:
                         return policy.publish_wire_retry_attempt(message, attempt, maximum, delay, exc)
 
+                    def _answer_shown() -> bool:
+                        return policy.wire_answer_shown()
+
                     run_client_kwargs["wire_retry_policy"] = WireRecipe(
                         max_retries=lambda: policy.max_retries,
                         stall_timeout_seconds=stream_attempt_timeout,
@@ -1853,8 +1805,10 @@ class SubAgentTools:
                         publish_retry=_wire_notice,
                         prepare_retry=None,
                         hosted_commits_in_flight=validation_middleware.hosted_commits_in_flight,
+                        answer_shown=_answer_shown,
                     ).build()
                 run_client_kwargs["continuation_token_observer"] = policy.observe_continuation_token
+                run_client_kwargs[RESPONSE_READY_KWARG] = policy.response_ready
                 self._controllers[invocation_id] = controller
                 try:
                     with (
@@ -1967,7 +1921,6 @@ class SubAgentTools:
                         logger.warning("sub-agent end hook failed for invocation %s", invocation_id, exc_info=True)
                 if invocation_id:
                     self._controllers.pop(invocation_id, None)
-                    self._intermediate_buffers.pop(invocation_id, None)
                     self._invocation_emitters.pop(invocation_id, None)
                 if stopped and background_tasks is not None:
                     # Ended before the turn goes on, which an interrupt (cancelling
@@ -2063,7 +2016,9 @@ class SubAgentTools:
             payload["result_summary"] = result_summary
         await self._hook_manager.fire(event, payload, target_operation_id=target_operation_id)
 
-    async def _fire_pre_compact_hook(self, tool_name: str, info: PreCompactInfo) -> None:
+    async def _fire_pre_compact_hook(
+        self, tool_name: str, info: PreCompactInfo, *, origin: InvocationOrigin | None
+    ) -> None:
         if self._hook_manager is None:
             return
         if not self._hook_manager.has_hooks_for(HookEvent.PRE_COMPACT):
@@ -2083,6 +2038,7 @@ class SubAgentTools:
                 },
             },
             target_operation_id=info.trajectory_operation_id,
+            origin=origin,
         )
 
     async def _publish_sub_agent_compaction_status(

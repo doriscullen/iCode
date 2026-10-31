@@ -31,8 +31,14 @@ class ChatMountPort(Protocol):
         """Mount one widget and report whether it remained attached."""
         ...
 
-    async def mount_transcript_widgets(self, widgets: list[Widget]) -> None:
-        """Mount replayed entries; older ones may still be landing when this returns."""
+    async def mount_transcript_widgets(
+        self, widgets: list[Widget], *, process_failures_after: tuple[Widget, ...] = ()
+    ) -> None:
+        """Mount replayed entries with omitted failure boundaries anchored after existing widgets.
+
+        Older entries may still be landing when this returns. Surfaces without
+        completed-turn folding need not retain the failure boundaries.
+        """
         ...
 
     async def remove_transcript_widget(self, widget: Widget) -> None: ...
@@ -206,6 +212,8 @@ class ChatScrollHost(Protocol):
 
     def set_scroll_target_y(self, y: float) -> None: ...
 
+    def stop_scroll_y_animation(self) -> None: ...
+
     def set_vertical_scrollbar_position(self, y: float) -> None: ...
 
     def get_container_size(self) -> Size: ...
@@ -215,6 +223,8 @@ class ChatScrollHost(Protocol):
     def apply_held_shrink_size_update(self, size: Size, container_size: Size) -> bool: ...
 
     def place_fixed_scroll_button(self, result: DockArrangeResult, size: Size) -> None: ...
+
+    def is_infrastructure(self, widget: Widget) -> bool: ...
 
     def bottom_spacer(self) -> Widget | None: ...
 
@@ -231,16 +241,3 @@ class ChatScrollHost(Protocol):
     def refresh(self, *, layout: bool = False) -> Self: ...
 
     def set_timer(self, delay: float, callback: Callable[[], object]) -> Timer: ...
-
-
-class ChatTranscriptPanelMarker:
-    """Nominal marker base identifying the chat transcript panel.
-
-    Chat helper modules must not import :mod:`chrys.app.tui.widgets.chat.panel`
-    (see ``tests/architecture/test_tui_structure.py``). Helpers that need to
-    recognize the transcript panel among a widget's ancestors — e.g. the
-    selection controller's hot per-mouse-move filter — check this base with a
-    plain ``isinstance`` instead of importing the concrete ``ChatPanel``.
-    """
-
-    __slots__ = ()

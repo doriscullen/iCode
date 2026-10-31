@@ -132,12 +132,13 @@ GPT-5.6 及之后的模型使用 `prompt_cache_options`，有效期为 `30m`，�
 | 用途 | 字段名 | 值 |
 | --- | --- | --- |
 | 提示词缓存 | `extra_body` | `{"cache_control": {"type": "ephemeral"}}` |
-| 自适应思考 | `thinking` | `{"type": "adaptive"}` |
+| 自适应思考并返回可读摘要 | `thinking` | `{"type": "adaptive", "display": "summarized"}` |
 | 固定预算的思考（较早的模型） | `thinking` | `{"type": "enabled", "budget_tokens": 8000}` |
 | 投入程度（effort） | `output_config` | `{"effort": "medium"}` |
 | 其他地址上较早模型的交错思考 | `additional_beta_flags` | `["interleaved-thinking-2025-05-14"]` |
 
 - 只有支持自适应思考的模型才能使用 `adaptive`；较新的模型会拒绝旧的 `enabled` / `budget_tokens` 形式。普通固定预算思考要求“最大输出词元数”大于 `budget_tokens`，手动交错思考的预算规则有所不同。
+- `display: "summarized"` 用于请求服务返回可读的思考摘要。较新的 Claude 模型（包括 Opus 5.5 和 Fable 5.1）默认隐藏这部分文字。请在已有的 `thinking` 对象中加入 `"display": "summarized"`；iCode 的“默认展开思考”设置只决定返回的文字在写出时完整展开还是只显示一行，不会向服务请求摘要。如需让接口隐藏摘要，可改为 `"display": "omitted"`；这不会关闭思考，也不会减少思考词元的费用。
 - 较新的 Claude 模型会拒绝非默认的 `temperature`、`top_p` 和 `top_k` 值，请不要设置。
 - `additional_beta_flags` 和 `betas` 用于给请求增加 Beta 标志，“HTTP 附加请求头”中的 `anthropic-beta` 也一样。iCode 会把它们排在自己的标志之后，合并到同一个 `anthropic-beta` 请求头中发送。`extra_headers` 行中的 `anthropic-beta` 会替换所有这些标志，包括 iCode 自己的标志；此时 iCode 只补上思考设置所需的标志。
 - 在 Anthropic 官方地址上使用固定预算的思考时，iCode 会自动添加交错思考的标志，详见 [Claude 思考设置](./models.md#claude-思考设置)。在其他地址上，请按上表自行添加。自适应思考已自动支持交错思考，无需该标志。交错思考的支持情况因模型而异，服务接受某个 Beta 标志并不代表它实际生效。
@@ -155,6 +156,14 @@ GPT-5.6 及之后的模型使用 `prompt_cache_options`，有效期为 `30m`，�
 | 推理强度 | `reasoning_effort` | `high` |
 
 当前 API 默认开启思考，推理强度支持 `low`、`high` 和 `max`。在思考模式下，`temperature`、`presence_penalty` 和 `frequency_penalty` 会被忽略；`top_p` 仅在 0.95 到 1.0 范围内生效。较早模型 ID 的能力可能不同。
+
+DeepSeek 也支持 Responses API。使用服务端 `web_search` 时必须选 Responses，并添加 `tools` 选项；支持的模型以 DeepSeek 官方文档为准。
+
+| 用途 | 字段名 | 值 |
+| --- | --- | --- |
+| 服务端联网搜索（Responses） | `tools` | `[{"type": "web_search"}]` |
+
+声明后，模型提供方会接管 `web_search` 这个名称；如果智能体也启用了本地 `web_search`，本地工具会在该次运行中停用并显示提示。服务端搜索不受 iCode 审批和网络设置约束。也可以改用本地 `web_search` 调 DeepSeek Search API，配置见[配置网络工具](./web-tools.md#deepseek-search-api)。
 
 官方文档：[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[上下文硬盘缓存](https://api-docs.deepseek.com/guides/kv_cache)、[API 参考](https://api-docs.deepseek.com/api/create-chat-completion)。
 

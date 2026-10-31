@@ -14,7 +14,16 @@ from chrys.foundation.models.approval_reuse import ApprovalReuseOffer, ReuseChoi
 from chrys.foundation.models.ask_user import AskUserAnswer, AskUserQuestion
 from chrys.foundation.models.background_tasks import BackgroundTaskView
 from chrys.foundation.models.execution import ExecutionSnapshot
-from chrys.foundation.models.invocations import InvocationOrigin
+from chrys.foundation.models.hook_confirmations import (
+    HookArgumentChange,
+    HookConfirmationAnswer,
+    HookConfirmationClaim,
+    HookConfirmationOutcome,
+    HookConfirmationSubjectKind,
+    RefusedInput,
+)
+from chrys.foundation.models.hook_executions import HookExecutionView
+from chrys.foundation.models.invocations import ContentChannel, ContentStatus, InvocationOrigin
 from chrys.foundation.models.todos import TodoItem
 from chrys.foundation.models.workflow_session import (
     WorkflowModelSelection,
@@ -103,6 +112,16 @@ class InvocationEvent(Event):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class PromptShortcutRef:
+    """The prompt shortcut a message's draft was expanded from, as the frontend's list loaded it."""
+
+    name: str
+    """The name typed after ``/``."""
+    path: str
+    """``PromptShortcut.path``: the file it was read from."""
+
+
 @dataclass
 class UserMessage(Event):
     """User sends a message to the agent."""
@@ -114,7 +133,9 @@ class UserMessage(Event):
     prepared_contents: list[Any] | None = field(default=None, repr=False, compare=False)
     # Set by frontends that submit while a run is active so the resulting
     # mid-run injection can be correlated and cancelled (``UserInjectCancel``)
-    # before the model sees it. ``None`` for ordinary fresh-turn submits.
+    # before the model sees it, and by a frontend for any message the user can
+    # withdraw while it is admitted (one carrying ``prompt_shortcut``). ``None``
+    # for ordinary fresh-turn submits.
     injection_id: str | None = None
     # Set by the backend, before its publish returns, when this message opened
     # a new turn — also for an injection submit whose run ended before it was
@@ -124,6 +145,11 @@ class UserMessage(Event):
     # the replay of this exact message. ``None`` for every frontend that has no
     # id of its own; the backend mints one before the turn starts.
     client_message_id: str | None = None
+    # The shortcut this message's draft was expanded from, set only when its
+    # text holds ``!`command``` placeholders: the engine runs them for that
+    # shortcut, if it still loads it, once the prompt hooks have passed, and
+    # sends their output in their place. Never joins a running turn.
+    prompt_shortcut: PromptShortcutRef | None = None
 
 
 @dataclass
@@ -293,6 +319,30 @@ class AgentProfileSwitch(Event):
     """User switches to a different agent profile."""
 
     profile_name: str = ""
+    source: Literal["user", "fallback"] = "user"
+    """``user``: the user's own pick, which new sessions also start on. ``fallback``: a
+    frontend replacing the session's agent after its profile was deleted, renamed or retired."""
+
+
+@dataclass
+class SessionOnlySwitch(Event):
+    """Switch this session's own agent and/or model in one rebuild, or neither (a prompt shortcut's).
+
+    New sessions keep starting on the agent and model they did. The engine
+    sets ``applied`` before the publish returns: True when what was asked is
+    in force, False when nothing changed (a refusal or failure was published).
+    A model the agent would not run is no part of what can be asked: the
+    engine leaves it out and says so in ``model_left_out``.
+    """
+
+    agent: str = ""
+    """Agent profile name; empty keeps the session's agent."""
+    model_profile: str = ""
+    """Model profile id; empty keeps the session's model."""
+    applied: bool = field(default=False, compare=False)
+    model_left_out: bool = field(default=False, compare=False)
+    """Set by the engine: the agent the switch runs on binds a model of its own (or an override is set),
+    which runs over the one asked for, so that one was not made the session's."""
 
 
 @dataclass
@@ -313,6 +363,9 @@ class ConfigUpdate(Event):
 @dataclass
 class SettingsReload(Event):
     """User updated .env settings — engine should reload Settings and rebuild agent."""
+
+    model_chosen: bool = False
+    """The user picked the default model for this session too (``$``): the session's own model ends."""
 
 
 @dataclass
@@ -349,9 +402,7 @@ class SetModelProfile(Event):
 
 @dataclass
 class AgentThinking(Event):
-    """Agent is thinking (optional thinking content)."""
-
-    text: str | None = None
+    """The agent is thinking: a pass began and its model request is on its way."""
 
 
 @dataclass
@@ -371,14 +422,6 @@ class TurnStarted(Event):
     is_retry: bool = False
     user_message_id: str | None = None
     """Id of the user message that opened the turn, when it has one."""
-
-
-@dataclass(frozen=True)
-class ProvisionalPresentation:
-    """Identity of one retractable text segment from a response attempt."""
-
-    attempt_id: str
-    segment_id: str
 
 
 @dataclass
@@ -415,31 +458,73 @@ class InvocationStarted(InvocationEvent):
 
 @dataclass
 class InvocationMessage(InvocationEvent):
-    """Assistant output owned by an invocation; consumers choose its projection."""
+    """An invocation's completion snapshot: its final answer, which content deltas already carried.
+
+    Frontends that render the deltas never append ``text`` after them; it
+    serves consumers that need the whole answer at once (headless results).
+    """
 
     agent_name: str = ""
     text: str = ""
     is_final: bool = True
-    is_intermediate: bool = False
     structured_output_completed: bool = False
-    presentation: ProvisionalPresentation | None = None
 
 
 @dataclass
-class InvocationPresentationAttemptAccepted(InvocationEvent):
-    """Commit provisional sub-agent transcript segments from one attempt."""
+class InvocationContentDelta(InvocationEvent):
+    """Text appended to one segment of an invocation's model output, as it arrives.
+
+    A segment is one run of same-channel text within one model response; a
+    tool call, a channel change or the response's end closes it. The first
+    delta of a ``segment_id`` opens the segment; ``text`` is only the new
+    text, never the text before it. Opaque reasoning (signatures, encrypted
+    payloads) never produces a delta.
+    """
 
     agent_name: str = ""
-    attempt_id: str = ""
+    segment_id: str = ""
+    channel: ContentChannel = "answer"
+    text: str = ""
+
+
+@dataclass
+class InvocationContentFinished(InvocationEvent):
+    """One content segment ended; no further delta carries its ``segment_id``.
+
+    A segment's end is not the invocation's: the final ``InvocationMessage``
+    still completes the turn, as a snapshot frontends never append.
+    """
+
+    agent_name: str = ""
+    segment_id: str = ""
+    channel: ContentChannel = "answer"
+    status: ContentStatus = "completed"
+
+
+@dataclass
+class InvocationContentAbandoned(InvocationEvent):
+    """A retry gave up the response these segments belong to: none of their text is kept.
+
+    Published at the retry boundary, before the open segment's
+    ``InvocationContentFinished``; segments of a response that landed never
+    appear here.
+    """
+
+    agent_name: str = ""
     segment_ids: tuple[str, ...] = ()
 
 
 @dataclass
-class InvocationPresentationAttemptRejected(InvocationEvent):
-    """Retract provisional sub-agent transcript segments from one attempt."""
+class InvocationAnswerWithdrawn(InvocationEvent):
+    """A bare Continue or Retry dropped the answer text these segments showed from history, to ask for it again.
+
+    Published when history drops it, before the request that asks again
+    runs; frontends withdraw exactly these segments. Text saved before
+    segments were stamped is dropped without being named here.
+    """
 
     agent_name: str = ""
-    attempt_id: str = ""
+    segment_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -610,7 +695,8 @@ class InvocationCompactionCommitted(InvocationEvent):
 class InvocationRetryAttempt(InvocationEvent):
     """Executor is retrying a transient error (published before each retry sleep).
 
-    Also announces the one resend after a context overflow, which compacts first.
+    Also announces the one resend after a context overflow, which compacts first,
+    and the one resend after a response that showed nothing.
     """
 
     agent_name: str = ""
@@ -947,6 +1033,86 @@ class BackgroundTasksChanged(Event):
 
 
 @dataclass
+class HookExecutionsChanged(Event):
+    """The hook runs in flight changed (full set, not a diff; for the TUI only)."""
+
+    executions: tuple[HookExecutionView, ...] = ()
+
+
+@dataclass
+class HookRunsChanged(Event):
+    """The engine's hook run log changed; reread it (no data; every session's runs; for the TUI only)."""
+
+
+@dataclass(kw_only=True)
+class HookConfirmationRequest(Event):
+    """A blocking hook asked the user to confirm an operation before it goes on.
+
+    Delivered by session-level ``subscribe`` only, never through the headless
+    turn stream: a new input's hooks run while that input is still being
+    published. A handler records the request, ``claim.try_claim()``, and starts
+    showing it on a task of its own; it never waits for the user. The one
+    frontend whose claim succeeds publishes the one ``HookConfirmationResponse``.
+
+    The contract a frontend relies on, and keeps:
+
+    - A claimed request ends exactly one way: the frontend's answer, or a
+      ``HookConfirmationWithdrawn`` from the backend (invalidated, timed out,
+      interrupted, closed). Nothing else ends it, so a frontend needs no
+      clean-up of its own for a session switch, a rebuild or an interrupt:
+      the withdrawal comes.
+    - The answer is published as soon as the user decides, before anything
+      the frontend does to put the question away (closing a dialog, settling
+      a card): how long that takes never makes an answer given in time late.
+    - Requests are routed by ``session_id`` alone. A frontend that serves one
+      session takes only that session's: a workflow node's requests carry the
+      workflow session's id, and reach only a frontend serving it.
+    """
+
+    request_id: str
+    operation_id: str
+    revision: int
+    run_id: str
+    """The hook run that asked (its ``hook.operation.*`` id and its run log entry)."""
+    origin: InvocationOrigin | None = None
+    """The sub-agent or workflow node the operation belongs to; None for the main agent's own."""
+    caller_name: str = ""
+    """The agent profile that wants the operation."""
+    hook_id: str
+    hook_source: str = ""
+    """``project`` or ``global``; empty when unknown."""
+    reason: str = ""
+    """What the hook wrote: plain text, never markup."""
+    subject: HookConfirmationSubjectKind
+    tool_name: str = ""
+    tool_kind: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    """A copy of the tool arguments the hook saw; the request never changes the call's own."""
+    asked_again: bool = False
+    """The user continued an earlier version of this tool call, whose arguments changed since."""
+    changed_arguments: tuple[HookArgumentChange, ...] = ()
+    """When asked again: each argument that differs from the version the user continued."""
+    input_text: str = ""
+    claim: HookConfirmationClaim = field(default_factory=HookConfirmationClaim)
+
+
+@dataclass(kw_only=True)
+class HookConfirmationResponse(Event):
+    """The frontend that claimed a ``HookConfirmationRequest`` answers it."""
+
+    request_id: str
+    answer: HookConfirmationAnswer
+
+
+@dataclass(kw_only=True)
+class HookConfirmationWithdrawn(Event):
+    """A ``HookConfirmationRequest`` ended without the claiming frontend's answer; stop showing it."""
+
+    request_id: str
+    outcome: HookConfirmationOutcome
+
+
+@dataclass
 class UserInjectResult(Event):
     """Reports whether a mid-run user message was delivered to the model.
 
@@ -978,6 +1144,13 @@ class Error(Event):
     display_message: MessageRef | None = None
     display_hint: MessageRef | None = None
     """Shown after ``display_message``; never without it."""
+    refused_input: RefusedInput | None = None
+    """Set when a gate refused a user input before it ran: which input.
+
+    ``prompt`` (a new turn's message) and ``retry_note`` (the note a retry adds) end the
+    request that brought them; ``injection`` (a message sent into a running turn) refuses
+    only itself, and the turn it was sent into goes on.
+    """
 
 
 @dataclass
@@ -990,6 +1163,8 @@ class Warning(Event):
     message: str = ""
     """Pre-rendered English retained byte-for-byte for compatibility consumers."""
     display_message: MessageRef | None = None
+    reason: str = ""
+    """Machine-readable cause within ``code``, for callers that act on it; empty when ``code`` says it all."""
 
 
 @dataclass
@@ -1044,6 +1219,8 @@ class AgentRuntimeDetails:
     model: RuntimeModelDetails = field(default_factory=RuntimeModelDetails)
     builtin_tools: dict[str, list[str]] = field(default_factory=dict)
     web_search_providers: dict[str, str] = field(default_factory=dict)
+    context_tools: list[str] = field(default_factory=list)
+    """The context management tools the agent has besides its built-in ones: compressing and recalling context."""
     sub_agent_tools: list[str] = field(default_factory=list)
     mcp_tools: dict[str, list[str]] = field(default_factory=dict)
     mcp_failures: dict[str, str] = field(default_factory=dict)
@@ -1120,6 +1297,24 @@ class ImageAttachmentCompressionFinished(Event):
     """Image attachment compression has finished before a user turn is sent."""
 
     image_count: int = 0
+
+
+@dataclass
+class PromptCommandsRunning(Event):
+    """A message's prompt-shortcut ``!`command``` placeholders started running, before its turn starts."""
+
+    count: int = 0
+    injection_id: str | None = None
+    """The message's ``UserMessage.injection_id``."""
+
+
+@dataclass
+class PromptCommandsEnded(Event):
+    """The commands a :class:`PromptCommandsRunning` announced ended; always follows one, whatever ended them."""
+
+    outcome: Literal["completed", "command_failed", "cancelled"] = "completed"
+    injection_id: str | None = None
+    """The message's ``UserMessage.injection_id``."""
 
 
 @dataclass

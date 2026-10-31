@@ -31,6 +31,8 @@ from chrys.orchestration.session_hooks import SessionHookFactory
 from chrys.orchestration.workflows.coordinator import WorkflowCoordinator
 from chrys.service.approval.policy import ApprovalMode
 from chrys.service.approval.turn_context import TurnContextHolder
+from chrys.service.hooks.confirmation import HookConfirmationService
+from chrys.service.hooks.run_log import HookRunLog
 from chrys.service.mcp.cache import MCPConnectionCache
 from chrys.service.mutations.workspace_changes import WorkspaceChangeTracker
 from chrys.service.session.history import SessionHistoryManager
@@ -67,11 +69,14 @@ def assemble_agent_engine(
     on_turn_started: Callable[[], None] | None = None,
     allow_user_interaction: bool = True,
     surface: SessionSurface | None = None,
+    record_hook_runs: bool = False,
 ) -> AgentEngine:
     """Build the owners and inject the engine's event-routing facade.
 
     *surface* is the frontend this engine serves; turns and workflow runs
     record it on their session. Production entry points always pass it.
+    *record_hook_runs* keeps every main-session hook run since the engine was
+    built, with its input and output, for the TUI's Hooks panel.
     """
     bus = event_bus
     if loaded_settings is not None and settings is not None and settings is not loaded_settings.settings:
@@ -115,6 +120,14 @@ def assemble_agent_engine(
         _unset_current_engine(engine)
 
     mcp_cache = MCPConnectionCache()
+    hook_runs = HookRunLog() if record_hook_runs else None
+    # The engine's one place where a hook's ``ask`` waits for the user, for every entry and every
+    # manager the engine builds; a headless engine has one too, which answers every ask unavailable.
+    hook_confirmations = HookConfirmationService(
+        bus=bus,
+        enabled=allow_user_interaction,
+        timeout_seconds=settings_handle.settings.approval_timeout_seconds,
+    )
     loader = AgentLoader(
         bus=bus,
         persistence=persistence,
@@ -138,6 +151,8 @@ def assemble_agent_engine(
         allow_user_interaction=allow_user_interaction,
         build_agent_fn=build_agent,
         register_current_engine=register_current_engine,
+        hook_runs=hook_runs,
+        hook_confirmations=hook_confirmations,
     )
 
     lifecycle = SessionLifecycle(
@@ -201,7 +216,7 @@ def assemble_agent_engine(
         model_registry=model_registry,
         allow_user_interaction=allow_user_interaction,
         persistence=persistence,
-        build_hooks=SessionHookFactory(bus),
+        build_hooks=SessionHookFactory(bus, confirmations=hook_confirmations),
     )
     controls = RuntimeControls(
         session=session,
@@ -211,6 +226,7 @@ def assemble_agent_engine(
         bus=bus,
         settings_handle=settings_handle,
         agent_registry=agent_registry,
+        model_registry=model_registry,
         workspace_change_tracker=workspace_change_tracker,
         workflows=workflows,
     )
@@ -232,5 +248,7 @@ def assemble_agent_engine(
         history=history,
         trajectory_recorder=recorder,
         workflows=workflows,
+        hook_runs=hook_runs,
+        hook_confirmations=hook_confirmations,
     )
     return engine

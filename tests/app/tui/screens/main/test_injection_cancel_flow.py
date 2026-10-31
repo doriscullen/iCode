@@ -54,6 +54,7 @@ def _make_controller(
         view=view,  # type: ignore[arg-type]
         start_worker=workers.append,
         handle_agent_message=_noop_agent_message,
+        handle_agent_content=_noop_agent_message,
         handle_error=_noop_error,
         set_agent_running=lambda _running: None,
         set_has_messages=lambda _has: None,
@@ -62,6 +63,9 @@ def _make_controller(
         commit_profile_switch_marker=lambda: None,
         post_gc_message=lambda _message: None,
         debug=lambda _key, _msg: None,
+        pending_switch=lambda _draft: None,
+        model_left_out=lambda: None,
+        show_error_notice=lambda _error: None,
     )
 
 

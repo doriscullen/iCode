@@ -82,7 +82,7 @@ async def test_mounting_the_dialog_writes_nothing_and_focuses_a_control() -> Non
         assert ports.notification_ports.saved == []
         assert isinstance(dialog.focused, Select)
         rows = dialog.rows()
-        assert len(rows) == ROW_COUNT == 36
+        assert len(rows) == ROW_COUNT == 40
         assert all(row.spec.key != "trajectory.verify_commands" for row in rows)
         assert dialog.query_one(TabbedContent).active == pane_id(GENERAL_TAB_ID)
 
@@ -748,9 +748,11 @@ async def test_quit_commits_a_settings_dialog_that_sits_under_another_modal() ->
     exits: list[bool] = []
     dialog = SettingsDialog.__new__(SettingsDialog)
     dialog.commit_pending = lambda: committed.append("settings")  # type: ignore[method-assign]
+    # Only the main screen opens Settings, so it sits at the bottom of the stack.
+    main = SimpleNamespace(background_tasks_running=False)
     fake_app = SimpleNamespace(
-        screen_stack=[object(), dialog, SimpleNamespace(name="confirm-on-top")],
-        _main_screen=None,
+        screen_stack=[main, dialog, SimpleNamespace(name="confirm-on-top")],
+        _main_screen=main,
         exit=lambda: exits.append(True),
     )
 

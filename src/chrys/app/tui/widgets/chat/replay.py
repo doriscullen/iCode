@@ -16,10 +16,11 @@ from chrys.app.tui.widgets.chat.messages import (
     INTERRUPTED_RETRY_ACTION_MESSAGE,
     AgentMessage,
     InterruptedMessage,
+    ThinkingMessage,
     UserMessage,
     format_message_created_at,
-    process_think_tags,
     resolve_interrupted_message_copy,
+    turn_duration_ms,
 )
 from chrys.app.tui.widgets.chat.ports import ChatMountPort, TranscriptLocalizationPort, TranscriptUiPort
 from chrys.app.tui.widgets.chat.toc_model import TurnTocModel, turn_index_from_extra
@@ -31,6 +32,7 @@ from chrys.foundation.hosted_tools import (
 from chrys.foundation.i18n import MessageDef, MessageRef
 from chrys.foundation.i18n.formatting import format_message, sanitize_legacy_block
 from chrys.foundation.models.history_markers import (
+    ANSWER_SEGMENT_KEY,
     AWAITING_SUB_AGENTS_MESSAGE,
     EXECUTION_FAILED_MESSAGE,
     EXECUTION_INTERRUPTED_MESSAGE,
@@ -38,6 +40,7 @@ from chrys.foundation.models.history_markers import (
     SUB_AGENT_STATE_DISCARDED_MESSAGE,
     HistoryMarkerKind,
 )
+from chrys.foundation.models.turns import opens_turn
 from chrys.foundation.text.images import is_image_media_type
 from chrys.foundation.tool_result_metadata import TOOL_INTERRUPTED_METADATA_KEY
 from chrys.foundation.trajectory_timing import trajectory_timing_from_metadata
@@ -65,6 +68,8 @@ from chrys.service.agent_middleware.events.hosted_tools import (
     normalize_hosted_replay_content,
 )
 from chrys.service.agent_middleware.events.result_persistence import PERSISTED_RESULT_METADATA_KEYS
+from chrys.service.context.providers.history import TURN_STARTED_AT_KEY
+from chrys.service.llm.reasoning_display import readable_reasoning
 from chrys.service.mutations.tool_names import _FILE_TOOLS
 from chrys.service.session.message_metadata import (
     MESSAGE_CREATED_AT_KEY,
@@ -77,6 +82,7 @@ from chrys.service.text_blocks import join_text_blocks, reconstruct_text_blocks,
 if TYPE_CHECKING:
     from textual.widget import Widget
 
+    from chrys.foundation.models.invocations import ContentChannel
     from chrys.service.context.providers.history import CompressedBlock
 
 # Replay renders every function-style call it can display: legacy serialized calls
@@ -148,6 +154,8 @@ class ReplayToolCall:
 @dataclass(frozen=True)
 class ReplayTurnMarker:
     turn_index: int | None
+    started_at: Any = None
+    """When the pass the marker ends began, which the answer before it is timed from."""
 
 
 @dataclass(frozen=True)
@@ -170,10 +178,22 @@ class ReplayAgentMessage:
     contents: list[Any]
     created_at: Any = None
     is_intermediate: bool = False
-    structured_output_completed: bool = False
     intermediate_texts: list[str] = field(default_factory=list)
     status_code: str | None = None
     status_count: int | None = None
+    duration_ms: int | None = None
+    is_status: bool = False
+
+
+@dataclass(frozen=True)
+class ReplayStructuredCompletion:
+    """The ✓ of a turn that ended with successful structured hosted output and no answer text.
+
+    It carries when the agent message whose output it completes finished, and
+    how long its turn took, and follows the thinking after it, as it did live.
+    """
+
+    created_at: Any = None
     duration_ms: int | None = None
 
 
@@ -192,13 +212,20 @@ class ReplayInterrupted:
     status_count: int | None = None
 
 
+@dataclass(frozen=True)
+class ReplaySuppressedStatus:
+    """An unsuccessful terminal status whose prose is omitted from compressed history."""
+
+
 ReplayEntry = (
     ReplayTurnMarker
     | ReplayUserMessage
     | ReplayProfileSwitch
     | ReplayAgentMessage
+    | ReplayStructuredCompletion
     | ReplayContextFold
     | ReplayInterrupted
+    | ReplaySuppressedStatus
 )
 
 
@@ -255,7 +282,9 @@ class HistoryReplayPlanner:
         *,
         file_snapshots: dict[str, list[Any]] | None = None,
         suppress_marker_text: bool = False,
+        show_reasoning: bool = False,
     ) -> ReplayPlan:
+        """Plan the replay of *messages*; with *show_reasoning*, readable thinking shows, and splits tool groups as live."""
         # Compaction tool summaries are the model's context and never render.
         # Drop them before pairing and merging, so a hidden summary cannot
         # split or join the tool groups around it.
@@ -264,8 +293,10 @@ class HistoryReplayPlanner:
             messages,
             file_snapshots=file_snapshots,
         )
-        merged = self._merge_assistant_entries(messages, pairings, standalone_hosted_results, annotations)
-        entries = self._build_entries(merged, suppress_marker_text=suppress_marker_text)
+        merged = self._merge_assistant_entries(
+            messages, pairings, standalone_hosted_results, annotations, show_reasoning=show_reasoning
+        )
+        entries = self._build_entries(merged, suppress_marker_text=suppress_marker_text, show_reasoning=show_reasoning)
         return ReplayPlan(entries=entries, annotations=annotations)
 
     def _pair_tool_calls(
@@ -408,6 +439,8 @@ class HistoryReplayPlanner:
         pairings: dict[int, _PairedToolData],
         standalone_hosted_results: dict[int, ReplayToolCall],
         annotations: list[ReplayCompatibilityAnnotation],
+        *,
+        show_reasoning: bool,
     ) -> list[MergedEntry]:
         merged: list[MergedEntry] = []
         legacy_duplicate_sidecars = _legacy_duplicate_intermediate_sidecars(messages)
@@ -480,7 +513,10 @@ class HistoryReplayPlanner:
 
             for content in contents:
                 if _is_tool_call(content) or id(content) in standalone_hosted_results:
-                    if self._append_text_segment(merged, pending_text, extra, is_intermediate=True):
+                    if self._append_text_segment(
+                        merged, pending_text, extra, is_intermediate=True, show_reasoning=show_reasoning
+                    ):
+                        # Thinking shown before the tools ends the tool group above, as it did live.
                         text_before_next_tool = True
                     pending_text.clear()
                     pending_tools.append(next(replay_tools))
@@ -508,7 +544,13 @@ class HistoryReplayPlanner:
                     has_preceding_text=text_before_next_tool,
                 )
             trailing_text_is_final = bool(pending_text) and _hosted_trailing_text_is_final(contents)
-            self._append_text_segment(merged, pending_text, extra, is_intermediate=not trailing_text_is_final)
+            self._append_text_segment(
+                merged,
+                pending_text,
+                extra,
+                is_intermediate=not trailing_text_is_final,
+                show_reasoning=show_reasoning,
+            )
 
         return self._coalesce_tool_groups(merged)
 
@@ -554,8 +596,9 @@ class HistoryReplayPlanner:
         extra: dict[str, Any],
         *,
         is_intermediate: bool,
+        show_reasoning: bool,
     ) -> bool:
-        if not _has_visible_text(contents):
+        if not (_has_visible_text(contents) or (show_reasoning and _shows_thinking(contents))):
             return False
         merged.append(
             _MergedAssistantEntry(
@@ -713,9 +756,12 @@ class HistoryReplayPlanner:
         merged: list[MergedEntry],
         *,
         suppress_marker_text: bool,
+        show_reasoning: bool,
     ) -> list[ReplayEntry]:
         entries: list[ReplayEntry] = []
         seen_user_in_turn = False
+        # When the turn's opening message was sent: when its pass began, unless Continue or Retry began it later.
+        turn_opened_at: Any = None
         retry_action_marker_index = _trailing_retry_marker_index(merged)
 
         for msg_index, entry in enumerate(merged):
@@ -726,7 +772,6 @@ class HistoryReplayPlanner:
                         created_at=_message_created_at(entry.additional_properties),
                         is_intermediate=entry.is_intermediate,
                         intermediate_texts=list(entry.intermediate_texts),
-                        duration_ms=_trajectory_duration_ms(entry.additional_properties),
                     )
                 )
                 continue
@@ -739,8 +784,11 @@ class HistoryReplayPlanner:
             status_code = _recognized_status_code(extra)
 
             if marker == HistoryMarkerKind.TURN:
-                entries.append(ReplayTurnMarker(turn_index_from_extra(extra)))
+                # A marker written before turns kept when their pass began times it from the opening message.
+                started_at = extra.get(TURN_STARTED_AT_KEY) or turn_opened_at
+                entries.append(ReplayTurnMarker(turn_index_from_extra(extra), started_at=started_at))
                 seen_user_in_turn = False
+                turn_opened_at = None
                 continue
 
             if marker == HistoryMarkerKind.SUMMARY:
@@ -776,6 +824,8 @@ class HistoryReplayPlanner:
                 # through as plain text only — chrome payloads never surface
                 # as conversation tool activity.
                 if suppress_marker_text:
+                    if role == "assistant" and (marker in HistoryMarkerKind.STATUS_MARKERS or status_code is not None):
+                        entries.append(ReplaySuppressedStatus())
                     continue
                 text_contents = [
                     {**content, "text": sanitize_legacy_block(str(content.get("text", "")))}
@@ -790,6 +840,7 @@ class HistoryReplayPlanner:
                             status_code=status_code,
                             status_count=_status_count(extra),
                             duration_ms=_trajectory_duration_ms(extra),
+                            is_status=marker in HistoryMarkerKind.STATUS_MARKERS or status_code is not None,
                         )
                     )
                 continue
@@ -802,7 +853,7 @@ class HistoryReplayPlanner:
                 # "continue" and keep rendering via the positional fallback.
                 if extra.get(HistoryMarkerKind.CONTINUATION_KEY):
                     continue
-                text = "\n".join(_text_parts(contents)).strip()
+                text = contents_text(contents)
                 profile_switch_to = str(extra.get(HistoryMarkerKind.PROFILE_SWITCH_TO_KEY) or "")
                 if not text:
                     if profile_switch_to:
@@ -821,31 +872,81 @@ class HistoryReplayPlanner:
                 )
                 if not is_injection:
                     seen_user_in_turn = True
+                if opens_turn(_TurnMessageView(role, extra)):
+                    # By its flags, not its place: a message sent after a stopped pass opens a turn of its own,
+                    # though the stopped pass left no marker before it.
+                    turn_opened_at = _message_created_at(extra)
                 continue
 
             if role == "assistant":
-                entries.append(
-                    ReplayAgentMessage(
-                        contents=list(contents),
-                        created_at=_message_created_at(extra),
-                        duration_ms=_trajectory_duration_ms(extra),
-                    )
-                )
+                entries.append(ReplayAgentMessage(contents=list(contents), created_at=_message_created_at(extra)))
 
-        return _mark_structured_output_completions(entries)
+        return _time_turn_answers(_add_structured_output_completions(entries, show_reasoning=show_reasoning))
 
 
-def _mark_structured_output_completions(entries: list[ReplayEntry]) -> list[ReplayEntry]:
-    """Mark a turn-ending successful hosted result that has no text response."""
+@dataclass(frozen=True)
+class _TurnMessageView:
+    """A persisted message dict as :func:`opens_turn` reads it."""
+
+    role: str
+    additional_properties: dict[str, Any]
+    text: str | None = None
+
+
+def _time_turn_answers(entries: list[ReplayEntry]) -> list[ReplayEntry]:
+    """Tell on the answer each pass ended with how long its turn took, from when the pass began, as live.
+
+    The answer is the last thing the pass showed before its marker, skipping thinking and messages sent mid-turn
+    (history may place one after the answer): its text, or the ✓ of its structured output. A pass that ended
+    otherwise (interrupted, failed, awaiting sub-agents) has none to time.
+    """
+    for index, marker in enumerate(entries):
+        if not isinstance(marker, ReplayTurnMarker):
+            continue
+        before = index - 1
+        while before >= 0 and (
+            _shows_at_most_thinking(previous := entries[before])
+            or (isinstance(previous, ReplayUserMessage) and previous.is_injection)
+        ):
+            before -= 1
+        answer = entries[before] if before >= 0 else None
+        if isinstance(answer, ReplayStructuredCompletion) or (
+            isinstance(answer, ReplayAgentMessage) and not answer.is_status
+        ):
+            entries[before] = replace(answer, duration_ms=turn_duration_ms(marker.started_at, answer.created_at))
+    return entries
+
+
+def _add_structured_output_completions(entries: list[ReplayEntry], *, show_reasoning: bool) -> list[ReplayEntry]:
+    """Complete a turn-ending successful hosted result that has no text response with a ✓.
+
+    The ✓ goes after the thinking that follows the result: live, it showed
+    when the turn ended. Shown thinking splits the tool group that ends a
+    turn into several; the ✓ reads them all, as it reads the one group
+    otherwise.
+    """
     candidate_index: int | None = None
+    completions: dict[int, ReplayStructuredCompletion] = {}
 
     def finalize_candidate() -> None:
         nonlocal candidate_index
         if candidate_index is None:
             return
         candidate = entries[candidate_index]
-        if isinstance(candidate, ReplayAgentMessage) and _has_successful_structured_tool(candidate.contents):
-            entries[candidate_index] = replace(candidate, structured_output_completed=True)
+        contents = list(candidate.contents) if isinstance(candidate, ReplayAgentMessage) else []
+        if show_reasoning and _shows_no_answer(candidate):
+            before = candidate_index
+            while before > 0 and isinstance(previous := entries[before - 1], ReplayAgentMessage):
+                # Only what thinking split off: a tool group, or the thinking before one.
+                if not (_shows_no_answer(previous) and (previous.is_intermediate or _has_tool_call(previous.contents))):
+                    break
+                before -= 1
+                contents.extend(previous.contents)
+        if isinstance(candidate, ReplayAgentMessage) and _has_successful_structured_tool(contents):
+            after = candidate_index
+            while after + 1 < len(entries) and _shows_at_most_thinking(entries[after + 1]):
+                after += 1
+            completions[after] = ReplayStructuredCompletion(candidate.created_at)
         candidate_index = None
 
     for index, entry in enumerate(entries):
@@ -855,19 +956,45 @@ def _mark_structured_output_completions(entries: list[ReplayEntry]) -> list[Repl
         if isinstance(entry, ReplayUserMessage) and not entry.is_injection:
             finalize_candidate()
             continue
-        if isinstance(entry, ReplayInterrupted):
+        if isinstance(entry, ReplayInterrupted | ReplaySuppressedStatus):
             candidate_index = None
             continue
         if not isinstance(entry, ReplayAgentMessage) or entry.is_intermediate:
             continue
-        if _has_visible_text(entry.contents) or any(
-            isinstance(content, ReplayToolCall) or (isinstance(content, dict) and _is_tool_call(content))
-            for content in entry.contents
-        ):
+        if _has_visible_text(entry.contents) or _has_tool_call(entry.contents):
             candidate_index = index
 
     finalize_candidate()
-    return entries
+    if not completions:
+        return entries
+    completed: list[ReplayEntry] = []
+    for index, entry in enumerate(entries):
+        completed.append(entry)
+        if (completion := completions.get(index)) is not None:
+            completed.append(completion)
+    return completed
+
+
+def _has_tool_call(contents: list[Any]) -> bool:
+    return any(
+        isinstance(content, ReplayToolCall) or (isinstance(content, dict) and _is_tool_call(content))
+        for content in contents
+    )
+
+
+def _shows_no_answer(entry: ReplayEntry) -> bool:
+    """Whether *entry* is an agent message that shows no answer or notice: tools and thinking at most."""
+    return (
+        isinstance(entry, ReplayAgentMessage)
+        and entry.status_code is None
+        and not any(text.strip() for text in entry.intermediate_texts)
+        and not _has_visible_text(entry.contents)
+    )
+
+
+def _shows_at_most_thinking(entry: ReplayEntry) -> bool:
+    """Whether *entry* is an agent message that shows no more than thinking: no answer, notice or tool."""
+    return _shows_no_answer(entry) and isinstance(entry, ReplayAgentMessage) and not _has_tool_call(entry.contents)
 
 
 def _has_successful_structured_tool(contents: list[Any]) -> bool:
@@ -895,13 +1022,21 @@ class HistoryReplayRenderer:
         default_profile: Callable[[], str],
         localization: TranscriptLocalizationPort | None = None,
         tool_widget_configurator: Callable[[Widget], None] | None = None,
+        workspace_cwd: Callable[[], str] | None = None,
+        show_reasoning: bool = False,
+        fold_passed_text: bool = False,
     ) -> None:
         self._mount = mount
+        self._workspace_cwd = workspace_cwd
         self._ui = ui
         self._toc = toc
         self._tool_kind_resolver = tool_kind_resolver
         self._default_profile = default_profile
         self._tool_widget_configurator = tool_widget_configurator
+        self._show_reasoning = show_reasoning
+        """Whether the transcript shows readable thinking; replayed, it starts folded."""
+        self._fold_passed_text = fold_passed_text
+        """Whether text between tool calls starts folded, as the live text it was folded once the turn moved on."""
         self._resolve_message = localization.render if localization is not None else format_message
         self._planner = HistoryReplayPlanner()
 
@@ -916,11 +1051,13 @@ class HistoryReplayRenderer:
         """Replay saved session messages into the chat transcript."""
         await self._ui.dismiss_welcome_for_content()
         self._ui.on_replay_started()
-        plan = self._planner.build_plan(messages, file_snapshots=file_snapshots)
+        show_reasoning = self._show_reasoning
+        plan = self._planner.build_plan(messages, file_snapshots=file_snapshots, show_reasoning=show_reasoning)
         plan.apply_compatibility_annotations()
         replay_profile = initial_profile or self._default_profile()
         seen_user_in_turn = False
         widgets: list[Widget] = []
+        process_failures_after: list[Widget] = []
 
         for entry in plan.entries:
             if isinstance(entry, ReplayTurnMarker):
@@ -931,7 +1068,13 @@ class HistoryReplayRenderer:
             if isinstance(entry, ReplayContextFold):
                 block = compressed_blocks.get(entry.context_id) if compressed_blocks else None
                 if block:
-                    replay_profile = await self._replay_compressed_block(block, replay_profile, widgets=widgets)
+                    replay_profile = await self._replay_compressed_block(
+                        block,
+                        replay_profile,
+                        widgets=widgets,
+                        show_reasoning=show_reasoning,
+                        process_failures_after=process_failures_after,
+                    )
                 freed_messages = len(block.messages) if block else 0
                 turn_range = block.turn_range if block else (0, 0)
                 widgets.append(
@@ -994,9 +1137,10 @@ class HistoryReplayRenderer:
                         is_final=True,
                         profile_name=replay_profile,
                         is_intermediate=True,
+                        collapsed=self._fold_passed_text,
                     )
                     for itext in entry.intermediate_texts
-                    if process_think_tags(itext, intermediate=True)
+                    if itext.strip()
                 )
                 contents = entry.contents
                 status_text = self._resolve_status(entry.status_code, entry.status_count)
@@ -1006,14 +1150,19 @@ class HistoryReplayRenderer:
                     contents,
                     profile_name=replay_profile,
                     is_intermediate=entry.is_intermediate,
-                    structured_output_completed=entry.structured_output_completed,
                     created_at=entry.created_at,
                     duration_ms=entry.duration_ms,
                     widgets=widgets,
+                    show_reasoning=show_reasoning,
+                    is_status=entry.is_status or entry.status_code is not None,
                 )
+                continue
+
+            if isinstance(entry, ReplayStructuredCompletion):
+                widgets.append(_structured_completion_message(entry, replay_profile, is_compressed=False))
 
         if widgets:
-            await self._mount.mount_transcript_widgets(widgets)
+            await self._mount.mount_transcript_widgets(widgets, process_failures_after=tuple(process_failures_after))
         self._ui.after_replay_history_mounted()
 
     def _resolve_status(self, status_code: str | None, count: int | None) -> str | None:
@@ -1040,14 +1189,25 @@ class HistoryReplayRenderer:
         replay_profile: str,
         *,
         widgets: list[Widget] | None = None,
+        show_reasoning: bool = False,
+        process_failures_after: list[Widget] | None = None,
     ) -> str:
         """Render a compressed block through the canonical replay planner."""
         replay_widgets = widgets if widgets is not None else []
+        failure_anchors = process_failures_after if process_failures_after is not None else []
         serialized_messages = [message.to_dict() for message in block.messages]
-        plan = self._planner.build_plan(serialized_messages, suppress_marker_text=True)
+        plan = self._planner.build_plan(serialized_messages, suppress_marker_text=True, show_reasoning=show_reasoning)
         plan.apply_compatibility_annotations()
         seen_user_in_turn = False
         for entry in plan.entries:
+            if isinstance(entry, ReplayInterrupted | ReplaySuppressedStatus):
+                # Omitted prose still ends the preceding activity unsuccessfully.
+                # Anchor the fact to existing content so it never creates a copy
+                # entry, a process member, or a row in the replay mount budget.
+                if replay_widgets:
+                    failure_anchors.append(replay_widgets[-1])
+                continue
+
             if isinstance(entry, ReplayTurnMarker):
                 self._toc.apply_turn_marker(entry.turn_index)
                 seen_user_in_turn = False
@@ -1091,9 +1251,10 @@ class HistoryReplayRenderer:
                         profile_name=replay_profile,
                         is_intermediate=True,
                         is_compressed=True,
+                        collapsed=self._fold_passed_text,
                     )
                     for text in entry.intermediate_texts
-                    if process_think_tags(text, intermediate=True)
+                    if text.strip()
                 )
                 visible_contents = [
                     content
@@ -1109,15 +1270,20 @@ class HistoryReplayRenderer:
                     visible_contents,
                     profile_name=replay_profile,
                     is_intermediate=entry.is_intermediate,
-                    structured_output_completed=entry.structured_output_completed,
                     created_at=entry.created_at,
                     duration_ms=entry.duration_ms,
                     is_compressed=True,
                     widgets=replay_widgets,
+                    show_reasoning=show_reasoning,
+                    is_status=entry.is_status or entry.status_code is not None,
                 )
+                continue
+
+            if isinstance(entry, ReplayStructuredCompletion):
+                replay_widgets.append(_structured_completion_message(entry, replay_profile, is_compressed=True))
 
         if widgets is None:
-            await self._mount.mount_transcript_widgets(replay_widgets)
+            await self._mount.mount_transcript_widgets(replay_widgets, process_failures_after=tuple(failure_anchors))
         return replay_profile
 
     async def _replay_assistant(
@@ -1125,38 +1291,71 @@ class HistoryReplayRenderer:
         contents: list[Any],
         profile_name: str = "",
         is_intermediate: bool = False,
-        structured_output_completed: bool = False,
         created_at: Any = None,
         duration_ms: int | None = None,
         is_compressed: bool = False,
         widgets: list[Widget] | None = None,
+        show_reasoning: bool = False,
+        is_status: bool = False,
     ) -> None:
-        """Replay a single assistant message, preserving text/tool-call order."""
+        """Replay a single assistant message, preserving text/thinking/tool-call order."""
         replay_widgets = widgets if widgets is not None else []
         pending_text: list[tuple[str, str | None]] = []
+        # The segment the pending text was shown in: one bubble per segment, as a bare Continue may withdraw each.
+        pending_segment: str | None = None
         pending_tools: list[ReplayToolCall | dict[str, Any]] = []
+        pending_thinking: list[str] = []
+        thinking_channel: ContentChannel | None = None
+        # An answer bubble thinking followed, as (index, text, segment ids): live, a later answer settled it.
+        before_thinking: tuple[int, str, tuple[str, ...]] | None = None
         timestamp = "" if is_intermediate else format_message_created_at(created_at)
 
-        async def flush_text() -> None:
+        def answer_message(text: str, segment_ids: tuple[str, ...], *, intermediate: bool) -> AgentMessage:
+            return AgentMessage(
+                text,
+                is_final=True,
+                profile_name=profile_name,
+                is_intermediate=intermediate,
+                is_compressed=is_compressed,
+                timestamp="" if intermediate else timestamp,
+                duration_ms=None if intermediate else duration_ms,
+                segment_ids=segment_ids,
+                is_status=is_status,
+                collapsed=self._fold_passed_text,
+            )
+
+        async def flush_text(*, settled: bool = False, thinking_follows: bool = False) -> None:
+            nonlocal before_thinking
             text = join_text_blocks(reconstruct_text_blocks(pending_text)).strip()
+            segment_ids = (pending_segment,) if pending_segment else ()
             pending_text.clear()
-            if text and process_think_tags(text, intermediate=is_intermediate):
+            if not text:
+                return
+            if before_thinking is not None:
+                index, earlier_text, earlier_segment_ids = before_thinking
+                replay_widgets[index] = answer_message(earlier_text, earlier_segment_ids, intermediate=True)
+                before_thinking = None
+            intermediate = is_intermediate or settled
+            replay_widgets.append(answer_message(text, segment_ids, intermediate=intermediate))
+            if thinking_follows and not intermediate:
+                before_thinking = (len(replay_widgets) - 1, text, segment_ids)
+
+        def flush_thinking() -> None:
+            nonlocal thinking_channel
+            channel, text = thinking_channel, "".join(pending_thinking)
+            thinking_channel = None
+            pending_thinking.clear()
+            if channel is not None:
                 replay_widgets.append(
-                    AgentMessage(
-                        text,
-                        is_final=True,
-                        profile_name=profile_name,
-                        is_intermediate=is_intermediate,
-                        is_compressed=is_compressed,
-                        timestamp=timestamp,
-                        duration_ms=None if is_intermediate else duration_ms,
-                    )
+                    ThinkingMessage(text, channel=channel, collapsed=True, is_compressed=is_compressed)
                 )
 
         async def flush_tools() -> None:
             if not pending_tools:
                 return
-            group = ToolGroup(live=False, tool_widget_configurator=self._tool_widget_configurator)
+            group = ToolGroup(
+                live=False, tool_widget_configurator=self._tool_widget_configurator, workspace_cwd=self._workspace_cwd
+            )
             for idx, tc in enumerate(pending_tools):
                 if isinstance(tc, ReplayToolCall):
                     name = tc.name
@@ -1261,37 +1460,65 @@ class HistoryReplayRenderer:
         for content in contents:
             is_tool = isinstance(content, ReplayToolCall) or _is_tool_call(content)
             if is_tool:
+                flush_thinking()
                 if pending_text:
                     await flush_text()
                 pending_tools.append(content)
             else:
                 if pending_tools:
                     await flush_tools()
+                if isinstance(content, dict) and content.get("type") in TOOL_RESULT_CONTENT_TYPES:
+                    # A result ends the thinking before it, as it ended the segment live.
+                    flush_thinking()
+                if show_reasoning and (shown := _readable_thinking(content)) is not None:
+                    channel, thought = shown
+                    if channel == thinking_channel:
+                        pending_thinking.append(thought)
+                    elif thought.strip():
+                        # The answer before it shows above it; blank thinking showed nothing live.
+                        flush_thinking()
+                        await flush_text(thinking_follows=True)
+                        thinking_channel = channel
+                        pending_thinking.append(thought)
+                    continue
                 if isinstance(content, dict) and content.get("type") == "text":
-                    text = content.get("text", "")
-                    block_id = text_block_id(content.get("additional_properties"))
-                    # Even an empty fragment can separate different item IDs.
-                    # Suppress empty blocks only after reconstruction.
-                    pending_text.append((text or "", block_id))
+                    properties = content.get("additional_properties")
+                    text, block_id = content.get("text", "") or "", text_block_id(properties)
+                    segment = properties.get(ANSWER_SEGMENT_KEY) if isinstance(properties, dict) else None
+                    segment = segment if isinstance(segment, str) and segment else None
                 elif isinstance(content, str):
-                    pending_text.append((content, None))
+                    text, block_id, segment = content, None, None
+                else:
+                    continue
+                # Even an empty fragment can separate different item IDs, but only
+                # text shows a segment. Suppress empty blocks after reconstruction.
+                if text:
+                    flush_thinking()
+                    if pending_text and segment != pending_segment:
+                        # A later segment settles this one as intermediate text, as it did live.
+                        await flush_text(settled=True)
+                    pending_segment = segment
+                pending_text.append((text, block_id))
 
         await flush_tools()
+        flush_thinking()
         await flush_text()
-        if structured_output_completed and not is_intermediate:
-            replay_widgets.append(
-                AgentMessage(
-                    "✓",
-                    is_final=True,
-                    profile_name=profile_name,
-                    is_compressed=is_compressed,
-                    is_structured_completion=True,
-                    timestamp=timestamp,
-                    duration_ms=duration_ms,
-                )
-            )
         if widgets is None:
             await self._mount.mount_transcript_widgets(replay_widgets)
+
+
+def _structured_completion_message(
+    entry: ReplayStructuredCompletion, profile_name: str, *, is_compressed: bool
+) -> AgentMessage:
+    return AgentMessage(
+        "✓",
+        is_final=True,
+        profile_name=profile_name,
+        is_compressed=is_compressed,
+        is_structured_completion=True,
+        timestamp=format_message_created_at(entry.created_at),
+        duration_ms=entry.duration_ms,
+    )
 
 
 def _message_contents(message: dict[str, Any]) -> list[Any]:
@@ -1496,6 +1723,18 @@ def _has_visible_text(contents: list[Any]) -> bool:
     )
 
 
+def _readable_thinking(content: Any) -> tuple[ContentChannel, str] | None:
+    """The channel and text a persisted reasoning content shows, or ``None`` when it has nothing readable."""
+    if not isinstance(content, dict) or content.get("type") != "text_reasoning":
+        return None
+    return readable_reasoning(Content.from_dict(content))
+
+
+def _shows_thinking(contents: list[Any]) -> bool:
+    """Whether *contents* hold thinking to show: readable text that is not blank, as live."""
+    return any((shown := _readable_thinking(content)) is not None and shown[1].strip() for content in contents)
+
+
 def _intermediate_text_is_visible(contents: list[Any], intermediate_text: Any) -> bool:
     if not isinstance(intermediate_text, str) or not intermediate_text.strip():
         return False
@@ -1580,6 +1819,11 @@ def _visible_text_variants(contents: list[Any]) -> list[str]:
         variants.append("\n".join(all_parts).strip())
         variants.append("".join(all_parts).strip())
     return [text for text in variants if text]
+
+
+def contents_text(contents: list[Any]) -> str:
+    """A user message's text as its contents hold it: what the model received, shown live and on replay alike."""
+    return "\n".join(_text_parts(contents)).strip()
 
 
 def _text_parts(contents: list[Any]) -> list[str]:

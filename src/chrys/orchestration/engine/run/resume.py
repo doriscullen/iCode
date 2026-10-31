@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -21,9 +21,10 @@ from chrys.foundation.models.turns import (
 )
 from chrys.foundation.trajectory.ids import new_analytics_id
 from chrys.foundation.trajectory.metadata import ensure_analytics_item_id, read_analytics_item_id
-from chrys.kernel import Message
+from chrys.kernel import Content, Message
 from chrys.orchestration.invoker.contracts import Failed, InvocationOutcome, RunIntent, RunRequest
 from chrys.orchestration.invoker.evidence import InvocationEvidence
+from chrys.service.session.history import SessionHistoryManager
 from chrys.service.session.message_metadata import (
     MESSAGE_CREATED_AT_KEY,
     stamp_message_created_at,
@@ -52,6 +53,8 @@ class TurnPassState:
     was_interrupted: bool = False
     run_failed: bool = False
     last_error: str = ""
+    partial_answer: tuple[Content, ...] = ()
+    """The answer contents of the response the ended pass left unrecorded."""
 
 
 def _make_user_message(
@@ -118,22 +121,37 @@ class TurnResumePolicy:
         """Pre-assign the analytics item id the next opening user message takes."""
         self._opening_item_id = item_id
 
-    def begin_invocation(self) -> None:
-        """Allocate the fresh operation's identity synchronously before preparation."""
+    def begin_invocation(self, *, typed_text: str | None = None) -> None:
+        """Allocate the fresh operation's identity synchronously before preparation.
+
+        *typed_text*, what the user typed when the message sent differs from it,
+        is recorded at once: a Stop before the request goes out leaves the
+        message to the failure fallback and the recovery checkpoint, which take
+        their record from :attr:`input_properties`.
+        """
         self.origin = InvocationOrigin("turn", self._session_id or "", new_analytics_id(), None)
         self.outcome = None
         self.evidence = InvocationEvidence(self.origin.invocation_id)
         self.pending_continuation_token = None
-        self.input_properties = None
+        self.input_properties = {HistoryMarkerKind.TYPED_TEXT_KEY: typed_text} if typed_text else None
 
     def _take_opening_item_id(self) -> str | None:
         item_id = self._opening_item_id
         self._opening_item_id = None
         return item_id
 
-    def fresh_request(self, contents: list, created_at: datetime | str | None = None) -> RunRequest:
-        """Prepare a new Turn input after checking the backend admission fence."""
+    def fresh_request(
+        self, contents: list, created_at: datetime | str | None = None, *, typed_text: str | None = None
+    ) -> RunRequest:
+        """Prepare a new Turn input after checking the backend admission fence.
+
+        *typed_text* is what the user typed when the message's text differs from
+        it (a prompt shortcut's commands spliced in): recorded on the message
+        (``HistoryMarkerKind.TYPED_TEXT_KEY``), never sent.
+        """
         user_message = _make_user_message(contents, created_at, item_id=self._opening_item_id)
+        if typed_text is not None and typed_text != user_message.text:
+            user_message.additional_properties[HistoryMarkerKind.TYPED_TEXT_KEY] = typed_text
         request = RunRequest([user_message], RunIntent.FRESH, self.origin)
         self.backend.validate(request)
         self._take_opening_item_id()
@@ -153,7 +171,11 @@ class TurnResumePolicy:
 
     @asynccontextmanager
     async def retry_request(
-        self, additional_text: str = "", created_at: datetime | str | None = None
+        self,
+        additional_text: str = "",
+        created_at: datetime | str | None = None,
+        *,
+        withdraw: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[RunRequest | None]:
         """Resume from current conversation state.
 
@@ -161,7 +183,9 @@ class TurnResumePolicy:
         continuation prompt. The text is sent as a real user message inside
         the current turn, so it appears as a proper user turn in history.
 
-        When *additional_text* is empty:
+        When *additional_text* is empty, a trailing answer the failed pass
+        showed is dropped first, so it is asked for again (*withdraw* hears
+        the segments it was shown in, before anything else runs), and then:
 
         * If there are completed tool calls after the last user message,
           continues from the transcript with empty input.
@@ -208,6 +232,11 @@ class TurnResumePolicy:
                     copy_reminder_record(note.additional_properties, fallback_note.additional_properties)
                     messages.append(fallback_note)
             return
+
+        history = SessionHistoryManager()
+        history.bind(state)
+        if (withdrawn := history.remove_trailing_answer()) and withdraw is not None:
+            await withdraw(withdrawn)
 
         # Find the last real user input. Legacy synthetic nudges stay in
         # persisted history for read compatibility but cannot become anchors.

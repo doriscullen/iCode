@@ -31,7 +31,6 @@ from chrys.app.tui.widgets.chat.ports import ChatMountPort, StatusCleanupPort, T
 from chrys.app.tui.widgets.chat.renderers.ask_user import AskUserToolCall
 from chrys.app.tui.widgets.chat.renderers.sub_agent import SubAgentToolCall
 from chrys.app.tui.widgets.chat.tool_call import ToolGroup
-from chrys.foundation.events.types import ProvisionalPresentation
 
 if TYPE_CHECKING:
     from chrys.app.tui.widgets import PromptDraft
@@ -53,10 +52,12 @@ class ToolGroupRegistry:
         finalize_agent_message: Callable[[], None] | None = None,
         tool_groups_expanded: Callable[[], bool] | None = None,
         tool_widget_configurator: Callable[[Widget], None] | None = None,
+        workspace_cwd: Callable[[], str] | None = None,
     ) -> None:
         self._mount = mount
         self._ui = ui
         self._status = status
+        self._workspace_cwd = workspace_cwd
         self._finalize_agent_message = finalize_agent_message
         self._tool_groups_expanded = tool_groups_expanded or _expanded_by_default
         self._tool_widget_configurator = tool_widget_configurator
@@ -171,8 +172,8 @@ class ToolGroupRegistry:
                 self._sub_agent_owning_groups.pop(widget, None)
         self._unlinked_sub_agents.clear()
 
-    def cancel_running_and_end_group(self) -> None:
-        """Cancel in-progress tools in every open group and close them.
+    def cancel_running_and_end_group(self, *, stopped_at: float | None = None) -> None:
+        """Cancel in-progress tools in every open group and close them, stopped at *stopped_at*, now if not given.
 
         Besides the current group, older groups can still hold running
         records: ``end_group`` retains sub-agent invocations whose parent
@@ -196,7 +197,7 @@ class ToolGroupRegistry:
                 groups.append(group)
                 seen.add(id(group))
         for group in groups:
-            group.cancel_running()
+            group.cancel_running(stopped_at=stopped_at)
             group.collapsed = True
         # Always advance the lifecycle, even when a InvocationToolCallStart is still
         # awaiting status cleanup and has not installed its group yet.
@@ -217,10 +218,18 @@ class ToolGroupRegistry:
         provider_status: str = "",
         provider_call_id: str = "",
         canonical_status: str = "running",
+        running_in_place: bool = False,
+        started_at: float | None = None,
     ) -> None:
-        """Add a running tool call, creating a group if needed."""
+        """Add a running tool call, creating a group if needed.
+
+        With *running_in_place*, the start of a call whose card still runs updates that card in its own group.
+        *started_at* is when the call started, as ``time.monotonic()`` read it, if not now.
+        """
         group_generation = self._group_generation
         group = self._current_tool_group
+        if running_in_place and self.is_tool_running(call_id):
+            group = self._tool_groups_by_call_id[call_id]
         if group is None:
             group = await self._open_tool_group(group_generation)
             if group is None:
@@ -252,9 +261,10 @@ class ToolGroupRegistry:
                 provider_status=provider_status,
                 provider_call_id=provider_call_id,
                 canonical_status=canonical_status,
+                started_at=started_at,
             )
         else:
-            await group.add_tool(call_id, tool_name, tool_kind, args_summary, args=args)
+            await group.add_tool(call_id, tool_name, tool_kind, args_summary, args=args, started_at=started_at)
         widget = group.get_tool(call_id)
         if self._group_generation == group_generation and isinstance(widget, SubAgentToolCall):
             self._sub_agent_owning_groups[widget] = group
@@ -290,17 +300,19 @@ class ToolGroupRegistry:
             await self._status.remove_trailing_status()
             if self._group_generation != group_generation:
                 return None
-            if self._finalize_agent_message is not None:
-                self._finalize_agent_message()
-            if self._tool_widget_configurator is None:
-                group = ToolGroup()
-            else:
-                group = ToolGroup(tool_widget_configurator=self._tool_widget_configurator)
+            group = ToolGroup(
+                tool_widget_configurator=self._tool_widget_configurator, workspace_cwd=self._workspace_cwd
+            )
             group.collapsed = not self._tool_groups_expanded()
             mounted = await self._mount.mount_transcript_widget(group)
             if not mounted or self._group_generation != group_generation:
                 await self._mount.remove_transcript_widget(group)
                 return None
+            # The text above settles and folds only now, with nothing awaited before the group's first call shows
+            # it: a layout during the mount would show the text folded and the waiting row gone, with nothing in
+            # their place, for a frame.
+            if self._finalize_agent_message is not None:
+                self._finalize_agent_message()
             self._current_tool_group = group
             return group
 
@@ -378,8 +390,9 @@ class ToolGroupRegistry:
         *,
         provider_status: str = "",
         metadata: dict[str, Any] | None = None,
+        stopped_at: float | None = None,
     ) -> None:
-        """Apply a canonical hosted lifecycle transition."""
+        """Apply a canonical hosted lifecycle transition; one that ends the call ends it at *stopped_at*."""
         group = self._tool_groups_by_call_id.get(call_id)
         if group is not None:
             group.update_tool_status(
@@ -387,6 +400,7 @@ class ToolGroupRegistry:
                 status,
                 provider_status=provider_status,
                 metadata=metadata,
+                stopped_at=stopped_at,
             )
             self._ui.schedule_anchor_sync()
 
@@ -483,43 +497,13 @@ class ToolGroupRegistry:
         """Resolve a widget after invocation-start established its route."""
         return self._sub_agent_widgets.get(invocation_id)
 
-    def add_sub_agent_message(
-        self,
-        agent_name: str,
-        invocation_id: str,
-        text: str,
-        *,
-        presentation: ProvisionalPresentation | None = None,
-    ) -> None:
-        """Route intermediate assistant prose to one sub-agent transcript."""
+    def add_sub_agent_answer(self, agent_name: str, invocation_id: str, segment_id: str, text: str) -> None:
+        """Route one whole answer segment to one sub-agent transcript."""
         widget = self._resolve_sub_agent(invocation_id)
         if widget is not None:
-            activity = widget.add_assistant_message(text, presentation=presentation, profile_name=agent_name)
+            activity = widget.add_answer(segment_id, text, profile_name=agent_name)
             group = self._sub_agent_owning_group(widget)
-            if group is not None:
-                group.update_sub_agent_activity(widget.call_id, activity)
-
-    def accept_sub_agent_presentation(
-        self,
-        invocation_id: str,
-        attempt_id: str,
-        segment_ids: tuple[str, ...],
-    ) -> None:
-        """Commit provisional transcript messages for one sub-agent attempt."""
-        widget = self._sub_agent_widgets.get(invocation_id)
-        if widget is not None:
-            activity = widget.accept_presentation_attempt(attempt_id, segment_ids)
-            group = self._sub_agent_owning_group(widget)
-            if group is not None:
-                group.update_sub_agent_activity(widget.call_id, activity)
-
-    def reject_sub_agent_presentation(self, invocation_id: str, attempt_id: str) -> None:
-        """Retract provisional transcript messages for one sub-agent attempt."""
-        widget = self._sub_agent_widgets.get(invocation_id)
-        if widget is not None:
-            activity = widget.reject_presentation_attempt(attempt_id)
-            group = self._sub_agent_owning_group(widget)
-            if group is not None:
+            if activity is not None and group is not None:
                 group.update_sub_agent_activity(widget.call_id, activity)
 
     async def add_sub_agent_tool_start(
@@ -541,7 +525,7 @@ class ToolGroupRegistry:
         """Route an inner tool call start to the correct SubAgentToolCall widget."""
         widget = self._resolve_sub_agent(invocation_id)
         if widget is not None:
-            await widget.add_inner_tool_start(
+            changed = await widget.add_inner_tool_start(
                 call_id,
                 tool_name,
                 args,
@@ -554,7 +538,7 @@ class ToolGroupRegistry:
                 provider_call_id=provider_call_id,
             )
             group = self._sub_agent_owning_group(widget)
-            if group is not None:
+            if changed and group is not None:
                 group.update_nested_tool_activity(
                     widget.call_id,
                     call_id,
@@ -730,6 +714,14 @@ class ToolGroupRegistry:
         if widget is not None:
             widget.set_paused(reason, last_error, retry_attempts, diagnostic_path, last_error_display)
             self._set_sub_agent_action_required(widget, required=True)
+
+    def sub_agent_answer_withdrawn(self, invocation_id: str, segment_ids: tuple[str, ...]) -> None:
+        """Withdraw the answer a sub-agent's retry dropped from its transcript and its latest activity."""
+        widget = self._sub_agent_widgets.get(invocation_id)
+        if widget is not None and widget.withdraw_answer(segment_ids):
+            group = self._sub_agent_owning_group(widget)
+            if group is not None:
+                group.update_sub_agent_activity(widget.call_id, None)
 
     def sub_agent_resumed_after_pause(self, invocation_id: str) -> None:
         """Dispatch a resume-after-pause transition to the correct card."""

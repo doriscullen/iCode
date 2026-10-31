@@ -25,7 +25,6 @@ from textual.widgets.option_list import Option
 
 from chrys.app.tui.binding_display import CANCEL_BINDING, localized_binding
 from chrys.app.tui.i18n import render_str
-from chrys.app.tui.screens.agents.panels.config_card import CollapsibleConfigCard
 from chrys.app.tui.screens.agents.panels.mcp import format_mcp_command_line
 from chrys.app.tui.screens.agents.validation_messages import (
     DESCRIPTION,
@@ -41,6 +40,7 @@ from chrys.app.tui.screens.agents.validation_messages import (
 from chrys.app.tui.screens.dialogs.base import BaseDialog
 from chrys.app.tui.util.removal import remove_children_shielded
 from chrys.app.tui.widgets import Checkbox, DialogButtonRow, DialogButtonSpec, HatchedEmptyState
+from chrys.app.tui.widgets.config_card import CollapsibleConfigCard
 from chrys.foundation.branding import APP_DISPLAY_NAME
 from chrys.foundation.i18n import MessageRef, msg
 from chrys.foundation.i18n.formatting import format_message, sanitize_legacy_block, sanitize_legacy_scalar

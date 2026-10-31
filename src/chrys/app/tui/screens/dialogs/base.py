@@ -13,6 +13,7 @@ from textual.screen import ModalScreen
 from chrys.app.tui.behaviors.click_outside_dismiss import ClickOutsideDismissMixin
 from chrys.app.tui.behaviors.insert_clipboard import INSERT_CLIPBOARD_BINDINGS, InsertClipboardScreenMixin
 from chrys.app.tui.behaviors.right_click_copy import RightClickScreenCopyMixin
+from chrys.app.tui.util.liveness import composed_live
 
 DialogResultT = TypeVar("DialogResultT")
 
@@ -49,6 +50,11 @@ class BaseDialog(
     @property
     def dismiss_requested(self) -> bool:
         return self._deferred_dismiss is not None or self._chrys_dismiss_await_complete is not None
+
+    @property
+    def _composed_live(self) -> bool:
+        """See :func:`composed_live`."""
+        return composed_live(self)
 
     def dismiss_when_topmost(self, result: object | None = None) -> None:
         """Retain completion while covered or mounting; never pop a screen belonging to another operation."""

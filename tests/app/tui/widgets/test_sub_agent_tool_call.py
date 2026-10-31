@@ -47,6 +47,7 @@ from tests.support.tui_helpers import (
     click_copy_button,
     header_zone_click,
     mount_sub_agent_detail,
+    title_text,
     wait_for_sub_agent_inner_tool,
 )
 from tests.support.waiting import wait_for
@@ -74,7 +75,7 @@ async def test_sub_agent_renders_task_prompt_as_markdown_in_dedicated_panel() ->
         assert header.copy_action_visible is False
         assert header._actions_text().plain.strip() == "View details"
         latest = tc.query_one("#sa-activity-text", Static)
-        assert latest.render().plain == "Running Explore"
+        assert title_text(latest) == "Running Explore"
 
         await tc.add_inner_tool_start("inner1", "read_file", {"path": "README.md"})
         await pilot.pause()
@@ -279,6 +280,63 @@ async def test_sub_agent_resume_after_pause_resets_attempt_local_inner_call_trac
         assert tool._inner_tools["inner-0"].status == "running"
         # Spend counters stay cumulative across attempts.
         assert tool._total_inner_calls == 3
+
+
+async def test_sub_agent_retry_drops_the_answer_its_failed_attempt_showed() -> None:
+    async with LocalizedWidgetApp(
+        lambda: SubAgentToolCall("c1", "Explore", args={"prompt": "delegate"})
+    ).run_test() as pilot:
+        tool = pilot.app.query_one(SubAgentToolCall)
+        tool.add_answer("segment-1", "Looking first.")
+        await tool.add_inner_tool_start("inner-0", "read_file", {})
+        tool.complete_inner_tool("inner-0", "done", 5)
+        tool.add_answer("segment-2", "The result is")
+        surface = await mount_sub_agent_detail(tool, pilot)
+
+        def answers(view: AgentTranscriptSurface) -> list[str]:
+            return [message.text for message in view.query(AgentMessage)]
+
+        await wait_for(lambda: answers(surface) == ["Looking first.", "The result is"], pilot=pilot)
+
+        tool.set_paused("stream_error", "connection closed", 0)
+        tool.set_resumed_after_pause()
+        # The retried attempt asks again for the answer it withdraws: that goes, the tool work stays.
+        tool.withdraw_answer(("segment-2",))
+        await wait_for(lambda: answers(surface) == ["Looking first."] and not surface._pending, pilot=pilot)
+        assert len(surface.query(ToolGroup)) == 1
+        tool.add_answer("segment-3", "The result is 42.")
+        await wait_for(lambda: answers(surface) == ["Looking first.", "The result is 42."], pilot=pilot)
+
+        reopened = await mount_sub_agent_detail(tool, pilot)
+        await wait_for(lambda: answers(reopened) == ["Looking first.", "The result is 42."], pilot=pilot)
+
+
+async def test_sub_agent_answer_a_failure_stopped_is_final_while_paused() -> None:
+    """While paused, the answer the failed attempt showed is final in live and reopened detail views."""
+    async with LocalizedWidgetApp(
+        lambda: SubAgentToolCall("c1", "Explore", args={"prompt": "delegate"})
+    ).run_test() as pilot:
+        tool = pilot.app.query_one(SubAgentToolCall)
+        tool.add_answer("segment-1", "I'll write the file now.")
+        surface = await mount_sub_agent_detail(tool, pilot)
+
+        def states(view: AgentTranscriptSurface) -> list[tuple[str, bool, bool]]:
+            return [
+                (message.text, message._is_final, message.has_class("--streaming"))
+                for message in view.query(AgentMessage)
+            ]
+
+        await wait_for(lambda: states(surface) == [("I'll write the file now.", False, True)], pilot=pilot)
+
+        tool.set_paused("stream_error", "connection closed", 0)
+        await wait_for(lambda: states(surface) == [("I'll write the file now.", True, False)], pilot=pilot)
+        reopened = await mount_sub_agent_detail(tool, pilot)
+        await wait_for(lambda: states(reopened) == [("I'll write the file now.", True, False)], pilot=pilot)
+
+        # Retry still asks again for the answer the failed attempt showed.
+        tool.set_resumed_after_pause()
+        tool.withdraw_answer(("segment-1",))
+        await wait_for(lambda: not states(surface) and not states(reopened), pilot=pilot)
 
 
 async def test_sub_agent_acp_transport_pause_shows_ui_only_diagnostic_banner() -> None:
@@ -589,7 +647,7 @@ async def test_sub_agent_omits_task_panel_when_prompt_is_empty() -> None:
 
         assert not list(tc.query("#sa-task-panel"))
         assert not list(tc.query(AgentTranscriptSurface))
-        assert tc.query_one("#sa-activity-text", Static).render().plain == "Running Explore"
+        assert title_text(tc.query_one("#sa-activity-text", Static)) == "Running Explore"
 
 
 async def test_sub_agent_copy_uses_prompt_input(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,7 +12,7 @@ engine coverage lives in ``test_retry_integration.py``.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -27,12 +27,13 @@ from chrys.foundation.events.types import AgentRuntimeDetails, RuntimeModelDetai
 from chrys.foundation.models.history_markers import HistoryMarkerKind
 from chrys.foundation.models.turns import UserMessageKind
 from chrys.foundation.models.workspace import Workspace
-from chrys.kernel import Message
+from chrys.foundation.text.images import LoadedImage
+from chrys.kernel import Content, Message
 from chrys.orchestration.engine.state.machine import EngineState, EngineStateMachine, Trigger
 from chrys.orchestration.engine.trajectory import TrajectoryRecorder
 from chrys.service.agent_middleware.system_reminder import SystemReminderMiddleware
 from chrys.service.mutations.workspace_changes import WorkspaceChangeTracker
-from chrys.service.session.history import SessionHistoryManager
+from chrys.service.session.history import OversizedImage, SessionHistoryManager
 from tests.support.components import make_current, make_turn_state
 from tests.support.loaded_agents import SkillRefreshLoader, install_loaded_agent, make_manifest
 from tests.support.reminder_inputs import manifest_entry
@@ -122,6 +123,7 @@ class _Executor:
         self.run_failed = False
         self.was_interrupted = False
         self.last_error = None
+        self.partial_answer = ()
         self.service_session_id = ""
         self.running = False
         self.on_resume = None
@@ -144,7 +146,7 @@ class _Executor:
         self.reset_counter_calls.append(reset_batch_id)
 
     @asynccontextmanager
-    async def retry_request(self, additional_text: str = "", created_at: object = None):
+    async def retry_request(self, additional_text: str = "", created_at: object = None, *, withdraw: object = None):
         yield additional_text
 
     def record_outcome(self, outcome):
@@ -206,6 +208,12 @@ class _History:
     def tag_last_user_message(self, key: str, value: str) -> None:
         self.tags.append((key, value))
 
+    def images_over(self, max_bytes: int) -> list[OversizedImage]:
+        return self._input_history.images_over(max_bytes)
+
+    def shrink_images(self, shrunk: Sequence[tuple[OversizedImage, LoadedImage]]) -> int:
+        return self._input_history.shrink_images(shrunk)
+
     def merge_loop_messages(self, _loop_recorder: object, *, insert_index: int | None = None) -> None:
         return None
 
@@ -215,7 +223,7 @@ class _History:
     def trim_to_last_complete_tool_results(self) -> None:
         return None
 
-    def remove_trailing_agent_text(self) -> None:
+    def keep_partial_answer(self, _contents: Sequence[Content]) -> None:
         return None
 
     def persist_batch_ids(self, _batch_records: list[object]) -> dict[int, object]:
@@ -239,7 +247,7 @@ class _History:
     def remove_all_status_markers(self) -> None:
         return None
 
-    def insert_turn_marker(self) -> None:
+    def insert_turn_marker(self, started_at: object = None) -> None:
         return None
 
     def remove_trailing_markers(self) -> None:

@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypedDict, Unpack
 
 import pytest
 from textual.widget import Widget
@@ -19,7 +20,6 @@ from chrys.app.tui.widgets.chat.replay import HistoryReplayRenderer
 from chrys.app.tui.widgets.chat.toc_model import TurnTocModel
 from chrys.app.tui.widgets.chat.tool_call import ToolGroup
 from chrys.app.tui.widgets.chat.tool_registry import ToolGroupRegistry
-from chrys.foundation.events.types import ProvisionalPresentation
 from chrys.foundation.models.ask_user import AskUserOption, AskUserQuestion
 from chrys.foundation.models.history_markers import HistoryMarkerKind
 from chrys.kernel import (
@@ -43,7 +43,9 @@ class _FakeMount:
         self.widgets.append(widget)
         return True
 
-    async def mount_transcript_widgets(self, widgets: list[Widget]) -> None:
+    async def mount_transcript_widgets(
+        self, widgets: list[Widget], *, process_failures_after: tuple[Widget, ...] = ()
+    ) -> None:
         self.calls.append(f"mount_batch:{len(widgets)}")
         self.widgets.extend(widgets)
 
@@ -130,8 +132,16 @@ class _FakeQuery:
         return list(self.children)
 
 
+class _ToolGroupOptions(TypedDict, total=False):
+    """The keywords the registry builds a ``ToolGroup`` with."""
+
+    tool_widget_configurator: Callable[[Widget], None] | None
+    workspace_cwd: Callable[[], str] | None
+
+
 class _FakeToolGroup:
-    def __init__(self) -> None:
+    def __init__(self, **options: Unpack[_ToolGroupOptions]) -> None:
+        self.options = options
         self.added: list[tuple[str, str, str]] = []
         self.completed: list[str] = []
         self.progress: list[str] = []
@@ -155,6 +165,7 @@ class _FakeToolGroup:
         args_summary: str = "",
         *,
         args: dict[str, Any] | None = None,
+        started_at: float | None = None,
     ) -> None:
         self.added.append((call_id, tool_name, tool_kind))
 
@@ -206,7 +217,7 @@ class _FakeToolGroup:
         self.locked.clear()
         self.collapse_locked = False
 
-    def cancel_running(self) -> None:
+    def cancel_running(self, *, stopped_at: float | None = None) -> None:
         self.completed.append("cancel")
         self._cancelled = True
 
@@ -229,8 +240,9 @@ class _FakeSubAgentWidget:
         provider_item_type: str = "",
         provider_status: str = "",
         provider_call_id: str = "",
-    ) -> None:
+    ) -> bool:
         self.events.append(("start", call_id, tool_name, args, tool_kind))
+        return True
 
     def complete_inner_tool(
         self,
@@ -503,8 +515,9 @@ async def test_tool_registry_uses_status_cleanup_before_mount_and_preserves_rout
     registry.update_tool_progress("a", ["line"])
     registry.update_tool_args("a", {"cmd": "echo"})
 
-    assert calls[:3] == ["remove_status", "finalize_agent", "mount:_FakeToolGroup"]
-    assert calls[4:7] == ["remove_status", "finalize_agent", "mount:_FakeToolGroup"]
+    # The text above folds once the group is mounted: its first call shows it before anything else lays out.
+    assert calls[:3] == ["remove_status", "mount:_FakeToolGroup", "finalize_agent"]
+    assert calls[4:7] == ["remove_status", "mount:_FakeToolGroup", "finalize_agent"]
     # Result, progress, and args all route to the OWNING group: sending the
     # result to the newer current group would silently drop it, leaving the
     # call rendered as running forever.
@@ -529,6 +542,7 @@ async def test_tool_registry_end_group_during_add_keeps_stable_routing(monkeypat
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             entered_add.set()
             await asyncio.wait_for(release_add.wait(), timeout=5)
@@ -568,8 +582,8 @@ async def test_tool_registry_delayed_start_does_not_clobber_reused_call_id(
     instances: list[_FakeToolGroup] = []
 
     class _FirstAddBlocksToolGroup(_FakeToolGroup):
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, **options: Unpack[_ToolGroupOptions]) -> None:
+            super().__init__(**options)
             instances.append(self)
             self._blocks = len(instances) == 1
 
@@ -581,6 +595,7 @@ async def test_tool_registry_delayed_start_does_not_clobber_reused_call_id(
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             if self._blocks:
                 entered_add.set()
@@ -622,8 +637,8 @@ async def test_tool_registry_delayed_start_supersedes_older_reused_call_id_owner
     instances: list[_FakeToolGroup] = []
 
     class _SecondAddBlocksToolGroup(_FakeToolGroup):
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, **options: Unpack[_ToolGroupOptions]) -> None:
+            super().__init__(**options)
             instances.append(self)
             self._blocks = len(instances) == 2
 
@@ -635,6 +650,7 @@ async def test_tool_registry_delayed_start_supersedes_older_reused_call_id_owner
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             if self._blocks:
                 entered_add.set()
@@ -677,8 +693,8 @@ async def test_tool_registry_result_racing_replacement_start_routes_to_new_card(
     instances: list[_FakeToolGroup] = []
 
     class _SecondAddBlocksToolGroup(_FakeToolGroup):
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, **options: Unpack[_ToolGroupOptions]) -> None:
+            super().__init__(**options)
             instances.append(self)
             self._blocks = len(instances) == 2
 
@@ -690,6 +706,7 @@ async def test_tool_registry_result_racing_replacement_start_routes_to_new_card(
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             if self._blocks:
                 entered_add.set()
@@ -737,6 +754,7 @@ async def test_tool_registry_delayed_start_does_not_resurrect_cleared_routing(
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             entered_add.set()
             await asyncio.wait_for(release_add.wait(), timeout=5)
@@ -781,6 +799,7 @@ async def test_tool_registry_delayed_sub_agent_start_does_not_requeue_after_end_
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             entered_add.set()
             await asyncio.wait_for(release_add.wait(), timeout=5)
@@ -821,6 +840,7 @@ async def test_invocation_link_fallback_uses_internal_tool_name_queue(
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             await super().add_tool(call_id, tool_name, tool_kind, args_summary, args=args)
             self._tools[call_id] = SubAgentToolCall(call_id, tool_name, args=args)
@@ -843,7 +863,7 @@ async def test_invocation_link_fallback_uses_internal_tool_name_queue(
         "Explore_invocation.json",
         tool_name="explore_agent",
     )
-    registry.add_sub_agent_message("Explore Agent", "invocation", "Still routed.")
+    registry.add_sub_agent_answer("Explore Agent", "invocation", "segment", "Still routed.")
     await registry.add_sub_agent_tool_start(
         "Explore Agent",
         "invocation",
@@ -1025,8 +1045,8 @@ async def test_tool_registry_concurrent_start_waits_for_group_mount(
             return mounted
 
     class _MountAwareToolGroup(_FakeToolGroup):
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, **options: Unpack[_ToolGroupOptions]) -> None:
+            super().__init__(**options)
             self.mount_completed = False
 
         async def add_tool(
@@ -1037,6 +1057,7 @@ async def test_tool_registry_concurrent_start_waits_for_group_mount(
             args_summary: str = "",
             *,
             args: dict[str, Any] | None = None,
+            started_at: float | None = None,
         ) -> None:
             assert self.mount_completed, "add_tool touched a group before its mount finished"
             await super().add_tool(call_id, tool_name, tool_kind, args_summary, args=args)
@@ -1176,7 +1197,7 @@ async def test_live_renderer_uses_status_port_for_failed_turn_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_renderer_processed_empty_intermediate_is_noop() -> None:
+async def test_live_renderer_whitespace_only_answer_segment_is_noop() -> None:
     calls: list[str] = []
     status = _FakeStatus(calls)
     registry = ToolGroupRegistry(_FakeMount(calls), _FakeUi(calls), status)
@@ -1191,9 +1212,10 @@ async def test_live_renderer_processed_empty_intermediate_is_noop() -> None:
         registry,
     )
 
-    await renderer.add_agent_message("<think>   </think>", is_intermediate=True)
+    await renderer.add_answer_delta("blank", "   \n")
+    renderer.finish_answer_segment("blank", completed=True)
 
-    assert calls == ["remove_status"]
+    assert calls == []
     assert registry.current_tool_group is group
 
 
@@ -1212,8 +1234,8 @@ async def test_live_renderer_derives_checkmark_for_successful_structured_only_ou
     )
     renderer.profile_name = "Code Agent"
 
-    await renderer.add_agent_message("", is_final=True, structured_output_completed=True)
-    await renderer.add_agent_message("", is_final=True)
+    await renderer.add_agent_message("", structured_output_completed=True)
+    await renderer.add_agent_message("")
 
     messages = [widget for widget in mount.widgets if isinstance(widget, AgentMessage)]
     assert len(messages) == 1
@@ -1235,7 +1257,7 @@ async def test_live_renderer_normalizes_whitespace_structured_completion_to_chec
         ToolGroupRegistry(_FakeMount(calls), _FakeUi(calls), status),
     )
 
-    await renderer.add_agent_message(" \n\t", is_final=True, structured_output_completed=True)
+    await renderer.add_agent_message(" \n\t", structured_output_completed=True)
 
     messages = [widget for widget in mount.widgets if isinstance(widget, AgentMessage)]
     assert len(messages) == 1
@@ -1244,7 +1266,7 @@ async def test_live_renderer_normalizes_whitespace_structured_completion_to_chec
 
 
 @pytest.mark.asyncio
-async def test_live_renderer_commits_matching_provisional_messages_and_retracts_the_rest() -> None:
+async def test_live_renderer_streams_each_segment_into_its_own_message_and_never_repeats_the_final() -> None:
     calls: list[str] = []
     status = _FakeStatus(calls)
     mount = _FakeMount(calls)
@@ -1257,29 +1279,21 @@ async def test_live_renderer_commits_matching_provisional_messages_and_retracts_
         ToolGroupRegistry(_FakeMount(calls), _FakeUi(calls), status),
     )
 
-    await renderer.add_agent_message(
-        "accepted",
-        is_intermediate=True,
-        presentation=ProvisionalPresentation("attempt-1", "segment-1"),
-    )
-    await renderer.add_agent_message(
-        "discarded sibling",
-        is_intermediate=True,
-        presentation=ProvisionalPresentation("attempt-1", "segment-2"),
-    )
-    await renderer.add_agent_message(
-        "rejected attempt",
-        is_intermediate=True,
-        presentation=ProvisionalPresentation("attempt-2", "segment-3"),
-    )
+    await renderer.add_answer_delta("partial", "Half an ")
+    await renderer.add_answer_delta("partial", "answer")
+    # A failed segment keeps its text; nothing is retracted.
+    renderer.finish_answer_segment("partial", completed=False)
+    await renderer.add_answer_delta("answer", "\n\nThe ")
+    await renderer.add_answer_delta("answer", "answer.")
+    renderer.finish_answer_segment("answer", completed=True)
+    await renderer.add_agent_message("The answer.")
 
-    await renderer.accept_presentation_attempt("attempt-1", ("segment-1",))
-    assert len(mount.widgets) == 2
-    assert calls.count("remove:AgentMessage") == 1
-
-    await renderer.reject_presentation_attempt("attempt-2")
-    assert len(mount.widgets) == 1
-    assert calls.count("remove:AgentMessage") == 2
+    messages = [widget for widget in mount.widgets if isinstance(widget, AgentMessage)]
+    assert [(message.text, message._is_final) for message in messages] == [
+        ("Half an answer", True),
+        ("The answer.", True),
+    ]
+    assert "remove:AgentMessage" not in calls
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,11 @@ widget, but avoids mounting one widget per block.
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
+import threading
+import time
+import traceback
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine, Sequence
@@ -60,13 +65,18 @@ from chrys.app.tui.widgets.markdown.parser import (
     _create_markdown_parser,
     _parse_tokens,
     _wrap_cell_text,
+    highlight_code,
 )
 from chrys.app.tui.widgets.markdown.stream import MarkdownStream
 from chrys.foundation.i18n import msg
 
+logger = logging.getLogger(__name__)
+
 _DIAGRAM_OPEN = msg("tui.markdown.diagram.open", fallback="Open full diagram")
 _INLINE_DIAGRAM_MAX_HEIGHT = 24
 _DIAGRAM_COMPILE_CACHE_SIZE = 24
+_PARSE_STALL_REPORT_SECONDS = 15.0
+"""A parse still running this long logs every thread's stack once, and how long it took when it ends."""
 
 
 def _strip_plain_text(strip: Strip) -> str:
@@ -192,6 +202,61 @@ class _DiagramLayout:
     @property
     def total_height(self) -> int:
         return self.preview_height + 1
+
+
+class _ParseWatch:
+    """Leaves evidence of a parse that runs long: no parse of a streamed answer takes seconds.
+
+    While one parse runs, every later update joins the parse after it, so a parse that never
+    ends freezes the document; what its thread is doing is all that can explain why.
+    """
+
+    __slots__ = ("finished", "reported", "started_at", "thread_id")
+
+    def __init__(self) -> None:
+        self.started_at = time.monotonic()
+        self.thread_id: int | None = None
+        """The executor thread running the parse; None while the parse still waits for one."""
+        self.finished = False
+        """Set by that thread: a busy loop can run the report after the parse ended."""
+        self.reported = False
+
+    def run(self, build: Callable[[str], list[MarkdownBlock]], markdown: str) -> list[MarkdownBlock]:
+        self.thread_id = threading.get_ident()
+        try:
+            return build(markdown)
+        finally:
+            self.finished = True
+
+    def report(self) -> None:
+        if self.finished:
+            return
+        self.reported = True
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        if self.thread_id is None:
+            where = "has not started: no executor thread took it"
+        else:
+            where = f"is running on thread {names.get(self.thread_id, self.thread_id)}"
+        stacks = [
+            f"--- {names.get(ident, ident)}{' (the parse)' if ident == self.thread_id else ''}\n"
+            + "".join(traceback.format_stack(frame))
+            for ident, frame in sys._current_frames().items()
+        ]
+        logger.warning(
+            "Markdown parse %s after %.0fs; every thread's stack:\n%s",
+            where,
+            time.monotonic() - self.started_at,
+            "\n".join(stacks),
+        )
+
+    def ended(self) -> None:
+        if self.reported:
+            # Quitting cancels the wait for a parse that never ends.
+            logger.warning(
+                "Markdown parse %s after %.1fs",
+                "ended" if self.finished else "was given up unfinished",
+                time.monotonic() - self.started_at,
+            )
 
 
 class _PendingParse:
@@ -419,12 +484,16 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
         super().__init__(name=name, id=id, classes=classes)
         self._initial_markdown: str | None = markdown
         self._markdown = ""
+        self._source_requested = False
+        """``update()`` or ``append()`` set the source: newer than the text the widget was built with."""
         self._parser_factory = parser_factory
         self._table_of_contents: TableOfContentsType | None = None
         self._open_links = open_links
         self._last_parsed_line = 0
         self._pending_parse: _PendingParse | None = None
         """The scheduled parse that has not read ``_markdown`` yet; new requests join it."""
+        self._shown_source = ""
+        """The source the installed blocks were parsed from."""
 
         # Virtualization state
         self._blocks: list[MarkdownBlock] = []
@@ -454,6 +523,8 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
         self._diagram_compile_cache: OrderedDict[tuple[str, str], CompiledDiagram] = OrderedDict()
         """Small per-widget cache reused across streaming Markdown reparses."""
         self._math_compile_cache: OrderedDict[str, CompiledMath] = OrderedDict()
+        self._fence_highlights: dict[tuple[str, str], Content] = {}
+        """The last parse's highlighted closed fences by language and code, for a streamed reparse to reuse."""
         self._math_rows: dict[int, tuple[str, ...]] = {}
         self._block_strips: dict[int, list[Strip]] = {}
         """Cached strips for long non-table/fence blocks, keyed by block index.
@@ -525,10 +596,16 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
         """The markdown source."""
         return self._markdown or ""
 
+    @property
+    def shown_source(self) -> str:
+        """The source of the document installed so far: ``source`` once its parse has landed."""
+        return self._shown_source
+
     async def _on_mount(self, _: Mount) -> None:  # ty: ignore[invalid-method-override]  # Textual dispatch awaits async handlers.
         initial_markdown = self._initial_markdown
         self._initial_markdown = None
-        await self.update(initial_markdown or "")
+        # An update before mount is newer than the text it was built with: installing that text would hide it.
+        await self.update(self._markdown if self._source_requested else initial_markdown or "")
 
         if initial_markdown is None:
             self.post_message(
@@ -696,13 +773,30 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
             else _configure_markdown_parser(self._parser_factory())
         )
         tokens = parser.parse(markdown)
-        return _parse_tokens(
+        previous = self._fence_highlights
+        highlights: dict[tuple[str, str], Content] = {}
+
+        def highlight_closed_fence(code: str, language: str) -> Content:
+            # A streamed reparse leaves closed fences unchanged. A fence is kept
+            # under the Content's own text, so the map holds no second copy of
+            # the code, and only when that text is the code itself.
+            highlighted = previous.get((language, code))
+            if highlighted is None:
+                highlighted = highlight_code(code, language)
+            if highlighted.plain == code:
+                highlights[language, highlighted.plain] = highlighted
+            return highlighted
+
+        blocks = _parse_tokens(
             tokens,
             compile_diagram=self._compile_mermaid_cached,
             open_links=self._open_links,
             math_enabled=bool(parser.options.get(MATH_ENABLED, False)),
             math_compiler=self._compile_math_cached,
+            highlight_closed_fence=highlight_closed_fence,
         )
+        self._fence_highlights = highlights
+        return blocks
 
     def _compile_math_cached(self, source: str) -> CompiledMath:
         """Bound both successful and failed compilations across streamed reparses."""
@@ -1704,7 +1798,9 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
             An optionally awaitable object that resolves once the document with
             this fragment, or newer, is installed.
         """
-        self._markdown = self.source + markdown
+        # Before mount, and before any update, the document is the text it was built with.
+        base = self.source if self._source_requested else self._initial_markdown or ""
+        self._markdown = base + markdown
         return self._request_parse(announce_contents=False)
 
     def _request_parse(self, *, announce_contents: bool) -> AwaitComplete:
@@ -1716,6 +1812,7 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
         what one of them alone would have.
         """
         self._table_of_contents = None
+        self._source_requested = True
         pending = self._pending_parse
         # A pending task is done here only when it was cancelled before it read
         # the source (loop shutdown); it can no longer parse, so it is not joinable.
@@ -1723,18 +1820,8 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
             pending.announce_contents = pending.announce_contents or announce_contents
             return AwaitComplete(asyncio.shield(pending.task))
 
-        # Drop the old document's render caches once per parse; installing the
-        # new blocks clears them again.
-        self._line_cache.clear()
-        self._table_layouts.clear()
-        self._table_strips.clear()
-        self._fence_layouts.clear()
-        self._fence_line_strips.clear()
-        self._fence_source_line_strips.clear()
-        self._block_strips.clear()
-        self._block_style_cache.clear()
-        self._plain_selection_cache = None
-        self._lines_cache_result = None
+        # The render caches stay until the new blocks are installed: the old
+        # blocks still paint meanwhile, and a table without its layout paints blank.
         pending = _PendingParse(self._run_parse, announce_contents=announce_contents)
         self._pending_parse = pending
         return AwaitComplete(asyncio.shield(pending.task))
@@ -1747,8 +1834,16 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
             if self._pending_parse is request:
                 self._pending_parse = None
             markdown = self._markdown
-            blocks = await asyncio.get_running_loop().run_in_executor(None, self._build_blocks, markdown)
+            loop = asyncio.get_running_loop()
+            watch = _ParseWatch()
+            report = loop.call_later(_PARSE_STALL_REPORT_SECONDS, watch.report)
+            try:
+                blocks = await loop.run_in_executor(None, watch.run, self._build_blocks, markdown)
+            finally:
+                report.cancel()
+                watch.ended()
             self._install_blocks(blocks)
+            self._shown_source = markdown
 
             lines = markdown.splitlines()
             self._last_parsed_line = len(lines) - (1 if lines and lines[-1] else 0)
@@ -1793,6 +1888,14 @@ class VirtualizedMarkdown(ScrollView, can_focus=True):
         self._width_at_last_layout = 0
         self._total_lines = 0
         self._block_line_info.clear()
+        self._line_cache.clear()
+        self._table_layouts.clear()
+        self._table_strips.clear()
+        self._fence_layouts.clear()
+        self._fence_line_strips.clear()
+        self._fence_source_line_strips.clear()
+        self._block_strips.clear()
+        self._block_style_cache.clear()
         self._diagram_action_lines.clear()
         self._diagram_action_widths.clear()
         self._plain_selection_cache = None

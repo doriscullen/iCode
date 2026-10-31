@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
 
 from rich.text import Text
 from textual.content import Content
@@ -17,30 +19,95 @@ from chrys.app.tui.screens.main.buddy_command import BuddyCommandController
 from chrys.app.tui.screens.main.commands import MainSlashCommandRegistry, SlashCommandActionPort
 from chrys.app.tui.screens.main.model_indicator import is_model_selection_locked
 from chrys.app.tui.screens.main.ports import BuddyCommandView, StartWorker, SuggestionPopupView
-from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState
+from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState, running_model
 from chrys.app.tui.support.gc_freeze import GcFreezeBlockReason
+from chrys.app.tui.support.prompt_history import DEFAULT_MAX_ENTRIES as _PROMPT_HISTORY_SEARCH_LIMIT
+from chrys.app.tui.support.prompt_search import (
+    LINE_BREAK,
+    LINE_SEPARATOR_RE,
+    PromptMatch,
+    PromptSearchIndex,
+    PromptSearchResult,
+)
 from chrys.app.tui.widgets.chrome.commands import (
     SlashCommandDef,
+    completion_token_start,
     is_slash_command_candidate,
+    parse_slash_draft,
 )
+from chrys.app.tui.widgets.chrome.input_bar import ChatDraft
+from chrys.app.tui.widgets.chrome.prompt_draft import ShortcutIntent
 from chrys.app.tui.widgets.chrome.suggestion_list import SuggestionItem
 from chrys.foundation.i18n import MessageRef, msg
-from chrys.foundation.i18n.formatting import format_message
+from chrys.foundation.i18n.formatting import format_message, sanitize_legacy_scalar, sanitize_terminal_block
 from chrys.foundation.platform import safe_getcwd
 from chrys.service.profiles.models.schema import is_model_profile_selectable
+from chrys.service.prompt_shortcuts import (
+    PromptShortcut,
+    expand_template,
+    load_prompt_shortcuts,
+    prompt_shortcut_folders,
+    prompt_shortcut_sources,
+)
 
 _FILE_QUERY_DEBOUNCE_SECONDS = 0.04
 _FILE_QUERY_LIMIT = 30
-_PROMPT_HISTORY_LIMIT = 100
-_PROMPT_HISTORY_LINE_BREAK = " ↵ "
+# The list shows the best this many prompts; search covers every stored prompt.
+_PROMPT_HISTORY_DISPLAY_LIMIT = 100
+# A row shows one line and the highlighted row scrolls it, so a label longer than
+# this only costs layout and marquee work on every keystroke; selection still
+# inserts the whole prompt.
+_PROMPT_HISTORY_LABEL_MAX_CHARS = 300
+# Preview width used before the list has been laid out.
+_PROMPT_HISTORY_FALLBACK_CELLS = 80
+# The index outlives the list for an instant reopen only while the prompts hold
+# at most this many characters; it keeps about three copies of their text.
+_PROMPT_HISTORY_CACHE_MAX_CHARS = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class TypedName:
+    """What a typed ``/name arguments`` names (:meth:`SuggestionHandler.resolve_typed_name`).
+
+    ``none``: not a ``/name``, or no command, skill or shortcut by that name.
+    ``pending``: the shortcuts are still being read and the name is no
+    command or skill, so it may yet be a shortcut.
+    """
+
+    kind: Literal["none", "command", "skill", "shortcut", "pending"]
+    shortcut: PromptShortcut | None = None
+    arguments: str = ""
+
 
 _SUGGESTIONS_FILES_TITLE = msg("tui.suggestions.files_title", fallback="Files under {root}")
 _SUGGESTIONS_COMMANDS_TITLE = msg("tui.suggestions.commands_title", fallback="Commands")
 _SUGGESTIONS_AGENTS_TITLE = msg("tui.suggestions.agents_title", fallback="Agents")
 _SUGGESTIONS_MODELS_TITLE = msg("tui.suggestions.models_title", fallback="Models")
 _SUGGESTIONS_PROMPT_HISTORY_TITLE = msg("tui.suggestions.prompt_history_title", fallback="Prompt History")
+_SUGGESTIONS_PROMPT_HISTORY_TITLE_MATCHES = msg(
+    "tui.suggestions.prompt_history_title_matches",
+    fallback="Prompt History · {count} match",
+    plural_fallback="Prompt History · {count} matches",
+)
+_SUGGESTIONS_PROMPT_HISTORY_TITLE_SHOWN_MATCHES = msg(
+    "tui.suggestions.prompt_history_title_shown_matches",
+    fallback="Prompt History · {shown} of {count} match",
+    plural_fallback="Prompt History · {shown} of {count} matches",
+)
+_SUGGESTIONS_PROMPT_HISTORY_EMPTY = msg("tui.suggestions.prompt_history_empty", fallback="No prompt history yet.")
+_SUGGESTIONS_PROMPT_HISTORY_DISABLED = msg(
+    "tui.suggestions.prompt_history_disabled",
+    fallback="Prompt history is off. Turn on Save prompt history in settings and restart to use it.",
+)
+_SUGGESTIONS_PROMPT_HISTORY_NO_MATCH = msg(
+    "tui.suggestions.prompt_history_no_match",
+    fallback="No matching prompts. Try changing or clearing the input.",
+)
 _SUGGESTIONS_SYSTEM_COMMANDS = msg("tui.suggestions.system_commands", fallback="System Commands")
 _SUGGESTIONS_LOADED_SKILLS = msg("tui.suggestions.loaded_skills", fallback="Loaded Skills")
+_SUGGESTIONS_PROMPT_SHORTCUTS = msg("tui.suggestions.prompt_shortcuts", fallback="Prompt Shortcuts")
+_PROMPT_HINT_ARGUMENT = msg("tui.prompt_shortcuts.hint.argument", fallback="argument {position}")
+_PROMPT_HINT_ARGUMENTS = msg("tui.prompt_shortcuts.hint.arguments", fallback="arguments")
 _SUGGESTIONS_SHADOWED = msg("tui.suggestions.shadowed", fallback="shadowed by /{name}")
 _SUGGESTIONS_BOUNDED_INDEX = msg(
     "tui.suggestions.bounded_index",
@@ -56,13 +123,28 @@ _COMMAND_UNAVAILABLE_RUNNING = msg(
     fallback="/{name} is not available while agent is running",
 )
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from textual.worker import Worker
 
     from chrys.app.tui.i18n import LocaleController
     from chrys.app.tui.widgets.chrome.file_index import ProjectPathIndex
     from chrys.app.tui.widgets.chrome.file_scanner import ProjectPathScanResult, ProjectPathSuggestion
     from chrys.foundation.events.types import RuntimeSkillDetails
+
+
+def _newest_unique(history: Sequence[str]) -> list[str]:
+    """Return *history* (oldest first) newest first, keeping only the newest copy of each prompt."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for prompt in reversed(history):
+        if prompt not in seen:
+            seen.add(prompt)
+            unique.append(prompt)
+    return unique
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +156,13 @@ class SuggestionCallbacks:
     submit_user_text: Callable[[str], object]
     start_agent_profile_switch: Callable[[str], object]
     start_model_profile_switch: Callable[[str], object]
+
+
+def _prompt_row_value(shortcut: PromptShortcut) -> str:
+    """A shortcut row's value, as typed (``/name``): unique among rows, which a file's path is not
+    (a file under two listed folders loads under two names) and a bare name is not (it may be a
+    command's or skill's too)."""
+    return f"/{shortcut.name}"
 
 
 class SuggestionHandler:
@@ -112,9 +201,31 @@ class SuggestionHandler:
         self._file_warmup_requested_root: str | None = None
         self._file_warmup_worker: Worker[None] | None = None
         self._prompt_history_revision = 0
-        self._prompt_history_draft = ""
+        self._prompt_history_index: PromptSearchIndex | None = None
+        self._prompt_history_query_revision = 0
+        self._prompt_history_pending: tuple[str, int] | None = None
+        self._prompt_history_query_worker: Worker[None] | None = None
+        self._prompt_history_enabled = True
+        # Whether this opening's load finished: a cached index can lack a prompt just submitted.
+        self._prompt_history_loaded = False
+        # The query and index whose rows are shown; showing them again keeps the selected row.
+        self._prompt_history_shown: tuple[str, PromptSearchIndex] | None = None
+        # Survives closing the list so reopening it re-normalizes only new prompts;
+        # None when the history is too large to keep in memory.
+        self._prompt_history_index_cache: PromptSearchIndex | None = None
+        # Up/Down and Enter/Tab pressed while a newer query is still ranking or
+        # the history still loading, in order; replayed once both are done.
+        self._prompt_history_deferred_keys: list[tuple[str, str]] = []
         self._slash_commands: list[SlashCommandDef] = []
         self._active_command: SlashCommandDef | None = None
+        # Read off the event loop, refreshed whenever ``/`` opens the list; only
+        # ever used for the folders it was read from (``_shortcuts``).
+        self._prompt_shortcuts: list[PromptShortcut] = []
+        self._prompt_shortcuts_folders: dict[str, Any] | None = None
+        """The folders and switches ``_prompt_shortcuts`` was read under; None before the first read."""
+        self._prompt_shortcuts_loading: dict[str, Any] | None = None
+        """The folders and switches the read in flight is reading under; None when none is out."""
+        self._prompt_shortcuts_generation = 0
         self._buddy_command = BuddyCommandController(
             buddy_view,
             render_message=self._render_message,
@@ -240,56 +351,305 @@ class SuggestionHandler:
         self._suggestion_mode = None
 
     def _invalidate_prompt_history_results(self) -> None:
-        """Invalidate an in-flight prompt-history load."""
+        """Invalidate an in-flight prompt-history load or query and drop loaded entries."""
         self._prompt_history_revision += 1
+        self._prompt_history_index = None
+        self._prompt_history_query_revision += 1
+        self._prompt_history_pending = None
+        self._prompt_history_deferred_keys = []
+        self._prompt_history_loaded = False
+        self._prompt_history_shown = None
 
     @staticmethod
-    def _prompt_history_label(text: str) -> str:
-        """Render a multi-line prompt as one visible suggestion row."""
-        return _PROMPT_HISTORY_LINE_BREAK.join(text.splitlines())
+    def _prompt_history_label(match: PromptMatch) -> tuple[str, tuple[tuple[int, int], ...]]:
+        """Render the preview windows of a ranked prompt as one row and locate its matches in it.
+
+        Line breaks show as ``↵`` (a trailing one is dropped, as ``splitlines``
+        does), control characters are replaced, and an ellipsis marks text cut
+        before, between or after the windows. The last window runs on to its
+        tail, past the row's edge, so a highlighted row scrolls on from the
+        match. The spans are ranges of the returned label.
+        """
+        prompt = match.prompt
+        parts: list[str] = []
+        spans: list[tuple[int, int]] = []
+        length = 0
+
+        def add(text: str, *, matched: bool = False) -> None:
+            nonlocal length
+            if matched:
+                spans.append((length, length + len(text)))
+            parts.append(text)
+            length += len(text)
+
+        def add_text(low: int, high: int) -> None:
+            position = low
+            for span_low, span_high in match.spans:
+                span_low, span_high = max(span_low, position), min(span_high, high)
+                if span_low >= span_high:
+                    continue
+                if span_low > position:
+                    add(sanitize_legacy_scalar(prompt[position:span_low]))
+                add(sanitize_legacy_scalar(prompt[span_low:span_high]), matched=True)
+                position = span_high
+            if position < high:
+                add(sanitize_legacy_scalar(prompt[position:high]))
+
+        previous_end = 0
+        windows = [*match.windows[:-1], (match.windows[-1][0], match.tail_end)]
+        for start, end in windows:
+            if start > previous_end or (start > 0 and not parts):
+                add("…")
+            position = start
+            for separator in LINE_SEPARATOR_RE.finditer(prompt, start, end):
+                add_text(position, separator.start())
+                position = separator.end()
+                # The LF of a CRLF whose CR fell before the window was already shown with it.
+                if position < len(prompt) and prompt[separator.start() - 1 : separator.end()] != "\r\n":
+                    add(LINE_BREAK)
+            add_text(position, end)
+            previous_end = end
+        if previous_end < len(prompt):
+            add("…")
+        return "".join(parts), tuple(spans)
+
+    def _enqueue_prompt_history_query(self, query: str) -> None:
+        """Record *query* as the latest history search and make sure a query loop will run it.
+
+        Ranking scans every loaded entry and entries have no length limit, so it
+        runs off the event loop; keystrokes that arrive meanwhile coalesce into
+        the newest pending query, and results for any older query are dropped.
+        """
+        self._prompt_history_query_revision += 1
+        self._prompt_history_pending = (query, self._prompt_history_query_revision)
+        if self._prompt_history_index is None or self._prompt_history_query_active():
+            return
+        self._prompt_history_query_worker = self._view.run_suggestion_worker(
+            self._run_prompt_history_query_loop(),
+            name="prompt-history-query",
+            group="prompt-history",
+        )
+
+    def _prompt_history_query_active(self) -> bool:
+        """Return whether a history query loop is running; at most one ever is."""
+        worker = self._prompt_history_query_worker
+        return worker is not None and not worker.is_finished
+
+    async def _run_prompt_history_query_loop(self) -> None:
+        """Rank the newest pending history query in a thread until none is pending.
+
+        Closing the list or a newer query makes the search in its thread stop
+        at the next prompt, and the loop goes on to whatever is pending then,
+        including the query of a list reopened meanwhile.
+        """
+        while self._prompt_history_pending is not None:
+            query, revision = self._prompt_history_pending
+            self._prompt_history_pending = None
+            index = self._prompt_history_index
+            if index is None:
+                return
+            result = await asyncio.to_thread(
+                index.search,
+                query,
+                limit=_PROMPT_HISTORY_DISPLAY_LIMIT,
+                cells=self._view.suggestion_row_cells() or _PROMPT_HISTORY_FALLBACK_CELLS,
+                head_chars=_PROMPT_HISTORY_LABEL_MAX_CHARS,
+                # Read from the search thread; the int read needs no lock.
+                should_stop=lambda revision=revision: revision != self._prompt_history_query_revision,
+            )
+            if self._prompt_history_result_current(revision, index):
+                items = await asyncio.to_thread(self._prompt_history_items, result.matches)
+                if not self._prompt_history_result_current(revision, index):
+                    continue
+                self._show_prompt_history_matches(index, items, result, query=query)
+                if self._prompt_history_pending is None and self._prompt_history_loaded:
+                    self._replay_deferred_prompt_history_keys()
+
+    def _prompt_history_result_current(self, revision: int, index: PromptSearchIndex) -> bool:
+        """Return whether a result for *revision* on *index* may still update the open history list."""
+        return (
+            revision == self._prompt_history_query_revision
+            and index is self._prompt_history_index
+            and self._view.is_attached
+            and self._suggestion_mode == "history"
+        )
+
+    @classmethod
+    def _prompt_history_items(cls, matches: list[PromptMatch]) -> list[SuggestionItem]:
+        """Build the rows for ranked *matches*; runs in a thread, off the event loop."""
+        items: list[SuggestionItem] = []
+        for match in matches:
+            label, spans = cls._prompt_history_label(match)
+            items.append(
+                SuggestionItem(value=match.prompt, label=label, kind="history", marquee_start=0, match_spans=spans)
+            )
+        return items
+
+    def _prompt_history_title(self, result: PromptSearchResult, *, shown: int, filtered: bool) -> str:
+        """Name the list, and while a query filters it, how many prompts matched."""
+        if not filtered or result.total == 0:
+            return self._suggestion_title("history")
+        if result.total > shown:
+            return self._render_message(
+                _SUGGESTIONS_PROMPT_HISTORY_TITLE_SHOWN_MATCHES.bind(count=result.total, shown=str(shown))
+            )
+        return self._render_message(_SUGGESTIONS_PROMPT_HISTORY_TITLE_MATCHES.bind(count=result.total))
+
+    def _show_prompt_history_matches(
+        self, index: PromptSearchIndex, items: list[SuggestionItem], result: PromptSearchResult, *, query: str
+    ) -> None:
+        """Show ranked rows from *index*, saying why when there are none.
+
+        Rows refit to a new width keep the selected prompt and scroll position,
+        so a held Enter picks what the user saw; a new query or newly loaded
+        prompts start again from the best match.
+        """
+        shown = self._prompt_history_shown
+        refit = shown is not None and shown[0] == query and shown[1] is index
+        self._prompt_history_shown = (query, index)
+        if not self._prompt_history_enabled:
+            empty = _SUGGESTIONS_PROMPT_HISTORY_DISABLED
+        elif len(index):
+            empty = _SUGGESTIONS_PROMPT_HISTORY_NO_MATCH
+        else:
+            empty = _SUGGESTIONS_PROMPT_HISTORY_EMPTY
+        self._view.update_suggestions(
+            items,
+            title=self._prompt_history_title(result, shown=len(items), filtered=bool(query.split())),
+            empty_text=self._render_message(empty.bind()),
+            keep_selection=refit,
+        )
+
+    def _defer_prompt_history_key(self, action: str, argument: str) -> bool:
+        """Hold a list key until the newest history results are shown; return whether it was held.
+
+        Results arrive after the keystroke that asked for them, and the first
+        ones after the history loads, so moving or selecting at once would act
+        on rows of an older query or on none at all. Rows from a cached index
+        wait for the load too, since it can lack a prompt submitted just now.
+        """
+        if self._suggestion_mode != "history":
+            return False
+        loading = self._prompt_history_index is None or not self._prompt_history_loaded
+        if not loading and self._prompt_history_pending is None and not self._prompt_history_query_active():
+            return False
+        self._prompt_history_deferred_keys.append((action, argument))
+        return True
+
+    def _replay_deferred_prompt_history_keys(self) -> None:
+        """Apply held Up/Down and Enter/Tab, in order, to the rows just shown."""
+        keys, self._prompt_history_deferred_keys = self._prompt_history_deferred_keys, []
+        for action, argument in keys:
+            if action == "move":
+                self._view.move_suggestion_cursor(argument)
+            else:
+                # Selecting closes the list, so nothing held after it applies.
+                self._view.select_highlighted_suggestion(execute=argument == "execute")
+                return
 
     def start_prompt_history(self) -> int:
-        """Open prompt-history loading synchronously and return its request revision."""
+        """Open prompt history synchronously and return its load revision.
+
+        With prompts indexed by an earlier opening, those are searched at once
+        while the load checks for new ones, so reopening shows no loading state.
+        """
         self._invalidate_prompt_history_results()
         revision = self._prompt_history_revision
-        self._prompt_history_draft = self._view.input_value()
         self._show_suggestions_loading("history")
+        cached = self._prompt_history_index_cache
+        if cached is not None:
+            self._prompt_history_index = cached
+            self._enqueue_prompt_history_query(self._view.input_value())
         return revision
 
     async def show_prompt_history_async(self, *, revision: int | None = None) -> None:
-        """Load and show the newest global prompt-history entries first."""
+        """Load the newest global prompt-history entries and show those matching the input text."""
         if revision is None:
             revision = self.start_prompt_history()
         elif revision != self._prompt_history_revision or self._suggestion_mode != "history":
             return
-        history = await self._view.load_prompt_history(max_entries=_PROMPT_HISTORY_LIMIT)
+        history = await self._view.load_prompt_history(max_entries=_PROMPT_HISTORY_SEARCH_LIMIT)
         if (
             revision != self._prompt_history_revision
             or not self._view.is_attached
             or self._suggestion_mode != "history"
         ):
             return
-        items = [
-            SuggestionItem(
-                value=prompt,
-                label=self._prompt_history_label(prompt),
-                kind="history",
-                marquee_start=0,
-            )
-            for prompt in reversed(history)
-        ]
-        self._view.update_suggestions(items, title=self._suggestion_title("history"))
+        self._prompt_history_enabled = self._view.prompt_history_enabled()
+        prompts = _newest_unique(history)
+        index = await asyncio.to_thread(partial(PromptSearchIndex, prompts, previous=self._prompt_history_index_cache))
+        if (
+            revision != self._prompt_history_revision
+            or not self._view.is_attached
+            or self._suggestion_mode != "history"
+        ):
+            return
+        self._prompt_history_loaded = True
+        shown = self._prompt_history_index
+        if shown is not None and index.same_prompts(shown):
+            # Nothing changed: keep the index being searched, whose results must still be shown.
+            if self._prompt_history_pending is None and not self._prompt_history_query_active():
+                self._replay_deferred_prompt_history_keys()
+            return
+        self._prompt_history_index = index
+        small = sum(len(prompt) for prompt in prompts) <= _PROMPT_HISTORY_CACHE_MAX_CHARS
+        self._prompt_history_index_cache = index if small else None
+        # Typing during the load was recorded only as input text; search what is there now.
+        self._enqueue_prompt_history_query(self._view.input_value())
 
     # -------------------------------------------------------------- #
     # Trigger handlers (called by thin @on forwarders in MainScreen)
     # -------------------------------------------------------------- #
 
     def on_slash_triggered(self) -> None:
-        """Show slash command suggestions."""
-        disabled = self._disabled_commands()
-        items = self._command_suggestion_items(self._visible_slash_commands(), disabled)
+        """Show slash command suggestions, then reread prompt shortcuts in the background."""
+        self._show_suggestions("commands", self._all_command_items(), disabled=self._disabled_commands())
+        # A burst of keys can reach the text area before this trigger is handled.
+        # Filter the current draft even when its Changed messages preceded the popup.
+        text = self._view.input_value()
+        if text not in ("/", "\uff0f"):
+            self.on_text_changed(text)
+        self.refresh_prompt_shortcuts()
+
+    def on_slash_query_changed(self, text: str) -> None:
+        """Reopen the command list for a ``/name`` draft when the list would stay open for it.
+
+        Uses the same test that keeps an open list open, so a path or comment
+        (``/Users/me``) never makes the list flash open and shut per keystroke.
+        """
+        if self._suggestion_mode is not None or self._view.suggestions_active:
+            return
+        if (
+            text not in ("/", "\uff0f")
+            and not is_slash_command_candidate(text)
+            and not self._names_prompt_shortcut(text)
+        ):
+            return
+        # Opening filters by the live draft.
+        self.on_slash_triggered()
+
+    def _exact_command_value(self, query: str) -> str | None:
+        """The row a fully typed name would run: the one :meth:`resolve_typed_name` names.
+
+        The groups are listed in another order, so without this the first
+        row, possibly a same-named shortcut, would be the one Enter picks.
+        """
+        if not query:
+            return None
+        typed = self.resolve_typed_name(f"/{query}")
+        if typed.kind == "command":
+            command = self._command_for_token(query)
+            return command.name if command is not None else None
+        if typed.kind == "skill":
+            return query
+        return _prompt_row_value(typed.shortcut) if typed.shortcut is not None else None
+
+    def _all_command_items(self) -> list[SuggestionItem]:
+        """Every row the bare ``/`` list shows: system commands, prompt shortcuts, then skills."""
+        items = self._command_suggestion_items(self._visible_slash_commands(), self._disabled_commands())
+        items.extend(self._prompt_shortcut_suggestion_items(self._known_shortcuts()))
         items.extend(self._runtime_skill_suggestion_items())
-        self._show_suggestions("commands", items, disabled=disabled)
+        return items
 
     def _command_suggestion_items(
         self,
@@ -358,6 +718,184 @@ class SuggestionHandler:
             if cmd.name == token or token in cmd.aliases:
                 return cmd
         return None
+
+    # -------------------------------------------------------------- #
+    # Prompt shortcuts
+    # -------------------------------------------------------------- #
+
+    def refresh_prompt_shortcuts(self) -> None:
+        """Reread prompt shortcut files off the event loop for the current workspace; the newest read wins."""
+        if not self._view.is_attached:
+            return
+        folders = self._prompt_shortcut_folders()
+        if folders == self._prompt_shortcuts_loading:
+            # A read under these folders is already out; it is fresh enough.
+            return
+        self._prompt_shortcuts_generation += 1
+        self._prompt_shortcuts_loading = folders
+        self._view.run_suggestion_worker(
+            self._load_prompt_shortcuts(
+                self._prompt_shortcuts_generation, folders, partial(load_prompt_shortcuts, **folders)
+            ),
+            name="prompt-shortcuts",
+            group="prompt-shortcuts",
+        )
+
+    def _shortcuts(self) -> list[PromptShortcut] | None:
+        """The shortcuts read for the current workspace; None while they are still being read.
+
+        A list read for another workspace is never shown or expanded: its
+        files may not apply here. A workspace change starts a new read; a
+        refresh for the same workspace keeps the list meanwhile. None ("not known yet") is not "none there":
+        a typed ``/name`` that may be a shortcut waits for it
+        (:meth:`resolve_typed_name`).
+        """
+        folders = self._prompt_shortcut_folders()
+        if folders == self._prompt_shortcuts_folders:
+            return self._prompt_shortcuts
+        if folders != self._prompt_shortcuts_loading:
+            self.refresh_prompt_shortcuts()
+        return None
+
+    def _known_shortcuts(self) -> list[PromptShortcut]:
+        """The shortcuts to show or match now: none while they are still being read."""
+        return self._shortcuts() or []
+
+    def resolve_typed_name(self, text: str) -> TypedName:
+        """What a typed ``/name arguments`` names: the one answer every way of sending or expanding acts on.
+
+        A typed name resolves to the first of: system command (or alias),
+        loaded skill, prompt shortcut (names compared case-insensitively, as
+        the loader dedupes them). Skills come before shortcuts because a skill
+        row only fills in ``/name`` and is resolved by name when sent; a
+        shortcut row expands its own file when chosen and never needs this.
+        While the shortcuts for the folders in force are still being read, a
+        name that is no command or skill is ``pending``: acted on now, a
+        shortcut would go to the model as plain text, unexpanded.
+        """
+        slash = parse_slash_draft(text.strip())
+        if slash is None or not slash.name:
+            return TypedName("none")
+        name, arguments = slash.name, slash.arguments
+        if self._command_for_token(name) is not None:
+            return TypedName("command")
+        if any(skill.name == name for skill in self._state.runtime.details.skill_details):
+            return TypedName("skill")
+        shortcuts = self._shortcuts()
+        if shortcuts is None:
+            return TypedName("pending")
+        key = name.casefold()
+        shortcut = next((c for c in shortcuts if c.name.casefold() == key), None)
+        return TypedName("none") if shortcut is None else TypedName("shortcut", shortcut, arguments)
+
+    def prompt_shortcut_sources_loader(self) -> Callable[[], list[tuple[Path, list[PromptShortcut]]]]:
+        """A blocking read of the shortcuts by source folder for the current workspace, as the / list reads them."""
+        return partial(prompt_shortcut_sources, **self._prompt_shortcut_folders())
+
+    def _prompt_shortcut_folders(self) -> dict[str, Any]:
+        """Where the loader reads shortcuts from for the current workspace."""
+        return prompt_shortcut_folders(self._current_file_root())
+
+    async def _load_prompt_shortcuts(
+        self, generation: int, folders: dict[str, Any], load: Callable[[], list[PromptShortcut]]
+    ) -> None:
+        try:
+            commands = await asyncio.to_thread(load)
+        except asyncio.CancelledError:
+            # A read that never lands is not one out: the next ask for these folders starts another.
+            if generation == self._prompt_shortcuts_generation:
+                self._prompt_shortcuts_loading = None
+            raise
+        except Exception:
+            # A worker error would exit the App; a broken shortcut directory must not.
+            logger.exception("Prompt shortcuts: loading failed")
+            # Read, and none found: a /name waiting on this read must not wait forever.
+            commands = []
+        if generation != self._prompt_shortcuts_generation:
+            return
+        self._prompt_shortcuts_loading = None
+        unchanged = folders == self._prompt_shortcuts_folders and commands == self._prompt_shortcuts
+        self._prompt_shortcuts = commands
+        self._prompt_shortcuts_folders = folders
+        if unchanged or not self._view.is_attached:
+            # Nothing to show, or no screen to show it on: a read can land
+            # while the screen is being torn down, its widgets already gone.
+            return
+        if self._suggestion_mode == "commands" and self._view.suggestions_active:
+            self.on_text_changed(self._view.input_value(), keep_selection=True)
+
+    def _prompt_shortcut_suggestion_items(self, commands: Sequence[PromptShortcut]) -> list[SuggestionItem]:
+        """Build prompt-shortcut rows.
+
+        A row expands its own file when chosen, whatever a system command or
+        skill of the same name does, so no row is ever disabled.
+        """
+        return [
+            SuggestionItem(
+                value=_prompt_row_value(command),
+                label=self._prompt_shortcut_label(command),
+                section=self._render_message(_SUGGESTIONS_PROMPT_SHORTCUTS.bind()),
+                kind="prompt",
+                marquee_start=len(f"/{command.name}  ") if command.description else None,
+            )
+            for command in commands
+        ]
+
+    @staticmethod
+    def _prompt_shortcut_label(command: PromptShortcut) -> Content:
+        """Build a literal-text label from user-authored shortcut metadata."""
+        label = Text.assemble(f"/{sanitize_legacy_scalar(command.name)}")
+        description = sanitize_legacy_scalar(command.description).strip()
+        if description:
+            # Second separator space styled dim — see _command_suggestion_items.
+            label.append(" ")
+            label.append(Text(" " + description, style="dim"))
+        return Content.from_rich_text(label)
+
+    def _prompt_shortcuts_matching(self, query: str) -> list[PromptShortcut]:
+        """Return shortcuts whose name matches *query*, best first; the loader keeps one per name."""
+        from chrys.app.tui.widgets.chrome.file_scanner import fuzzy_filter
+
+        by_name = {command.name: command for command in self._known_shortcuts()}
+        names = fuzzy_filter(query, list(by_name), max_results=20) if query else list(by_name)
+        return [by_name[name] for name in names]
+
+    def _names_prompt_shortcut(self, text: str) -> bool:
+        """Whether *text* is ``/`` plus part of a shortcut name a slash command could not be (``/git/x``, ``/周报``).
+
+        Paths and comments (``/Users/me``, ``// note``) match no shortcut, so the list still closes for them.
+        """
+        slash = parse_slash_draft(text)
+        return (
+            slash is not None and slash.bare and bool(slash.name) and bool(self._prompt_shortcuts_matching(slash.name))
+        )
+
+    def _prompt_shortcut_for_value(self, value: str) -> PromptShortcut | None:
+        """Return the shortcut a row stands for (:func:`_prompt_row_value`)."""
+        return next((c for c in self._known_shortcuts() if _prompt_row_value(c) == value), None)
+
+    def _expand_prompt_shortcut(self, command: PromptShortcut, arguments: str) -> None:
+        # The file's text reaches the terminal through the input bar: no escape or control codes, tabs kept.
+        expansion = expand_template(
+            sanitize_terminal_block(command.template),
+            arguments,
+            default_hint=self._default_prompt_hint,
+        )
+        owner = ShortcutIntent(command.name, command.agent, command.model, path=command.path)
+        self._view.expand_prompt_in_input(ChatDraft(expansion.text, tuple(expansion.fields), owner))
+
+    def _default_prompt_hint(self, position: int | None) -> str:
+        if position is None:
+            return self._render_message(_PROMPT_HINT_ARGUMENTS.bind())
+        return self._render_message(_PROMPT_HINT_ARGUMENT.bind(position=position))
+
+    def expand_typed_name(self, typed: TypedName) -> bool:
+        """Expand *typed* into the draft when it names a prompt shortcut; returns whether it expanded."""
+        if typed.shortcut is None:
+            return False
+        self.dismiss_suggestions()
+        self._expand_prompt_shortcut(typed.shortcut, typed.arguments)
+        return True
 
     def on_file_triggered(self) -> None:
         """Show file search suggestions."""
@@ -437,10 +975,8 @@ class SuggestionHandler:
         )
 
     def _current_model_profile_id(self) -> str:
-        """Return the best-known current model-profile id for suggestion styling."""
-        if self._state.runtime.details_confirmed:
-            return self._state.runtime.details.model.profile_id
-        return self._services.active_model_profile_id
+        """Return the model the session runs, for suggestion styling."""
+        return running_model(self._state, self._services)
 
     def _get_model_items(self) -> tuple[list[SuggestionItem], set[str]]:
         """Build suggestion items and disabled set from selectable model profiles."""
@@ -509,7 +1045,7 @@ class SuggestionHandler:
         self._file_warmup_requested_root = root
         worker = self._file_warmup_worker
         if worker is None or worker.is_finished:
-            worker = self._view.run_file_suggestion_worker(
+            worker = self._view.run_suggestion_worker(
                 self._run_file_warmup_loop(),
                 name="file-suggestion-warmup",
                 group="file-suggestions",
@@ -665,7 +1201,7 @@ class SuggestionHandler:
             return
         self._file_query_pending = (query, revision)
         if self._file_query_worker is None or self._file_query_worker.is_finished:
-            self._file_query_worker = self._view.run_file_suggestion_worker(
+            self._file_query_worker = self._view.run_suggestion_worker(
                 self._run_file_query_loop(),
                 name="file-suggestion-query",
                 group="file-suggestions",
@@ -736,13 +1272,18 @@ class SuggestionHandler:
     # Filtering as user types
     # -------------------------------------------------------------- #
 
-    def on_text_changed(self, text: str) -> None:
+    def on_text_changed(self, text: str, *, keep_selection: bool = False) -> None:
         """Re-filter suggestion list as user types."""
         if self._suggestion_mode is None:
             return
-
         if self._suggestion_mode == "commands":
-            if text not in ("/", "\uff0f") and not is_slash_command_candidate(text):
+            if text in ("/", "\uff0f"):
+                if keep_selection:
+                    self._view.update_suggestions(
+                        self._all_command_items(), disabled=self._disabled_commands(), keep_selection=True
+                    )
+                    return
+            elif not is_slash_command_candidate(text) and not self._names_prompt_shortcut(text):
                 self.dismiss_suggestions()
                 return
             query = text.lstrip("/\uff0f")
@@ -792,6 +1333,7 @@ class SuggestionHandler:
                     ordered_cmds.append(cmd)
             disabled = self._disabled_commands()
             items = self._command_suggestion_items(ordered_cmds, disabled)
+            items.extend(self._prompt_shortcut_suggestion_items(self._prompt_shortcuts_matching(query)))
             skills = self._state.runtime.details.skill_details
             if query:
                 skill_names = [skill.name for skill in skills]
@@ -805,6 +1347,8 @@ class SuggestionHandler:
                 items,
                 disabled=self._disabled_commands(),
                 title=self._suggestion_title("commands"),
+                keep_selection=keep_selection,
+                initial=self._exact_command_value(query),
             )
 
         elif self._suggestion_mode == "subcommands":
@@ -827,11 +1371,12 @@ class SuggestionHandler:
                 self._view.show_subcommand_suggestions(all_subs, initial=initial)
 
         elif self._suggestion_mode == "files":
-            idx = max(text.rfind("@"), text.rfind("\uff20"))
-            if idx < 0:
+            # The token a pick replaces (``replace_trigger_text``): the same span, so nothing typed is left behind.
+            start = completion_token_start(text, "@")
+            if start is None:
                 self.dismiss_suggestions()
                 return
-            query = text[idx + 1 :]
+            query = text[start + 1 :]
             if query:
                 self._enqueue_file_query(query)
             else:
@@ -860,18 +1405,32 @@ class SuggestionHandler:
             items = [item_by_id[profile_id] for profile_id in matches]
             self._view.update_suggestions(items, disabled=disabled, title=self._suggestion_title("models"))
 
-        elif self._suggestion_mode == "history" and text != self._prompt_history_draft:
-            self.dismiss_suggestions()
+        elif self._suggestion_mode == "history":
+            # The whole input is the search query; entries arriving later read it on load.
+            self._enqueue_prompt_history_query(text)
 
     # -------------------------------------------------------------- #
     # Navigation and selection
     # -------------------------------------------------------------- #
 
+    def on_prompt_history_shortcut_while_open(self) -> None:
+        """Ctrl+R again while history is open moves to the next older match, as in shells."""
+        self.on_suggestion_navigate("down")
+
+    def on_suggestion_row_width_changed(self) -> None:
+        """Re-fit history previews to the new row width."""
+        if self._suggestion_mode == "history" and self._prompt_history_index is not None:
+            self._enqueue_prompt_history_query(self._view.input_value())
+
     def on_suggestion_navigate(self, direction: str) -> None:
+        if self._defer_prompt_history_key("move", direction):
+            return
         self._view.move_suggestion_cursor(direction)
 
     def on_suggestion_select(self, execute: bool) -> bool:
         """Handle Tab/Enter on suggestion list. Returns True if handled."""
+        if self._defer_prompt_history_key("select", "execute" if execute else "insert"):
+            return True
         selected = self._view.select_highlighted_suggestion(execute=execute)
         if not selected and execute:
             mode = self._suggestion_mode
@@ -884,15 +1443,21 @@ class SuggestionHandler:
             if mode == "models" and not self._model_fallback_should_submit(text):
                 return True
             self.dismiss_suggestions()
-            self._view.set_input_value("")
-            if text and (mode in {"agents", "models"} or not self.dispatch_slash_command(text)):
-                self._callbacks.submit_user_text(text)
+            # What Enter does with the list closed, through the one submit path.
+            self._view.submit_input()
             return True
         return bool(selected)
 
     def on_suggestion_selected(self, mode: str, text: str, execute: bool, kind: str = "") -> None:
         """Handle a confirmed suggestion selection."""
         if mode == "commands":
+            if kind == "prompt":
+                # Enter and Tab both expand: a shortcut's text is always shown before it is sent.
+                self.dismiss_suggestions()
+                command = self._prompt_shortcut_for_value(text)
+                if command is not None:
+                    self._expand_prompt_shortcut(command, "")
+                return
             if kind == "skill":
                 self.dismiss_suggestions()
                 if execute:

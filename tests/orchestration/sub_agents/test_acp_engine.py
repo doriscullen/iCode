@@ -13,11 +13,12 @@ from typing import Any
 import pytest
 
 import chrys.orchestration.engine.build.builder as builder_module
-import chrys.orchestration.sub_agents.tools as tools_module
 from chrys.foundation.config.settings import Settings
 from chrys.foundation.events.bus import EventBus
 from chrys.foundation.events.types import (
+    InvocationAnswerWithdrawn,
     InvocationCascadeAborted,
+    InvocationContentDelta,
     InvocationMessage,
     InvocationPaused,
     InvocationProgress,
@@ -46,6 +47,7 @@ from chrys.service.profiles.agents.schema import (
 from chrys.service.profiles.models.registry import ModelProfileRegistry
 from chrys.service.profiles.models.schema import ModelProfile
 from chrys.service.session import sub_agent_logs
+from chrys.service.session.sub_agent_transcript import load_persisted_sub_agent_transcript
 from chrys.service.state.store import JsonFileStateStore
 from tests.support.acp_fixtures import STUB_SCRIPT
 from tests.support.paths import SRC_ROOT
@@ -75,6 +77,8 @@ async def _start_acp_engine(
 
     for event_type in (
         InvocationMessage,
+        InvocationContentDelta,
+        InvocationAnswerWithdrawn,
         InvocationCascadeAborted,
         InvocationStarted,
         InvocationPaused,
@@ -94,8 +98,7 @@ async def _start_acp_engine(
     )
 
     async def create_client(_profile: Any = None, **kwargs: Any) -> MockChatClient:
-        main_client._on_intermediate_text_async = kwargs.get("on_intermediate_text_async")
-        main_client._on_intermediate_text_sync = kwargs.get("on_intermediate_text_sync")
+        main_client._on_intermediate_text = kwargs.get("on_intermediate_text")
         return main_client
 
     monkeypatch.setattr(builder_module, "create_client", create_client)
@@ -110,7 +113,7 @@ async def _start_acp_engine(
             kwargs.setdefault("backoff_schedule", (0, 0, 0, 0, 0))
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(tools_module, "AcpSubAgentPolicy", FastAcpController)
+    monkeypatch.setattr("chrys.orchestration.sub_agents.acp_policy.AcpSubAgentPolicy", FastAcpController)
 
     model_registry = ModelProfileRegistry()
     model_registry.register(
@@ -282,6 +285,11 @@ async def test_acp_retry_from_engine_starts_fresh_attempt_and_discards_partial_r
     await wait_for(lambda: bool(captured.get(InvocationResumed)), description="ACP resume")
     await wait_for(lambda: main_client.call_count == 2, timeout=20, description="parent completion")
     await engine.wait_for_run_task()
+    # The retry's new session asks again for the answer the crashed one showed: the card withdraws it.
+    (discarded,) = {delta.segment_id for delta in captured[InvocationContentDelta] if delta.text == "discarded partial"}
+    (withdrawn,) = captured[InvocationAnswerWithdrawn]
+    assert withdrawn.origin == pause.origin
+    assert withdrawn.segment_ids == (discarded,)
     results = [event for event in captured.get(InvocationToolCallResult, []) if event.tool_name == "Explore"]
     assert results[-1].result == "stub response"
     assert "discarded partial" not in results[-1].result
@@ -293,6 +301,11 @@ async def test_acp_retry_from_engine_starts_fresh_attempt_and_discards_partial_r
         lambda: not list((session_dir / "sub_agents" / "pending").glob("*.json")),
         description="post-save pending cleanup",
     )
+    # The audit records the withdrawal: reopened, the card shows the retried answer once, as it did live.
+    transcript = await load_persisted_sub_agent_transcript(session_dir, audit_paths[0].name)
+    assert transcript is not None
+    texts = [content["text"] for message in transcript.messages for content in message["contents"] if "text" in content]
+    assert texts == ["stub response"]
 
 
 @pytest.mark.asyncio

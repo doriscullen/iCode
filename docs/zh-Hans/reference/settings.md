@@ -39,6 +39,9 @@ llm:
 | `ui.locale` | `CHRYS_LOCALE` | `system` | 字符串；`system` 跟随系统，也可设为 `en` 或 `zh-Hans`。不支持的语言使用英语；不改变模型回复语言 |
 | `ui.editor.keymap` | `CHRYS_EDITOR_KEYMAP` | `standard` | 字符串；`standard`、`emacs`、`vim`，选择输入编辑器的按键模式 |
 | `ui.chat.tool_groups_expanded` | 无 | `false` | 布尔值；新出现的工具组是否默认展开详情 |
+| `ui.chat.show_thinking` | 无 | `false` | 布尔值；TUI 对话中新的可读思考在模型写出时是否在回复上方展开；为 `false` 时只显示一行，滚动显示最新内容。无论开关，模型继续下一步后思考都会折叠。服务只以加密形式返回的思考不会显示 |
+| `ui.chat.fold_finished_turns` | 无 | `true` | 布尔值；成功回复后自动折叠中间执行过程。适用于之后完成的轮次及之后打开的会话，已有过程块保持当前状态。用户消息和最终回复始终可见 |
+| `ui.chat.image_graphics` | 无 | `true` | 布尔值；启动时询问终端类型，并在 Ghostty、kitty、iTerm2 3.7.5 及以上版本、WezTerm、开启了终端图片的 VS Code 和 Windows Terminal 1.22 及以上版本中，用终端自身的图形能力全彩显示对话中的图片；为 `false` 时不询问终端，图片与在其他终端中一样以彩色色块绘制。启动时读取 |
 | `ui.chat.file_snapshot_inline_chars` | `CHRYS_TUI_FILE_SNAPSHOT_INLINE_CHARS` | `131072` | 整数；控制文件编辑卡片直接载入的改动前后内容上限，按两者字节数合计判断。不超过上限时随卡片载入，标题显示具体的增删行数；超过上限且有可用快照引用时，展开差异才读取，标题不显示具体行数。`0` 或负数将上限设为零；没有可用快照引用时仍可能保留内联内容。此设置只控制卡片的内容载入方式；是否备份文件内容由 `mutations.snapshot.max_file_mb` 和 `mutations.snapshot.skip_binary` 决定 |
 | `history.prompt.enabled` | `CHRYS_HISTORY_DISABLE` | `true` | 布尔值；跨会话保存和读取输入历史，关闭不会删除已有记录。环境变量含义相反：只有精确的 `1` 禁用历史，其他值不禁用 |
 | `app.update_check` | `CHRYS_UPDATE_CHECK` | `true` | 布尔值；TUI 每天启动时最多查询一次 iCode 的最新版本，有新版本时在欢迎页显示新版本号和升级 iCode 的命令。查询请求不包含你的任何个人信息或数据。`icode run`、`icode acp` 和 `icode serve` 不会查询 |
@@ -94,6 +97,7 @@ llm:
 | YAML 键 | 环境变量 | 默认值 | 类型、取值与效果 |
 | --- | --- | --- | --- |
 | `tools.search.respect_gitignore` | 无 | `true` | 布尔值；grep 和 glob 搜索时应用 `.gitignore` 规则。设为 `false` 时仍会跳过隐藏路径，`.ignore` 等其他忽略文件也仍然生效 |
+| `tools.image.send_limit_kb` | `CHRYS_IMAGE_SEND_LIMIT_KB` | `256` | 整数，`32` 到 `3072`，超出范围时取最近的边界值；发给模型的一张图片的文件最多占用的 KB 数（在请求中以 base64 发送，约多三分之一）。附加、查看或由 ACP 客户端发送的图片超过它时压缩为不超过它的 JPEG；每轮和每次重试开始时，会话中之前发送的、超过它的图片也会压缩 |
 | `tools.ask_user.inline` | `CHRYS_ASK_USER_INLINE` | `false` | 布尔值；TUI 中将智能体提问显示在对话中，而不是弹出窗口 |
 | `tools.ask_user.timeout_seconds` | `CHRYS_ASK_USER_TIMEOUT_SECONDS` | `900` | 整数或 `null`；等待回答的秒数，超时后向智能体返回超时结果；`0`、负数或用户 YAML 的 `null` 表示无限等待 |
 | `tools.result.ceiling_tokens` | `CHRYS_TOOL_RESULT_CEILING_TOKENS` | `64000` | 整数；单条工具结果交给模型前的最终长度上限，单位 token。`0` 关闭此限制；正数最小 `2000`，负数无效 |
@@ -129,6 +133,8 @@ llm:
 | `tools.web_egress.proxy_dns` | `local` | 字符串；`local` 或 `remote`。设置代理后，`local` 在本机解析主机名，只连接检查过的公网地址；`remote` 把主机名交给代理，由代理决定最终地址。未设置 `proxy_url` 时不起作用。参阅[使用 fake-IP 代理](../guides/configuration/web-tools.md#使用-fake-ip-代理) |
 
 这些值中的主机名可以包含下划线。
+
+例如，使用 DeepSeek Search API 时，需要授权 `https://api.deepseek.com/v1/tools/search`，并在 `credential_env_names` 中列出 `DEEPSEEK_API_KEY`。
 
 ### 上下文与轨迹分析
 

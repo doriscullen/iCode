@@ -6,13 +6,20 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
+from functools import partial
 from typing import Any, Unpack
 from unittest.mock import create_autospec
 
 import pytest
 
 from chrys.foundation.events.bus import EventBus
-from chrys.foundation.events.types import InvocationPaused, InvocationRetryAttempt
+from chrys.foundation.events.types import (
+    InvocationAnswerWithdrawn,
+    InvocationContentDelta,
+    InvocationPaused,
+    InvocationResumed,
+    InvocationRetryAttempt,
+)
 from chrys.foundation.models.history_markers import HistoryMarkerKind
 from chrys.foundation.models.invocations import InvocationOrigin
 from chrys.foundation.retry import StreamRetryLoop
@@ -36,6 +43,8 @@ from chrys.orchestration.sub_agents.shell import SubAgentToolShell
 from chrys.service.llm.mock import MockChatClient
 from tests.orchestration.sub_agents._controller_fixtures import _make_controller, kernel_shell
 from tests.service.trajectory._fakes import FakeSink, make_context
+from tests.support.event_capture import collect_events
+from tests.support.waiting import ENGINE_TURN_TIMEOUT, wait_for
 
 
 def _agent(monkeypatch: pytest.MonkeyPatch, run) -> Agent:
@@ -109,7 +118,8 @@ async def test_child_stall_preserves_final_attempt_and_timeout_payload(monkeypat
         async def updates():
             session.state["chrys_history"]["messages"].append(mutated[len(calls) - 1])
             compaction.value = f"attempt {len(calls)}"
-            yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("partial")])
+            # Progress with nothing readable: a stall that showed no text may be retried.
+            yield AgentResponseUpdate(role="assistant", contents=[])
             await asyncio.Event().wait()
 
         return ResponseStream(updates(), finalizer=AgentResponse.from_updates)
@@ -151,6 +161,63 @@ async def test_child_stall_preserves_final_attempt_and_timeout_payload(monkeypat
     assert compaction.value == "attempt 2"
     assert paused[0].last_error == "Stream stalled after 1 retries: no streaming updates received for 0.01s"
     assert controller.policy._attempt_handle.task is None
+
+
+@pytest.mark.parametrize(
+    ("completed", "shows_answer_text"),
+    [(True, True), (False, True), (True, False)],
+    ids=["shown_segment", "unfinished_segment", "segment_no_frontend_shows"],
+)
+async def test_a_child_stall_is_retried_as_a_whole_run_only_while_no_answer_segment_showed(
+    monkeypatch: pytest.MonkeyPatch, completed: bool, shows_answer_text: bool
+) -> None:
+    """Sub-agent views show an answer segment once it completes; one still streaming, or nowhere shown, never showed."""
+    bus = EventBus()
+    calls: list[list[Message]] = []
+    paused: list[InvocationPaused] = []
+
+    def run(input: list[Message], *, stream: bool, **_kwargs: Unpack[AgentRunKwargs]):
+        assert stream
+        calls.append(input)
+
+        async def updates():
+            yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("partial")])
+            if completed:
+                # Reasoning after it completes the answer segment.
+                yield AgentResponseUpdate(role="assistant", contents=[Content.from_text_reasoning(text="hmm")])
+            await asyncio.Event().wait()
+
+        return ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+
+    controller = _make_controller(
+        _agent(monkeypatch, run),
+        bus,
+        stream=True,
+        max_retries=3,
+        run_kwargs={"options": {"store": True}},
+        shows_answer_text=shows_answer_text,
+    )
+    controller.policy._stream_attempt_timeout = 0.01
+
+    async def abort(event: InvocationPaused) -> None:
+        paused.append(event)
+        controller.request_abort()
+
+    await bus.subscribe(InvocationPaused, abort)
+    try:
+        assert (await controller.run()).startswith("Error:")
+    finally:
+        await bus.unsubscribe(InvocationPaused, abort)
+    if completed and shows_answer_text:
+        # The shown text would be shown again: the stalled pass is not run a second time.
+        assert len(calls) == 1
+        assert paused[0].retry_attempts == 0
+        assert paused[0].last_error == "no streaming updates received for 0.01s"
+    else:
+        # The whole run is retried until its budget runs out.
+        assert len(calls) == 4
+        assert paused[0].retry_attempts == 3
+        assert paused[0].last_error == "Stream stalled after 3 retries: no streaming updates received for 0.01s"
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -331,7 +398,7 @@ async def test_child_reject_backoff_pause_save_event_retry_input_order(
     controller.policy._persist_dir = tmp_path
     original_reject = events.reject_hosted_attempt
     original_save = controller.policy._write_persisted
-    original_prepare = controller.policy._prepare_retry_input
+    original_prepare = controller.policy.prepare_retry
 
     async def reject(message: str) -> None:
         order.append("reject hosted")
@@ -341,9 +408,9 @@ async def test_child_reject_backoff_pause_save_event_retry_input_order(
         original_save()
         order.append("pause-save")
 
-    def prepare() -> None:
+    def prepare() -> tuple[str, ...]:
         order.append("retry input")
-        original_prepare()
+        return original_prepare()
 
     async def sleep(_seconds: int) -> bool:
         entered.set()
@@ -361,9 +428,7 @@ async def test_child_reject_backoff_pause_save_event_retry_input_order(
 
     monkeypatch.setattr(events, "reject_hosted_attempt", create_autospec(original_reject, side_effect=reject))
     monkeypatch.setattr(controller.policy, "_write_persisted", create_autospec(original_save, side_effect=save))
-    monkeypatch.setattr(
-        controller.policy, "_prepare_retry_input", create_autospec(original_prepare, side_effect=prepare)
-    )
+    monkeypatch.setattr(controller.policy, "prepare_retry", create_autospec(original_prepare, side_effect=prepare))
     monkeypatch.setattr(
         controller.policy,
         "_interruptible_sleep",
@@ -396,6 +461,96 @@ async def test_child_reject_backoff_pause_save_event_retry_input_order(
         await asyncio.gather(task, return_exceptions=True)
         await bus.unsubscribe(InvocationRetryAttempt, retry_notice)
         await bus.unsubscribe(InvocationPaused, pause)
+
+
+async def test_a_retry_announces_its_resume_then_withdraws_the_answer_it_dropped_before_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A details view carries the transcript on from the resume, then drops what the retry asks for again."""
+    bus = EventBus()
+    order: list[object] = []
+    calls = 0
+
+    async def run(_input, *, stream: bool, **_kwargs: Unpack[AgentRunKwargs]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("failure")
+        order.append("next pass")
+        return AgentResponse(messages=[Message("assistant", ["done"])])
+
+    controller = _make_controller(_agent(monkeypatch, run), bus, max_retries=0)
+    controller.policy._persist_dir = tmp_path
+    original_prepare = controller.policy.prepare_retry
+
+    def prepare() -> tuple[str, ...]:
+        assert original_prepare() == ()
+        order.append("answer dropped")
+        return ("segment-1",)
+
+    async def pause(_event: InvocationPaused) -> None:
+        controller.request_retry()
+
+    async def resumed(_event: InvocationResumed) -> None:
+        order.append("resumed")
+
+    async def withdrawn(event: InvocationAnswerWithdrawn) -> None:
+        order.append(("withdrawn", event.origin, event.segment_ids))
+
+    monkeypatch.setattr(controller.policy, "prepare_retry", create_autospec(original_prepare, side_effect=prepare))
+    await bus.subscribe(InvocationPaused, pause)
+    await bus.subscribe(InvocationResumed, resumed)
+    await bus.subscribe(InvocationAnswerWithdrawn, withdrawn)
+    try:
+        assert await asyncio.wait_for(controller.run(), ENGINE_TURN_TIMEOUT) == "done"
+    finally:
+        await bus.unsubscribe(InvocationPaused, pause)
+        await bus.unsubscribe(InvocationResumed, resumed)
+        await bus.unsubscribe(InvocationAnswerWithdrawn, withdrawn)
+
+    assert order == ["resumed", "answer dropped", ("withdrawn", controller.origin, ("segment-1",)), "next pass"]
+
+
+async def test_a_retried_child_withdraws_the_segment_its_kept_answer_was_shown_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stamp joins the text the child's view showed to what its Retry drops from history to ask again."""
+    bus = EventBus()
+    session = AgentSession()
+    session.state["chrys_history"] = {"messages": [Message("user", ["do the thing"])]}
+    deltas: list[InvocationContentDelta] = []
+    withdrawals: list[InvocationAnswerWithdrawn] = []
+    calls = 0
+
+    async def failing():
+        yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("Partial answer")])
+        # Reasoning after it completes the segment, so it shows and is kept.
+        yield AgentResponseUpdate(role="assistant", contents=[Content.from_text_reasoning(text="hmm")])
+        raise RuntimeError("response failed")
+
+    async def answering():
+        yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("done")])
+
+    def run(_input: Any, *, stream: bool, **_kwargs: Any) -> ResponseStream:
+        nonlocal calls
+        calls += 1
+        return ResponseStream(failing() if calls == 1 else answering(), finalizer=AgentResponse.from_updates)
+
+    controller = _make_controller(_agent(monkeypatch, run), bus, session=session, stream=True)
+
+    async def retry(_event: InvocationPaused) -> None:
+        controller.request_retry()
+
+    await bus.subscribe(InvocationPaused, retry)
+    await bus.subscribe(InvocationContentDelta, partial(collect_events, deltas))
+    await bus.subscribe(InvocationAnswerWithdrawn, partial(collect_events, withdrawals))
+    assert await asyncio.wait_for(controller.run(), ENGINE_TURN_TIMEOUT) == "done"
+
+    (shown,) = {delta.segment_id for delta in deltas if delta.channel == "answer" and delta.text == "Partial answer"}
+    (withdrawn,) = withdrawals
+    assert (withdrawn.origin, withdrawn.segment_ids) == (controller.origin, (shown,))
+    history = session.state["chrys_history"]["messages"]
+    assert "Partial answer" not in [message.text for message in history]
 
 
 @pytest.mark.parametrize("forced_stateless", [False, True], ids=["stored-client", "forced-stateless"])
@@ -511,7 +666,7 @@ def test_child_retry_seed_replays_the_reminders_its_anchor_was_sent_with(recorde
         anchor.additional_properties[HistoryMarkerKind.SYSTEM_REMINDERS_KEY] = record
     session.state["chrys_history"] = {"messages": [anchor]}
 
-    ctrl.policy._prepare_retry_input()
+    assert ctrl.policy.prepare_retry() == ()
 
     assert session.state["chrys_history"]["messages"] == []
     [seed] = ctrl.policy._next_run_input
@@ -521,3 +676,43 @@ def test_child_retry_seed_replays_the_reminders_its_anchor_was_sent_with(recorde
         assert seed.additional_properties[HistoryMarkerKind.SYSTEM_REMINDERS_KEY] is not record
     else:
         assert HistoryMarkerKind.SYSTEM_REMINDERS_KEY not in seed.additional_properties
+
+
+async def test_a_paused_child_cancelled_later_keeps_its_partial_answer_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pause and the cancel both repair the failed pass; the answer it showed is kept by the first."""
+    bus = EventBus()
+    session = AgentSession()
+    session.state["chrys_history"] = {"messages": [Message("user", ["do the thing"])]}
+    paused = asyncio.Event()
+
+    async def note_pause(_event: InvocationPaused) -> None:
+        paused.set()
+
+    await bus.subscribe(InvocationPaused, note_pause)
+
+    async def updates():
+        yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("Partial answer")])
+        # Reasoning after it completes the segment, so it shows; the one cut off after never does.
+        yield AgentResponseUpdate(role="assistant", contents=[Content.from_text_reasoning(text="hmm")])
+        yield AgentResponseUpdate(role="assistant", contents=[Content.from_text("Cut o")])
+        raise RuntimeError("response failed")
+
+    def stream_then_fail(_input: Any, *, stream: bool, **_kwargs: Any) -> ResponseStream:
+        return ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+
+    controller = _make_controller(_agent(monkeypatch, stream_then_fail), bus, session=session, stream=True)
+
+    def answers() -> list[str]:
+        return [message.text for message in session.state["chrys_history"]["messages"] if message.role == "assistant"]
+
+    task = asyncio.create_task(controller.run())
+    try:
+        await wait_for(lambda: paused.is_set() or task.done(), timeout=ENGINE_TURN_TIMEOUT, description="the pause")
+        assert not task.done()
+        assert answers() == ["Partial answer"]
+        await controller.cascade_abort()
+        await asyncio.gather(task, return_exceptions=True)
+        assert answers() == ["Partial answer"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

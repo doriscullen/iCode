@@ -4,16 +4,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
 from chrys.app.tui import i18n as tui_i18n
 from chrys.app.tui.app import ChrysApp
+from chrys.app.tui.graphics.probe import TerminalReport
 from chrys.app.tui.screens.main.session_handlers import RestoreRequest
 from chrys.app.tui.screens.main.state import MainScreenState, RunState
 from chrys.foundation.config.settings import Settings
@@ -27,9 +31,109 @@ from chrys.orchestration.startup import RuntimeBootstrap
 from tests.support.tui_helpers import main_screen_parts
 
 
-def test_tui_startup_profile_resolves_preferred_agent() -> None:
-    from chrys.app.tui.app import _resolve_startup_profile
+@pytest.mark.parametrize("show_startup_loading", [False, True])
+async def test_main_screen_paints_before_engine_construction(tmp_path: Path, show_startup_loading: bool) -> None:
+    from chrys.app.tui import app as tui_module
     from chrys.service.profiles.agents.registry import AgentProfileRegistry
+    from chrys.service.profiles.agents.schema import AgentProfile
+    from chrys.service.state.store import JsonFileStateStore
+    from tests.support.tui_app_harness import ShutdownOnlyEngine
+    from tests.support.waiting import DEFAULT_WAIT_TIMEOUT, MAIN_SCREEN_BUILD_TIMEOUT, wait_for
+
+    started = asyncio.Event()
+    frames: list[object] = []
+
+    class PaintProbe(ChrysApp):
+        CSS_PATH: ClassVar = [Path(tui_module.__file__).parent / path for path in ChrysApp.CSS_PATH]
+
+        def _display(self, screen, renderable) -> None:
+            super()._display(screen, renderable)
+            frames.append(screen)
+
+        def _build_main_screen(self):
+            if show_startup_loading:
+                assert frames
+                assert frames[0].id == "_default"
+            return super()._build_main_screen()
+
+        async def _start_engine(self, profile, screen) -> None:
+            assert screen in frames
+            started.set()
+
+    registry = AgentProfileRegistry()
+    registry.register(AgentProfile(name="Code"))
+    app = PaintProbe(
+        EventBus(),
+        ShutdownOnlyEngine(),  # type: ignore[arg-type]
+        settings=Settings(),
+        state_store=JsonFileStateStore(tmp_path),
+        agent_registry=registry,
+        gc_freeze_enabled=False,
+        show_startup_loading=show_startup_loading,
+    )
+    async with app.run_test():
+        task = app._startup_task
+        assert task is not None
+        await wait_for(
+            lambda: started.is_set() or task.done(),
+            description="agent construction after the main screen paints",
+            # The loading shell builds the main screen inside this wait; without it, that build ran before the app
+            # was ready.
+            timeout=MAIN_SCREEN_BUILD_TIMEOUT if show_startup_loading else DEFAULT_WAIT_TIMEOUT,
+        )
+        if task.done():
+            await task
+        assert started.is_set()
+        if show_startup_loading:
+            indicator = app._startup_loading_indicator
+            assert indicator is not None
+            assert not indicator._animating
+            timer = indicator._auto_refresh_timer
+            assert timer is not None
+            assert not timer._active.is_set()
+
+
+async def test_cancelled_startup_ignores_late_refresh_callback() -> None:
+    from tests.support.waiting import wait_for
+
+    callback_ready: asyncio.Future[Callable[[], None]] = asyncio.get_running_loop().create_future()
+    starts: list[object] = []
+
+    class RefreshGate:
+        is_running = True
+        _closing = False
+        _exit = False
+        _wait_for_startup_refresh = ChrysApp._wait_for_startup_refresh
+
+        def call_after_refresh(self, callback: Callable[[], None]) -> bool:
+            callback_ready.set_result(callback)
+            return True
+
+        async def _start_engine(self, profile: object, screen: object) -> None:
+            starts.append(profile)
+
+    task = asyncio.create_task(
+        ChrysApp._start_engine_after_refresh(RefreshGate(), object(), object())  # type: ignore[arg-type]
+    )
+    try:
+        await wait_for(lambda: callback_ready.done() or task.done(), description="startup waiting for paint")
+        if task.done():
+            await task
+        assert not task.done()
+        callback = callback_ready.result()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        callback()
+        assert starts == []
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def test_tui_startup_profile_resolves_preferred_agent() -> None:
+    from chrys.service.profiles.agents.registry import AgentProfileRegistry, resolve_launch_profile
     from chrys.service.profiles.agents.schema import AgentProfile
 
     registry = AgentProfileRegistry()
@@ -38,12 +142,11 @@ def test_tui_startup_profile_resolves_preferred_agent() -> None:
     registry.register(code)
     registry.register(qa)
 
-    assert _resolve_startup_profile(registry, "QA") is qa
+    assert resolve_launch_profile(registry, "QA") is qa
 
 
 def test_tui_startup_profile_accepts_id_and_display_name() -> None:
-    from chrys.app.tui.app import _resolve_startup_profile
-    from chrys.service.profiles.agents.registry import AgentProfileRegistry
+    from chrys.service.profiles.agents.registry import AgentProfileRegistry, resolve_launch_profile
     from chrys.service.profiles.agents.schema import AgentProfile
 
     registry = AgentProfileRegistry()
@@ -52,13 +155,12 @@ def test_tui_startup_profile_accepts_id_and_display_name() -> None:
     registry.register(code)
     registry.register(qa)
 
-    assert _resolve_startup_profile(registry, "qa-id") is qa
-    assert _resolve_startup_profile(registry, "quality agent") is qa
+    assert resolve_launch_profile(registry, "qa-id") is qa
+    assert resolve_launch_profile(registry, "quality agent") is qa
 
 
 def test_tui_startup_profile_falls_back_to_code_when_preferred_missing() -> None:
-    from chrys.app.tui.app import _resolve_startup_profile
-    from chrys.service.profiles.agents.registry import AgentProfileRegistry
+    from chrys.service.profiles.agents.registry import AgentProfileRegistry, resolve_launch_profile
     from chrys.service.profiles.agents.schema import AgentProfile
 
     registry = AgentProfileRegistry()
@@ -67,12 +169,11 @@ def test_tui_startup_profile_falls_back_to_code_when_preferred_missing() -> None
     registry.register(qa)
     registry.register(code)
 
-    assert _resolve_startup_profile(registry, "Missing") is code
+    assert resolve_launch_profile(registry, "Missing") is code
 
 
 def test_tui_startup_profile_treats_sub_agent_only_preference_as_unusable() -> None:
-    from chrys.app.tui.app import _resolve_startup_profile
-    from chrys.service.profiles.agents.registry import AgentProfileRegistry
+    from chrys.service.profiles.agents.registry import AgentProfileRegistry, resolve_launch_profile
     from chrys.service.profiles.agents.schema import AgentProfile
 
     registry = AgentProfileRegistry()
@@ -81,7 +182,7 @@ def test_tui_startup_profile_treats_sub_agent_only_preference_as_unusable() -> N
     registry.register(explore)
     registry.register(code)
 
-    assert _resolve_startup_profile(registry, "Explore") is code
+    assert resolve_launch_profile(registry, "Explore") is code
 
 
 def test_terminal_restore_skips_textual_web_driver(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
@@ -164,11 +265,12 @@ def test_main_restores_terminal_when_app_run_raises(
     monkeypatch.setattr(tui_app, "stop_debug_logging", lambda _runtime: calls.append("stop-debug"))
     monkeypatch.setattr(tui_app, "_restore_terminal_after_run", lambda _app: calls.append("restore-terminal"))
     monkeypatch.setattr(tui_app, "_reset_terminal_title_after_run", lambda: calls.append("reset-title"))
+    monkeypatch.setattr(tui_app, "ask_terminal", lambda _env, *, enabled: None)
     monkeypatch.setattr(tui_app, "EventBus", object)
     monkeypatch.setattr(tui_app, "AgentProfileRegistry", _Registry)
     monkeypatch.setattr(tui_app, "ModelProfileRegistry", _Registry)
-    monkeypatch.setattr(tui_app, "JsonFileStateStore", object)
-    monkeypatch.setattr(tui_app, "assemble_agent_engine", _Engine)
+    monkeypatch.setattr("chrys.service.state.store.JsonFileStateStore", object)
+    monkeypatch.setattr("chrys.orchestration.engine.assembly.assemble_agent_engine", _Engine)
 
     with pytest.raises(RuntimeError, match="boom"):
         tui_app.main(app_cls=_App)  # type: ignore[arg-type]
@@ -256,11 +358,19 @@ def test_main_passes_startup_args_to_app(
     monkeypatch.setattr(tui_app, "stop_debug_logging", lambda _runtime: calls.append("stop-debug"))
     monkeypatch.setattr(tui_app, "_restore_terminal_after_run", lambda _app: calls.append("restore-terminal"))
     monkeypatch.setattr(tui_app, "_reset_terminal_title_after_run", lambda: calls.append("reset-title"))
+    terminal_report = TerminalReport("ghostty 1.4.0")
+    asked: list[tuple[bool, bool]] = []
+
+    def _ask_terminal(env: Mapping[str, str], *, enabled: bool) -> TerminalReport:
+        asked.append((env is os.environ, enabled))
+        return terminal_report
+
+    monkeypatch.setattr(tui_app, "ask_terminal", _ask_terminal)
     monkeypatch.setattr(tui_app, "EventBus", object)
     monkeypatch.setattr(tui_app, "AgentProfileRegistry", _AgentRegistry)
     monkeypatch.setattr(tui_app, "ModelProfileRegistry", _ModelRegistry)
-    monkeypatch.setattr(tui_app, "JsonFileStateStore", object)
-    monkeypatch.setattr(tui_app, "assemble_agent_engine", _Engine)
+    monkeypatch.setattr("chrys.service.state.store.JsonFileStateStore", object)
+    monkeypatch.setattr("chrys.orchestration.engine.assembly.assemble_agent_engine", _Engine)
 
     original_cwd = Path.cwd()
     try:
@@ -268,6 +378,10 @@ def test_main_passes_startup_args_to_app(
     finally:
         os.chdir(original_cwd)
 
+    # The terminal named by the process environment is asked, by the loaded setting, and the answer goes
+    # to the app.
+    assert asked == [(True, Settings().chat_image_graphics)]
+    assert captured_kwargs["terminal_report"] is terminal_report
     assert captured_kwargs["startup_session_id"] == "session-1"
     assert captured_kwargs["profile_name"] == "Code"
     assert captured_kwargs["apply_saved_model_on_restore"] is False
@@ -289,7 +403,9 @@ def test_main_passes_startup_args_to_app(
     # The successful-turn callback composes buddy persistence with the
     # session-title updater; turn-start cancellation goes to the updater.
     title_updater = captured_kwargs["session_title_updater"]
-    assert isinstance(title_updater, tui_app.SessionTitleUpdater)
+    from chrys.app.features.session_title import SessionTitleUpdater
+
+    assert isinstance(title_updater, SessionTitleUpdater)
     buddy_calls: list[str] = []
     monkeypatch.setattr(tui_app, "on_buddy_successful_turn", lambda: buddy_calls.append("buddy"))
     monkeypatch.setattr(title_updater, "on_turn_finished", lambda: buddy_calls.append("title"))
@@ -340,6 +456,8 @@ def test_tui_locale_parser_sanitizes_hostile_argv_while_usage_stays_english(
     sanitized = hostile.replace("\x1b", "�").replace("\n", "�")
     monkeypatch.setenv("CHRYS_LOCALE", "zh-Hans")
     monkeypatch.setattr(sys, "argv", argv)
+    # Simulate a console script: argparse also inspects the main module spec.
+    monkeypatch.setattr(sys.modules["__main__"], "__spec__", None)
     monkeypatch.setattr(startup_mod, "configure_utf8_stdio", lambda: None)
 
     with pytest.raises(SystemExit) as exc_info:
@@ -372,6 +490,10 @@ async def test_unmount_drains_title_updater_after_engine_shutdown() -> None:
         async def shutdown(self) -> None:
             calls.append("engine")
 
+    class _Graphics:
+        async def close(self) -> None:
+            calls.append("graphics")
+
     class _Freeze:
         def close(self) -> None:
             calls.append("gc-close")
@@ -385,6 +507,7 @@ async def test_unmount_drains_title_updater_after_engine_shutdown() -> None:
         _update_check_task=None,
         _left_behind_task=None,
         _program_status_reporter=_Reporter(),
+        _terminal_graphics=_Graphics(),
         _session_title_updater=_Updater(),
         _engine=_Engine(),
         _gc_freeze=_Freeze(),
@@ -393,7 +516,7 @@ async def test_unmount_drains_title_updater_after_engine_shutdown() -> None:
 
     await ChrysApp.on_unmount(host)
 
-    assert calls == ["program-status", "gc-close", "timer-stop", "engine", "updater"]
+    assert calls == ["program-status", "graphics", "gc-close", "timer-stop", "engine", "updater"]
     assert host._gc_freeze_watchdog is None
 
 

@@ -40,6 +40,7 @@ from chrys.foundation.events.types import (
     SessionDelete,
     SessionFork,
     SessionNew,
+    SessionOnlySwitch,
     SessionRestore,
     SetApprovalMode,
     SetModelProfile,
@@ -82,6 +83,8 @@ from chrys.service.trajectory.state import TurnRecord, turn_records
 if TYPE_CHECKING:
     from chrys.foundation.events.bus import EventBus
     from chrys.foundation.models.execution import ExecutionSnapshot
+    from chrys.service.hooks.confirmation import HookConfirmationService
+    from chrys.service.hooks.run_log import HookRunLog
     from chrys.service.profiles.agents.schema import AgentProfile
     from chrys.service.profiles.models.registry import ModelProfileRegistry
     from chrys.service.profiles.models.schema import ModelProfile
@@ -162,6 +165,8 @@ class AgentEngine:
         history: SessionHistoryManager,
         trajectory_recorder: trajectory_recorder.TrajectoryRecorder,
         workflows: WorkflowCoordinator,
+        hook_runs: HookRunLog | None = None,
+        hook_confirmations: HookConfirmationService | None = None,
     ) -> None:
         self._bus = bus
         self._session = session
@@ -180,6 +185,8 @@ class AgentEngine:
         self._history = history
         self._trajectory_recorder = trajectory_recorder
         self._workflows = workflows
+        self._hook_runs = hook_runs
+        self._hook_confirmations = hook_confirmations
         self._subscribed = False
         self._release_task: asyncio.Task[None] | None = None
 
@@ -187,6 +194,11 @@ class AgentEngine:
     def turns(self) -> TurnCoordinator:
         """Turn orchestration and runtime state."""
         return self._turns
+
+    @property
+    def hook_runs(self) -> HookRunLog | None:
+        """Every main-session hook run since the engine was built; None unless it records them."""
+        return self._hook_runs
 
     @property
     def workflows(self) -> WorkflowCoordinator:
@@ -521,6 +533,7 @@ class AgentEngine:
         await self._bus.subscribe(SettingsReload, self._on_settings_reload)
         await self._bus.subscribe(SetApprovalMode, self._on_set_approval_mode)
         await self._bus.subscribe(SetModelProfile, self._on_set_model_profile)
+        await self._bus.subscribe(SessionOnlySwitch, self._on_session_only_switch)
         await self._bus.subscribe(BackgroundTaskStop, self._on_background_task_stop)
         await self._bus.subscribe(InvocationRetryRequested, self._on_sub_agent_retry)
         await self._bus.subscribe(InvocationAbortRequested, self._on_sub_agent_abort)
@@ -529,12 +542,23 @@ class AgentEngine:
         await self._bus.subscribe(InvocationAborted, self._on_sub_agent_unpaused)
         await self._bus.subscribe(InvocationCascadeAborted, self._on_sub_agent_unpaused)
         await self._workflows.subscribe()
+        if self._hook_confirmations is not None:
+            await self._hook_confirmations.start()
 
     async def shutdown(self) -> None:
         # Closing is declared before the active workflow run is drained: a requester queued behind that
         # run is refused as shutting down instead of being admitted into a session that is going away.
         self._session.mark_closing()
-        await self._workflows.shutdown()
+        # An input still being admitted ends now, and whatever it waits on with it (a hook's
+        # confirmation, a prompt shortcut's commands), whoever is driving the admission.
+        self._turns.turn_state.input_operations.invalidate_all("shutdown")
+        try:
+            await self._workflows.shutdown()
+        except BaseException:
+            # The release, which closes the hook confirmations, never started: they close all the same.
+            if self._release_task is None and self._hook_confirmations is not None:
+                await self._hook_confirmations.close()
+            raise
         await self._release()
 
     async def _release(self) -> None:
@@ -547,13 +571,21 @@ class AgentEngine:
         """
         task = self._release_task
         if task is None or task.done():
-            task = asyncio.create_task(self._lifecycle.shutdown(), name="chrys.engine.release")
+            task = asyncio.create_task(self._release_resources(), name="chrys.engine.release")
             self._release_task = task
         # Shutdown drains usage publications. An inline UsageUpdate handler must return before that
         # drain can finish; the release task retains ownership after the handler gives up its wait.
         if asyncio.current_task() in self._usage_publisher.tasks:
             return
         await asyncio.shield(task)
+
+    async def _release_resources(self) -> None:
+        try:
+            await self._lifecycle.shutdown()
+        finally:
+            if self._hook_confirmations is not None:
+                # After the release: what still waits on a question ends unavailable, and no answer is taken after.
+                await self._hook_confirmations.close()
 
     async def _session_operation(
         self, operation: str, run: Callable[[], Awaitable[None]], *, target_session_id: str | None = None
@@ -768,6 +800,10 @@ class AgentEngine:
     async def _on_profile_switch(self, event: AgentProfileSwitch) -> None:
         """Handle agent profile switch — preserves conversation history."""
         await self._controls.on_profile_switch(event)
+
+    async def _on_session_only_switch(self, event: SessionOnlySwitch) -> None:
+        """Switch this session's own agent and/or model in one rebuild (a prompt shortcut's)."""
+        await self._controls.on_session_only_switch(event)
 
     def pin_ask_user_timeout(self) -> None:
         """Mark ``ask_user_timeout_seconds`` as caller-owned across reloads.

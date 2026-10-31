@@ -28,7 +28,9 @@ from typing import Any, Never, cast
 
 from chrys.foundation.platform.c_api import declare_functions, struct_fields
 from chrys.foundation.platform.child_reap import install_stopped_child_reap_fix
+from chrys.foundation.platform.runtime_paths import is_windows_store_python_stub
 from chrys.foundation.text.encoding import decode_bytes, is_mostly_text
+from chrys.foundation.util.once_close import finish_close
 
 # Every subprocess in the app is spawned through this module, and the shim has to
 # be in place before the first one starts, so install it on import.  See
@@ -38,6 +40,10 @@ install_stopped_child_reap_fix()
 _CP_UTF8 = 65001
 _STOPPED_PROCESS_POLL_INTERVAL = 1.0
 _PROCESS_WAIT_CLEANUP_TIMEOUT = 2.0
+_LATE_START_GRACE = 30.0
+"""How long a start a cancel stopped waiting for may still finish and have its tree ended; then it is given up."""
+_LATE_CHILD_ENDINGS: set[asyncio.Task[None]] = set()
+"""Tree endings for starts that finished after their cancel went on; each removes itself when done."""
 _WINDOWS_TREE_KILL_TIMEOUT = 2.0
 
 
@@ -75,6 +81,20 @@ def raise_if_missing_cwd(cwd: object, error: OSError) -> None:
     path = os.fspath(cwd)
     if isinstance(path, str) and path and not os.path.isdir(path):
         raise MissingWorkingDirectoryError(path) from error
+
+
+@dataclass(frozen=True)
+class WindowsShellCommand:
+    """A command line for ``cmd.exe /c``, handed to it as written: :func:`managed_subprocess`'s one argument.
+
+    An argument list reaches a Windows child joined by ``subprocess.list2cmdline``,
+    which escapes every quote in it as ``\\"``; ``cmd.exe`` does not read that
+    escape, so ``echo x > "a b"`` would print its redirection instead. The trusted
+    ``cmd.exe`` (:func:`resolve_windows_comspec`) gets the command as ``/c "<command>"``,
+    the form ``subprocess`` gives a shell command. Windows only.
+    """
+
+    command: str
 
 
 @dataclass(frozen=True)
@@ -199,6 +219,12 @@ def _windows_console_encoding() -> str | None:
 
 
 _CREATE_NEW_CONSOLE = 0x00000010
+_CREATE_SUSPENDED = 0x00000004
+_ERROR_ACCESS_DENIED = 5
+_NTSTATUS_WIN32_ACCESS_DENIED = 0xC0070005
+_RESUME_THREAD_FAILED = 0xFFFFFFFF
+_PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
+_PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 _WINDOWS_BATCH_SUFFIXES = {".bat", ".cmd"}
 _WINDOWS_BATCH_FORBIDDEN = {'"', "%", "!", "^", "\r", "\n"}
 
@@ -436,7 +462,7 @@ async def spawn_managed_stdio_process(
             raise
 
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await _create_owned_subprocess(
             command,
             *args,
             stdin=asyncio.subprocess.PIPE,
@@ -527,6 +553,8 @@ def _windows_process_api() -> _WindowsProcessAPI:
                     ctypes.POINTER(_ProcessInformation),
                 ],
             ),
+            "AssignProcessToJobObject": (wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE]),
+            "ResumeThread": (wintypes.DWORD, [wintypes.HANDLE]),
             "SetHandleInformation": (wintypes.BOOL, [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]),
             "QueryInformationJobObject": (
                 wintypes.BOOL,
@@ -615,7 +643,7 @@ def _windows_resolve_application(command: str, env: dict[str, str], cwd: str) ->
         base = ntpath.join(directory, command)
         candidates = (base,) if has_extension else tuple(base + extension for extension in extensions)
         for candidate in candidates:
-            if os.path.isfile(candidate):
+            if os.path.isfile(candidate) and not is_windows_store_python_stub(candidate):
                 return ntpath.normpath(candidate)
     # Unresolved bare names are returned as-is so the spawn path fails closed
     # with a deterministic not-found error instead of searching implicit
@@ -690,6 +718,76 @@ async def _wrap_windows_parent_pipes(
         raise
 
 
+type _WindowsAttribute = tuple[int, ctypes.Array[Any], str]
+"""A process/thread attribute: its id, the array it points into, and the message if Windows rejects it."""
+
+
+def _windows_create_process(
+    api: _WindowsProcessAPI,
+    application: str,
+    command_line_text: str,
+    *,
+    flags: int,
+    environment: object,
+    cwd: str,
+    stdio: tuple[int, int, int],
+    attributes: tuple[_WindowsAttribute, ...],
+    process_info: _ProcessInformation,
+) -> int | None:
+    """Create the process with *attributes* into *process_info*; return the error ``CreateProcessW`` failed with, if any.
+
+    The attribute list points into the attributes' arrays, which the caller keeps referenced.
+    """
+    size = ctypes.c_size_t()
+    api.kernel32.InitializeProcThreadAttributeList(None, len(attributes), 0, ctypes.byref(size))
+    attribute_buffer = ctypes.create_string_buffer(size.value)
+    attribute_list = ctypes.cast(attribute_buffer, wintypes.LPVOID)
+    if not api.kernel32.InitializeProcThreadAttributeList(attribute_list, len(attributes), 0, ctypes.byref(size)):
+        _raise_windows_process_error(api, "Unable to initialize Windows process attributes.")
+    try:
+        for attribute, value, failure in attributes:
+            if not api.kernel32.UpdateProcThreadAttribute(
+                attribute_list,
+                0,
+                attribute,
+                ctypes.cast(value, wintypes.LPVOID),
+                ctypes.sizeof(value),
+                None,
+                None,
+            ):
+                _raise_windows_process_error(api, failure)
+        stdin, stdout, stderr = stdio
+        startup = _StartupInfoExW(
+            _StartupInfoW(
+                cb=ctypes.sizeof(_StartupInfoExW),
+                dwFlags=0x00000101,  # STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES
+                wShowWindow=0,  # SW_HIDE
+                hStdInput=stdin,
+                hStdOutput=stdout,
+                hStdError=stderr,
+            ),
+            attribute_list,
+        )
+        # CreateProcessW may write to the command line, so every call gets a buffer of its own.
+        command_line = ctypes.create_unicode_buffer(command_line_text)
+        if api.kernel32.CreateProcessW(
+            application,
+            command_line,
+            None,
+            None,
+            True,
+            flags,
+            environment,
+            cwd,
+            ctypes.byref(startup),
+            ctypes.byref(process_info),
+        ):
+            return None
+        return int(cast(Any, ctypes).get_last_error())
+    finally:
+        api.kernel32.DeleteProcThreadAttributeList(attribute_list)
+
+
 async def _spawn_windows_managed_stdio_process(
     command: str,
     args: tuple[str, ...],
@@ -702,9 +800,9 @@ async def _spawn_windows_managed_stdio_process(
     api = _windows_process_api()
     job_handle = _windows_create_job(api)
     pipe_pairs: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None = None
-    attribute_buffer = None
-    attribute_list = None
     process_handle: int | None = None
+    thread_handle: int | None = None
+    in_job = False
     try:
         pipe_pairs = _make_windows_pipe_pairs()
         (stdin_parent, stdin_child), (stdout_parent, stdout_child), (stderr_parent, stderr_child) = pipe_pairs
@@ -715,37 +813,6 @@ async def _spawn_windows_managed_stdio_process(
         for parent_handle in (stdin_parent, stdout_parent, stderr_parent):
             if not api.kernel32.SetHandleInformation(parent_handle, HANDLE_FLAG_INHERIT, 0):
                 _raise_windows_process_error(api, "Unable to protect a parent stdio handle.")
-
-        # The child joins the job as it is created and inherits only its three stdio handles.
-        # The attribute list points into these arrays, so they stay referenced until
-        # DeleteProcThreadAttributeList in the finally below.
-        PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
-        job_array = (wintypes.HANDLE * 1)(job_handle)
-        handle_array = (wintypes.HANDLE * 3)(stdin_child, stdout_child, stderr_child)
-        attributes = (
-            (PROC_THREAD_ATTRIBUTE_JOB_LIST, job_array, "Unable to attach the Windows Job Object atomically."),
-            (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handle_array, "Unable to restrict inherited Windows handles."),
-        )
-        size = ctypes.c_size_t()
-        api.kernel32.InitializeProcThreadAttributeList(None, len(attributes), 0, ctypes.byref(size))
-        attribute_buffer = ctypes.create_string_buffer(size.value)
-        candidate = ctypes.cast(attribute_buffer, wintypes.LPVOID)
-        if not api.kernel32.InitializeProcThreadAttributeList(candidate, len(attributes), 0, ctypes.byref(size)):
-            _raise_windows_process_error(api, "Unable to initialize Windows process attributes.")
-        # Named only once initialized: the finally below deletes whatever attribute_list names.
-        attribute_list = candidate
-        for attribute, value, failure in attributes:
-            if not api.kernel32.UpdateProcThreadAttribute(
-                attribute_list,
-                0,
-                attribute,
-                ctypes.cast(value, wintypes.LPVOID),
-                ctypes.sizeof(value),
-                None,
-                None,
-            ):
-                _raise_windows_process_error(api, failure)
 
         application = _windows_resolve_application(command, env, cwd)
         if not ntpath.isabs(application):
@@ -765,38 +832,62 @@ async def _spawn_windows_managed_stdio_process(
         else:
             argv = [application, *args]
             command_line_text = subprocess.list2cmdline(argv)
-        command_line = ctypes.create_unicode_buffer(command_line_text)
         environment = _windows_environment_block(env)
 
-        startup = _StartupInfoExW(
-            _StartupInfoW(
-                cb=ctypes.sizeof(_StartupInfoExW),
-                dwFlags=0x00000101,  # STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES
-                wShowWindow=0,  # SW_HIDE
-                hStdInput=stdin_child,
-                hStdOutput=stdout_child,
-                hStdError=stderr_child,
-            ),
-            attribute_list,
+        # The child joins the job before it runs and inherits only its three stdio handles.
+        stdio = (stdin_child, stdout_child, stderr_child)
+        job_attribute: _WindowsAttribute = (
+            _PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            (wintypes.HANDLE * 1)(job_handle),
+            "Unable to attach the Windows Job Object atomically.",
         )
-        process_info = _ProcessInformation()
+        handle_attribute: _WindowsAttribute = (
+            _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            (wintypes.HANDLE * 3)(*stdio),
+            "Unable to restrict inherited Windows handles.",
+        )
         creation_flags = _CREATE_NEW_CONSOLE | 0x00000400 | 0x00080000
-        if not api.kernel32.CreateProcessW(
+        process_info = _ProcessInformation()
+        create = functools.partial(
+            _windows_create_process,
+            api,
             application,
-            command_line,
-            None,
-            None,
-            True,
-            creation_flags,
-            environment,
-            cwd,
-            ctypes.byref(startup),
-            ctypes.byref(process_info),
-        ):
-            _raise_windows_process_error(api, "Unable to create the Windows subprocess.")
+            command_line_text,
+            environment=environment,
+            cwd=cwd,
+            stdio=stdio,
+            process_info=process_info,
+        )
+        error = create(flags=creation_flags, attributes=(job_attribute, handle_attribute))
+        # The denial can also come as NTSTATUS_FROM_WIN32(ERROR_ACCESS_DENIED), which ctypes reports signed.
+        suspended = error is not None and (error & 0xFFFFFFFF) in (
+            _ERROR_ACCESS_DENIED,
+            _NTSTATUS_WIN32_ACCESS_DENIED,
+        )
+        if suspended:
+            # Windows refuses the job attribute for a packaged (MSIX) executable, such as PowerShell
+            # installed from the Store: that child is created suspended and runs once a job holds it.
+            # The job the refused attempt named refuses the child too, so the child gets a new one;
+            # it is made before the old one closes, so a failure leaves one live handle to close.
+            refused_job, job_handle = job_handle, _windows_create_job(api)
+            _close_windows_handle(refused_job)
+            error = create(flags=creation_flags | _CREATE_SUSPENDED, attributes=(handle_attribute,))
+        if error is not None:
+            # Says when the fallback ran too, so a report shows whether the job attribute was all it refused.
+            detail = " even without the Job Object attribute" if suspended else ""
+            raise OSError(error, f"Unable to create the Windows subprocess{detail}.", None, error)
         process_handle = int(process_info.hProcess)
-        api.kernel32.CloseHandle(process_info.hThread)
-        for child_handle in (stdin_child, stdout_child, stderr_child):
+        thread_handle = int(process_info.hThread)
+        in_job = not suspended
+        if suspended:
+            if not api.kernel32.AssignProcessToJobObject(job_handle, process_handle):
+                _raise_windows_process_error(api, "Unable to assign the Windows subprocess to its Job Object.")
+            in_job = True
+            if api.kernel32.ResumeThread(thread_handle) == _RESUME_THREAD_FAILED:
+                _raise_windows_process_error(api, "Unable to start the Windows subprocess.")
+        api.kernel32.CloseHandle(thread_handle)
+        thread_handle = None
+        for child_handle in stdio:
             api.kernel32.CloseHandle(child_handle)
         # _wrap_windows_parent_pipes owns the parent handles from here, including on failure.
         pipe_pairs = None
@@ -817,7 +908,9 @@ async def _spawn_windows_managed_stdio_process(
             _windows_stderr_transport=stderr_transport,
         )
     except BaseException:
-        _terminate_windows_retained_process(job_handle, process_handle, exit_code=1)
+        # Ending the job ends nothing the job has not taken yet: a suspended child is terminated itself.
+        _terminate_windows_retained_process(job_handle if in_job else None, process_handle, exit_code=1)
+        _close_windows_handle(thread_handle)
         _close_windows_handle(process_handle)
         _close_windows_handle(job_handle)
         if pipe_pairs is not None:
@@ -825,9 +918,6 @@ async def _spawn_windows_managed_stdio_process(
                 for handle in pair:
                     _close_windows_handle(handle)
         raise
-    finally:
-        if attribute_list is not None:
-            api.kernel32.DeleteProcThreadAttributeList(attribute_list)
 
 
 async def _windows_process_exit(process_handle: int) -> int:
@@ -923,7 +1013,7 @@ async def _managed_subprocess_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[a
     kwargs.setdefault("stdin", subprocess.DEVNULL)
 
     try:
-        proc = await asyncio.create_subprocess_exec(*args, **kwargs)
+        proc = await _create_owned_subprocess(*args, **kwargs)
     except OSError as exc:
         raise_if_missing_cwd(kwargs.get("cwd"), exc)
         raise
@@ -1206,6 +1296,86 @@ def _windows_tree_kill_argv(pid: int) -> list[str] | None:
     if taskkill is None:
         return None
     return [taskkill, "/PID", str(pid), "/T", "/F"]
+
+
+async def _create_owned_subprocess(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+    """Start a subprocess that a cancel arriving while it starts cannot leave running.
+
+    ``create_subprocess_exec`` returns only once the child's pipes are connected,
+    but the child runs from the fork on. Cancelled in between, asyncio kills the
+    direct child alone, and whatever it started (a shell's commands) runs on with
+    no owner. So the start finishes under a shield, and a cancel that came
+    meanwhile ends the child's whole tree before it is passed on. That ending
+    runs as one task drained to its end: a second cancel cannot cut it short.
+    """
+    # Callers pass their own stdin; detached by default as in :func:`managed_subprocess`.
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    if len(args) == 1 and isinstance(args[0], WindowsShellCommand):
+        if sys.platform != "win32":
+            raise ValueError("A Windows shell command runs only on Windows.")
+        start = asyncio.create_subprocess_shell(args[0].command, executable=resolve_windows_comspec(), **kwargs)
+    else:
+        start = asyncio.create_subprocess_exec(*args, **kwargs)
+    spawn = asyncio.ensure_future(start)
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        await finish_close(asyncio.create_task(_end_started_child(spawn, kwargs)))
+        raise
+
+
+async def _end_started_child(spawn: asyncio.Future[asyncio.subprocess.Process], kwargs: dict[str, Any]) -> None:
+    """Wait a bounded time for the start a cancel interrupted, then end the child's whole tree.
+
+    A cancel must always be able to end, so a start that does not finish in
+    time (a working folder on a stalled network disk) is not waited for: the
+    caller's cancel goes on, and the child's tree is ended whenever the start
+    finishes (:func:`_end_child_once_started`).
+    """
+    await asyncio.wait({spawn}, timeout=_PROCESS_WAIT_CLEANUP_TIMEOUT)
+    if not spawn.done():
+        _end_child_once_started(spawn, kwargs)
+        return
+    if spawn.cancelled() or spawn.exception() is not None:
+        # A start that failed left nothing running; the cancel is what the caller hears.
+        return
+    await _end_child_tree(spawn.result(), kwargs)
+
+
+def _end_child_once_started(spawn: asyncio.Future[asyncio.subprocess.Process], kwargs: dict[str, Any]) -> None:
+    """End the tree of a start that finishes after its cancel went on, or give the start up after a grace.
+
+    Cancelling the start instead would end only the direct child (asyncio
+    kills that one), leaving whatever it started running with no owner; that
+    is the last resort, for a start still stuck after :data:`_LATE_START_GRACE`.
+    """
+    loop = asyncio.get_running_loop()
+    give_up = loop.call_later(_LATE_START_GRACE, spawn.cancel)
+
+    def started(future: asyncio.Future[asyncio.subprocess.Process]) -> None:
+        give_up.cancel()
+        # Read here, so a failure is not logged as never retrieved.
+        if future.cancelled() or future.exception() is not None:
+            return
+        ending = loop.create_task(_end_child_tree(future.result(), kwargs))
+        _LATE_CHILD_ENDINGS.add(ending)
+        ending.add_done_callback(_LATE_CHILD_ENDINGS.discard)
+
+    spawn.add_done_callback(started)
+
+
+async def _end_child_tree(proc: asyncio.subprocess.Process, kwargs: dict[str, Any]) -> None:
+    """End a started child and everything it started, then reap it within a bounded wait."""
+    process_group_id = _infer_process_group_id(proc, kwargs)
+    if process_group_id is not None:
+        kill_process_group(process_group_id)
+    if proc.pid is not None:
+        await kill_windows_process_tree(proc.pid)
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+    finalize_subprocess_transport(proc)
+    with contextlib.suppress(ProcessLookupError, OSError, TimeoutError):
+        await asyncio.wait_for(proc.wait(), timeout=_PROCESS_WAIT_CLEANUP_TIMEOUT)
 
 
 def _infer_process_group_id(proc: asyncio.subprocess.Process, kwargs: dict[str, Any]) -> int | None:

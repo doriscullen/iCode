@@ -10,21 +10,27 @@ import inspect
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from functools import partial
+from pathlib import Path
 
 import pytest
 from textual import events
 from textual.widget import AwaitMount, Widget
 
-from chrys.app.tui.widgets.chat.messages import AgentMessage, ErrorMessage, UserMessage
+from chrys.app.tui.widgets.chat.messages import AgentMessage, ErrorMessage, ThinkingMessage, UserMessage
 from chrys.app.tui.widgets.chat.panel import ChatPanel
 from chrys.app.tui.widgets.chat.replay_mount import REPLAY_MOUNT_BATCH_SIZE
-from chrys.app.tui.widgets.chat.tool_call import ToolGroup
+from chrys.app.tui.widgets.chat.tool_call import ToolGroup, ToolGroupTitle
+from chrys.app.tui.widgets.markdown.widget import VirtualizedMarkdown
 from chrys.app.tui.widgets.welcome import WelcomeWidget
+from chrys.foundation.models.history_markers import ANSWER_SEGMENT_KEY
+from chrys.foundation.tool_kinds import KIND_FILESYSTEM_READ, TOOL_CALL_KIND_METADATA_KEY
+from chrys.kernel import Content
 from tests.app.tui.widgets._scroll_gc import install_fake_chat_panel_gc
 from tests.support.tui_helpers import (
     ChatPanelApp,
     _simulate_chat_panel_user_scroll_y,
     chat_content_children,
+    title_text,
 )
 from tests.support.waiting import DEFAULT_WAIT_TIMEOUT, wait_for, wait_until, wait_until_quiet
 
@@ -84,6 +90,11 @@ def _assert_document_order(panel: ChatPanel) -> None:
     assert None not in seqs
     assert seqs == sorted(seqs)
     assert len(set(seqs)) == len(seqs)
+
+
+def _placement(before: Widget | None, after: Widget | None) -> dict[str, Widget]:
+    """The placement a wrapped ``mount`` was given: an explicit ``None`` would skip the panel's own place above its chrome."""
+    return {key: widget for key, widget in (("before", before), ("after", after)) if widget is not None}
 
 
 class _PrependGate:
@@ -454,7 +465,7 @@ def _jump_into_a_prepended_batch(
             panel.scroll_to_turn(turn.id)
 
     def mount(*widgets: Widget, before: Widget | None = None, after: Widget | None = None) -> AwaitMount:
-        mounting = real_mount(*widgets, before=before, after=after)
+        mounting = real_mount(*widgets, **_placement(before, after))
         if when == "registered" and before is not None and chosen():
             jump(list(widgets))
         return mounting
@@ -463,7 +474,17 @@ def _jump_into_a_prepended_batch(
         if when == "registered" or before is None or not chosen():
             await real_mount_batch(entries, before=before)
             return
+        compositor = panel.screen._compositor
+        # Whether an earlier scroll left the screen's map invalid here depends
+        # on timing (a loaded runner): forced, so every run takes that path.
+        compositor._full_map_invalidated = True
         layout_hold.enter_context(panel.app.batch_update())
+        # A geometry read rebuilds an invalid map, and would place the held
+        # batch without a frame: built here, before the batch mounts, the map
+        # stays valid under the hold, so the batch has no geometry until the
+        # hold ends.
+        full_map = compositor.full_map
+        assert panel in full_map
         held.append(entries)
         await real_mount_batch(entries, before=before)
         if when == "mounted":
@@ -564,7 +585,7 @@ async def test_a_view_moved_before_the_last_batch_lays_out_stays_on_its_turn(
                 _simulate_chat_panel_user_scroll_y(cp, turns[0].virtual_region.y)
 
         def mount(*widgets: Widget, before: Widget | None = None, after: Widget | None = None) -> AwaitMount:
-            mounting = real_mount(*widgets, before=before, after=after)
+            mounting = real_mount(*widgets, **_placement(before, after))
             if before is not None and not turns:
                 turns.append(next(widget for widget in widgets if isinstance(widget, UserMessage)))
                 if move == "held_jump" and turns[0].id is not None:
@@ -646,6 +667,31 @@ async def test_user_scroll_drops_a_toc_jump_still_waiting_for_its_turn(
         target = next(child for child in cp.children if isinstance(child, UserMessage) and child.id == oldest_turn)
         assert not target.has_class("-highlighted")
         assert reading.virtual_region.y - cp.scroll_y == offset
+
+
+async def test_a_message_sent_drops_a_toc_jump_still_waiting_for_its_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The new message is what the user looks at now; the turn they jumped to before must not take the view."""
+    async with ChatPanelApp().run_test(size=_SIZE) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        gate = _PrependGate(cp, monkeypatch)
+        await cp.replay_history(_turns())
+        await gate.wait_held(pilot)
+        await _settle(cp, pilot)
+        oldest_turn = cp.toc_items[0].turn_id
+
+        cp.scroll_to_turn(oldest_turn)
+        cp.agent_running = True
+        await cp.add_user_message("new question")
+        message = cp.query(UserMessage).last()
+        await wait_for(lambda: bool(message.outer_size), pilot=pilot, description="the message laid out")
+
+        gate.release.set()
+        await _wait_complete(cp)
+        await _settle(cp, pilot)
+
+        target = next(child for child in cp.children if isinstance(child, UserMessage) and child.id == oldest_turn)
+        assert not target.has_class("-highlighted")
+        assert cp.scroll_y <= message.virtual_region.y < cp.scroll_y + cp.size.height
 
 
 @pytest.mark.parametrize("refreshes", [0, 1])
@@ -793,11 +839,18 @@ async def test_a_toc_jump_queued_before_an_unmount_never_runs(monkeypatch: pytes
         assert jumps == []
 
 
-async def test_fold_all_during_prepend_reaches_tool_groups_mounted_later(monkeypatch: pytest.MonkeyPatch) -> None:
-    async with ChatPanelApp().run_test(size=_SIZE) as pilot:
+@pytest.mark.parametrize("fold_processes", [False, True])
+async def test_fold_all_during_prepend_reaches_tool_groups_mounted_later(
+    monkeypatch: pytest.MonkeyPatch, fold_processes: bool
+) -> None:
+    # Folded turns hide entries, so the tail and the first batch mount all of the unfolded history but its first
+    # prompt: the turns past it leave a tool group each pending, six here. More would only add work the wait must
+    # outlast.
+    count = _TOOL_TURNS + 6 if fold_processes else _TOOL_TURNS
+    async with ChatPanelApp(fold_finished_turns=lambda: fold_processes).run_test(size=_SIZE) as pilot:
         cp = pilot.app.query_one(ChatPanel)
         gate = _PrependGate(cp, monkeypatch)
-        await cp.replay_history(_turns(_TOOL_TURNS, with_tools=True))
+        await cp.replay_history(_turns(count, with_tools=True))
         await gate.wait_held(pilot)
         mounted_groups = list(cp.query(ToolGroup))
         assert mounted_groups
@@ -811,9 +864,37 @@ async def test_fold_all_during_prepend_reaches_tool_groups_mounted_later(monkeyp
         await _wait_complete(cp)
         groups = list(cp.query(ToolGroup))
 
-        assert len(groups) == _TOOL_TURNS
-        assert [group.collapsed for group in groups] == [False] * _TOOL_TURNS
+        assert len(groups) == count
+        assert [group.collapsed for group in groups] == [False] * count
         # Everything is expanded now, so the next fold-all collapses.
+        assert cp.toggle_fold_all() is True
+
+
+async def test_fold_all_during_prepend_reaches_thinking_mounted_later(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the oldest turns thought, so fold-all finds no fold mounted yet: the pending thinking takes the choice."""
+    thought_turns = 4
+    messages = _turns()
+    for message in messages[: 2 * thought_turns]:
+        if message["role"] == "assistant":
+            message["contents"] = [Content.from_text_reasoning(text="Thinking first.").to_dict(), *message["contents"]]
+
+    async with ChatPanelApp(thinking_expanded=lambda: True).run_test(size=_SIZE) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        gate = _PrependGate(cp, monkeypatch)
+        await cp.replay_history(messages)
+        await gate.wait_held(pilot)
+        assert not cp.query(ThinkingMessage)
+        assert any(isinstance(widget, ThinkingMessage) for widget in cp.pending_transcript_widgets())
+
+        assert cp.toggle_fold_all() is False
+
+        gate.release.set()
+        await _wait_complete(cp)
+        thinking = list(cp.query(ThinkingMessage))
+
+        assert len(thinking) == thought_turns
+        assert [message.collapsed for message in thinking] == [False] * len(thinking)
+        assert all(message.query(VirtualizedMarkdown) for message in thinking)
         assert cp.toggle_fold_all() is True
 
 
@@ -842,3 +923,56 @@ async def test_fold_all_while_the_last_batch_mounts_outlasts_the_choice_before_i
 
         assert folds == [True]
         assert [group.collapsed for group in cp.query(ToolGroup)] == [True] * _TOOL_TURNS
+
+
+async def test_a_folder_change_during_prepend_reaches_tool_groups_mounted_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each turn's group read one file in the chat's folder, so its row names that file relative to the folder.
+    folder = Path(Path(__file__).anchor, "work")
+    messages = _turns(_TOOL_TURNS, with_tools=True)
+    calls = [content for message in messages for content in message["contents"] if content["type"] == "function_call"]
+    for index, call in enumerate(calls):
+        call["arguments"] = {"path": str(folder / f"file_{index}.py")}
+        call["additional_properties"] = {TOOL_CALL_KIND_METADATA_KEY: KIND_FILESYSTEM_READ}
+    async with ChatPanelApp().run_test(size=_SIZE) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        cp.set_workspace_cwd(str(folder))
+        gate = _PrependGate(cp, monkeypatch)
+        await cp.replay_history(messages)
+        await gate.wait_held(pilot)
+        assert any(isinstance(widget, ToolGroup) for widget in cp.pending_transcript_widgets())
+
+        # The chat moves to another folder while older history waits to mount: the files lie outside it now. Mounted
+        # rows name them anew, and the rows still to mount read the folder as they mount, not as replay planned them.
+        cp.set_workspace_cwd(str(folder.parent / "elsewhere"))
+        gate.release.set()
+        await _wait_complete(cp)
+
+        titles = [title_text(group.query_one(ToolGroupTitle))[2:] for group in cp.query(ToolGroup)]
+        assert titles == [f"Read {folder / f'file_{index}.py'}" for index in range(_TOOL_TURNS)]
+
+
+async def test_a_withdrawal_mid_prepend_waits_for_the_replay_then_removes_each_answer_it_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The answers a bare Continue drops leave the view whichever replay batch mounted them."""
+    messages = _turns()
+    for index, segment in ((1, "oldest"), (-1, "newest")):
+        contents = messages[index]["contents"]
+        assert isinstance(contents, list)
+        contents[0]["additional_properties"] = {ANSWER_SEGMENT_KEY: segment}
+    async with ChatPanelApp().run_test(size=_SIZE) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        gate = _PrependGate(cp, monkeypatch)
+        await cp.replay_history(messages)
+        await gate.wait_held(pilot)
+
+        withdrawal = asyncio.create_task(cp.withdraw_answer(("oldest", "newest")))
+        await asyncio.sleep(0)
+        assert not withdrawal.done()
+        gate.release.set()
+        await asyncio.wait_for(withdrawal, timeout=DEFAULT_WAIT_TIMEOUT)
+
+        withdrawn = {"answer 0\n\nmore about 0", f"answer {_TURNS - 1}\n\nmore about {_TURNS - 1}"}
+        assert _message_texts(cp) == [text for _, text in _expected_messages() if text not in withdrawn]

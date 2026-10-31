@@ -32,6 +32,7 @@ from chrys.foundation.events.types import (
     CompactionFinished,
     CompactionStarted,
     ContextCompressed,
+    InvocationAnswerWithdrawn,
     InvocationContextPressure,
     InvocationMessage,
     InvocationStarted,
@@ -195,6 +196,41 @@ def test_on_sub_agent_paused_ignores_a_workflow_node_child() -> None:
     asyncio.run(_run_pause(handler, parent=InvocationOrigin("workflow_node", "", "node-run", None)))
     assert calls == []
     assert handler.attention_mark() == ""
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        (InvocationOrigin("turn", "s1", "turn-1", None), [("chat", ("seg-1",))]),
+        (
+            InvocationOrigin("sub_agent", "s1", "inv-1", InvocationOrigin("turn", "s1", "turn-1", None)),
+            [("sub_agent", "inv-1", ("seg-1",))],
+        ),
+        # A workflow node's details hear it from the workflow projector; the chat has no card for its children.
+        (InvocationOrigin("workflow_node", "s1", "node-1", None), []),
+        (
+            InvocationOrigin("sub_agent", "s1", "inv-2", InvocationOrigin("workflow_node", "s1", "node-1", None)),
+            [],
+        ),
+    ],
+    ids=["turn", "chat-sub-agent", "workflow-node", "workflow-child"],
+)
+def test_a_withdrawn_answer_leaves_the_view_that_shows_it(origin: InvocationOrigin, expected: list[tuple]) -> None:
+    calls: list[tuple] = []
+
+    class _FakePanel:
+        async def withdraw_answer(self, segment_ids: tuple[str, ...]) -> None:
+            calls.append(("chat", segment_ids))
+
+        def sub_agent_answer_withdrawn(self, invocation_id: str, segment_ids: tuple[str, ...]) -> None:
+            calls.append(("sub_agent", invocation_id, segment_ids))
+
+    screen = SimpleNamespace(_state=MainScreenState(run=RunState()), query_one=lambda _cls: _FakePanel())
+    handler = make_backend_handler(screen)
+
+    asyncio.run(handler.on_answer_withdrawn(InvocationAnswerWithdrawn(origin=origin, segment_ids=("seg-1",))))
+
+    assert calls == expected
 
 
 @pytest.mark.parametrize("settle", ["decided", "resumed", "cascade_aborted", "aborted", "next_run"])
@@ -911,7 +947,13 @@ def test_backend_handler_defers_agent_message_while_user_bubble_is_rendering() -
 
     asyncio.run(handler.on_agent_message(event))
 
-    assert state.render_gate.consume_deferred() == [event]
+    replayed: list[object] = []
+
+    async def replay(deferred: object) -> None:
+        replayed.append(deferred)
+
+    asyncio.run(state.render_gate.drain(replay))
+    assert replayed == [event]
 
 
 def test_final_agent_message_keeps_gate_and_prestamps_terminal_absorb(
@@ -975,6 +1017,50 @@ def test_final_agent_message_keeps_gate_and_prestamps_terminal_absorb(
     assert gc_messages[0].terminal_boundary is True
     assert gc_messages[0].time == 10.0
     assert input_events[0].time == 20.0
+
+
+def test_final_agent_message_tells_when_its_turn_began() -> None:
+    """The answer is timed from when the user sent the message or pressed Continue or Retry, as the backend keeps it."""
+    began = datetime(2026, 8, 19, 1, 58, tzinfo=UTC)
+    finished = began + timedelta(minutes=6)
+    rendered: list[dict[str, object]] = []
+
+    class _FakeStatusBar:
+        def flash_completed(self) -> None:
+            pass
+
+    class _FakeChatPanel:
+        async def add_agent_message(
+            self,
+            text: str,
+            *,
+            structured_output_completed: bool = False,
+            created_at: datetime | None = None,
+            turn_started_at: datetime | None = None,
+        ) -> None:
+            rendered.append({"text": text, "created_at": created_at, "turn_started_at": turn_started_at})
+
+    status = _FakeStatusBar()
+    panel = _FakeChatPanel()
+    screen = SimpleNamespace(
+        _state=MainScreenState(run=RunState(agent_running=True, started_at=began)),
+        _gc_messages=[],
+        _session_title=fake_session_title(),
+        _set_agent_running=lambda _value: None,
+        query_one=lambda cls: status if cls.__name__ == "StatusBar" else panel,
+        _debug=lambda *_args: None,
+    )
+    handler = make_backend_handler(screen)
+
+    asyncio.run(
+        handler.on_agent_message(
+            InvocationMessage(
+                text="done", is_final=True, origin=InvocationOrigin("turn", "", "turn-test", None), timestamp=finished
+            )
+        )
+    )
+
+    assert rendered == [{"text": "done", "created_at": finished, "turn_started_at": began}]
 
 
 def test_final_agent_message_render_failure_releases_turn_without_absorb() -> None:

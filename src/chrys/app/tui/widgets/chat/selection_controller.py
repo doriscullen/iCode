@@ -31,14 +31,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import TYPE_CHECKING, TypeGuard
 
 from textual.geometry import Offset, Region
 from textual.selection import SELECT_ALL, Selection
 from textual.widget import Widget
 
-from chrys.app.tui.widgets.chat.ports import ChatTranscriptPanelMarker
 from chrys.app.tui.widgets.chat.tool_call import is_tool_copy_excluded
+from chrys.app.tui.widgets.chat.transcript_panel import ChatTranscriptPanelMarker
 
 if TYPE_CHECKING:
     from textual.screen import Screen
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
 
     from chrys.app.tui.widgets.chat.panel import ChatPanel
 
-DocKey = tuple[int, ...]
+DocKey = tuple[Fraction | int, ...]
 
 # Orders a gap representative key after every real key that shares its
 # ``before`` prefix; leaf keys never extend below a leaf, so any suffix works.

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 from textual.containers import Vertical
+from textual.geometry import Region
 from textual.widgets import Button, Checkbox, Input, Label, OptionList, Select, Static
 
 from chrys.app.tui.screens.models.screen import (
@@ -92,6 +93,94 @@ async def test_model_config_uses_default_token_limits() -> None:
     async with open_model_config(registry, global_default_profile_id=profile.id) as (screen, _pilot):
         assert screen.query_one("#mc-max-tokens", Input).value == "200000"
         assert screen.query_one("#mc-max-output-tokens", Input).value == "32000"
+
+
+def _shown_label_text(label: Label) -> str:
+    """The label's text as painted, wrapped lines joined, so clipped cells are missing."""
+    lines = label.render_lines(Region(0, 0, label.size.width, label.size.height))
+    return " ".join(strip.text.strip() for strip in lines)
+
+
+def _label_fits(label: Label) -> bool:
+    width = label.size.width
+    return label.size.height == label.get_content_height(label.container_size, label.container_size, width)
+
+
+async def test_model_config_token_labels_hint_the_loaded_profile() -> None:
+    # Neither value is a compose default, so the hint can only come from loading the profile.
+    registry, profile = single_profile_registry(max_context_tokens=1_000_000, max_output_tokens=128_000)
+
+    async with open_model_config(registry, global_default_profile_id=profile.id) as (screen, pilot):
+        context_label = screen.query_one("#mc-max-tokens-label", Label)
+        output_label = screen.query_one("#mc-max-output-label", Label)
+        await wait_for(lambda: str(context_label.render()).endswith("Max Context Window · 1M"), pilot=pilot)
+        await wait_for(lambda: str(output_label.render()).endswith(" · 128K"), pilot=pilot)
+
+
+async def test_model_config_token_labels_follow_typed_values() -> None:
+    registry, profile = single_profile_registry()
+
+    async with open_model_config(registry, global_default_profile_id=profile.id) as (screen, pilot):
+        context_label = screen.query_one("#mc-max-tokens-label", Label)
+        output_label = screen.query_one("#mc-max-output-label", Label)
+
+        context_input = screen.query_one("#mc-max-tokens", Input)
+        context_input.focus()
+        await wait_for(lambda: context_input.has_focus, pilot=pilot)
+        await pilot.press("ctrl+a", *"1280000")
+        await wait_for(lambda: str(context_label.render()).endswith("Max Context Window · 1.28M"), pilot=pilot)
+        await pilot.press("ctrl+a", *"128040")
+        await wait_for(lambda: str(context_label.render()).endswith("Max Context Window · 128.04K"), pilot=pilot)
+        await pilot.press("ctrl+a", *"3500008")
+        await wait_for(lambda: str(context_label.render()).endswith("Max Context Window · ~3.5M"), pilot=pilot)
+        await pilot.press("ctrl+a", *"999")
+        await wait_for(lambda: str(context_label.render()).endswith("Max Context Window"), pilot=pilot)
+
+        output_input = screen.query_one("#mc-max-output-tokens", Input)
+        output_input.focus()
+        await wait_for(lambda: output_input.has_focus, pilot=pilot)
+        await pilot.press("ctrl+a", *"64000")
+        await wait_for(lambda: str(output_label.render()).endswith(" · 64K"), pilot=pilot)
+
+
+async def test_model_config_output_hint_survives_provider_and_api_style_changes() -> None:
+    registry, profile = single_profile_registry(provider="openai", max_output_tokens=64_000)
+
+    async with open_model_config(registry, global_default_profile_id=profile.id) as (screen, pilot):
+        output_label = screen.query_one("#mc-max-output-label", Label)
+        await wait_for(
+            lambda: str(output_label.render()) == "Max Output Tokens (max_completion_tokens) · 64K", pilot=pilot
+        )
+
+        screen.query_one("#mc-api-style", Select).value = "responses"
+        await wait_for(lambda: str(output_label.render()) == "Max Output Tokens (max_output_tokens) · 64K", pilot=pilot)
+
+        screen.query_one("#mc-provider", Select).value = "anthropic"
+        await wait_for(lambda: str(output_label.render()) == "Max Output Tokens (max_tokens) · 64K", pilot=pilot)
+
+
+async def test_model_config_token_labels_wrap_instead_of_clipping_the_hint_on_a_narrow_terminal() -> None:
+    registry, profile = single_profile_registry(max_context_tokens=1_000_000, max_output_tokens=128_000)
+
+    # At 70 columns the context title fits one line alone but needs a second line with a hint.
+    async with open_model_config(registry, global_default_profile_id=profile.id, size=(70, 40)) as (screen, pilot):
+        context_label = screen.query_one("#mc-max-tokens-label", Label)
+        output_label = screen.query_one("#mc-max-output-label", Label)
+        await wait_for(lambda: "· 128K" in _shown_label_text(output_label), pilot=pilot)
+        assert output_label.size.height > 1
+        assert _label_fits(output_label)
+        await wait_for(lambda: "· 1M" in _shown_label_text(context_label), pilot=pilot)
+
+        context_input = screen.query_one("#mc-max-tokens", Input)
+        context_input.focus()
+        await wait_for(lambda: context_input.has_focus, pilot=pilot)
+        await pilot.press("ctrl+a", *"999")
+        await wait_for(lambda: context_label.size.height == 1, pilot=pilot)
+        assert _label_fits(context_label)
+        await pilot.press("ctrl+a", *"1280000")
+        await wait_for(lambda: "· 1.28M" in _shown_label_text(context_label), pilot=pilot)
+        assert context_label.size.height == 2
+        assert _label_fits(context_label)
 
 
 async def test_model_config_lists_profiles_in_reading_order_and_selects_the_first_listed() -> None:
@@ -451,13 +540,13 @@ async def test_model_config_delete_runtime_effective_reloads_from_global_default
         assert registry.get(runtime_effective.id) is None
         assert get_global_default_profile_id() == global_default.id
         assert os.environ["CHRYS_MODEL_PROFILE"] == global_default.id
-        assert result == "switched"
+        assert result == "deleted"
 
     published = await _model_config_result_events(result, registry)
     assert len(published) == 1
 
 
-async def test_model_config_delete_global_default_leaves_other_runtime_untouched(
+async def test_model_config_delete_global_default_leaves_the_pointer_and_reloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from chrys.service.profiles.models.env_bridge import (
@@ -483,10 +572,11 @@ async def test_model_config_delete_global_default_leaves_other_runtime_untouched
         assert registry.get(global_default.id) is None
         assert get_global_default_profile_id() == promoted_default.id
         assert os.environ["CHRYS_MODEL_PROFILE"] == runtime_effective.id
-        assert result == ""
+        # Any deletion reloads: the engine drops whatever the session used that is gone.
+        assert result == "deleted"
 
     published = await _model_config_result_events(result, registry)
-    assert published == []
+    assert len(published) == 1
 
 
 async def test_model_config_delete_recognizes_name_based_process_pointer(
@@ -510,7 +600,7 @@ async def test_model_config_delete_recognizes_name_based_process_pointer(
         result = screen._cancel_result()
 
         assert os.environ["CHRYS_MODEL_PROFILE"] == global_default.id
-        assert result == "switched"
+        assert result == "deleted"
 
 
 async def test_model_config_delete_global_default_promotes_first_selectable(
@@ -575,7 +665,7 @@ async def test_model_config_delete_runtime_effective_skips_unresolvable_file_def
         # deleted; the process pointer still lands on a usable profile.
         assert get_global_default_profile_id() == file_default_pointer
         assert os.environ["CHRYS_MODEL_PROFILE"] == selectable.id
-        assert result == "switched"
+        assert result == "deleted"
 
 
 async def test_model_config_delete_runtime_effective_clears_pointer_when_nothing_selectable(

@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import importlib.util
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -13,14 +11,12 @@ from pathlib import Path
 import pytest
 
 from chrys.foundation.patches import textual_compositor_cjk
+from tests.support.installed_packages import copy_installed_package
 
 
 @pytest.mark.parametrize("patch_mode", ["startup", "runtime-only", "already-patched"])
 def test_first_launch_repairs_preimported_compositor(tmp_path: Path, patch_mode: str) -> None:
-    spec = importlib.util.find_spec("textual")
-    assert spec is not None and spec.origin is not None
-    package = tmp_path / "textual"
-    shutil.copytree(Path(spec.origin).parent, package, ignore=shutil.ignore_patterns("__pycache__"))
+    package = copy_installed_package("textual", tmp_path)
     target = package / "_compositor.py"
     source = target.read_text(encoding="utf-8")
     # The development venv may already be patched. Reconstruct the old CJK
@@ -41,9 +37,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
-# Follow the production import ordering: ChrysApp imports Textual before main
-# reaches bootstrap_runtime(), which in turn calls apply_all().
-from chrys.app.tui.app import ChrysApp
+# Textual is imported before apply_all() runs, as in production, where ChrysApp
+# imports it before main reaches bootstrap_runtime(). The Textual modules that
+# hold the patched classes are imported below and Chrys holds none, so the
+# app's own import, the bulk of a cold start, would add no holder to repair.
 from chrys.foundation.patches import apply_all, textual_compositor_cjk
 from chrys.foundation.patches import textual_win_sleep
 import textual._compositor as compositor_module

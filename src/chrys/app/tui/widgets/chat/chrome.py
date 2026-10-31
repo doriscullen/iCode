@@ -17,6 +17,7 @@ from chrys.app.tui.util.git_branch import format_workspace_subtitle
 from chrys.app.tui.util.logo import CHAT_LOGO
 from chrys.app.tui.util.removal import remove_shielded
 from chrys.app.tui.widgets.chat.ports import ChatChromeHost
+from chrys.app.tui.widgets.chat.waiting_row import WaitingRow
 from chrys.app.tui.widgets.click_affordance import ClickAffordance
 from chrys.app.tui.widgets.welcome import WelcomeWidget, copy_on_click
 from chrys.foundation.i18n import MessageRef, msg
@@ -124,12 +125,13 @@ class ScrollToBottomButton(ClickAffordance):
 
 
 class ChatPanelChrome:
-    """Own welcome/spacer/button infrastructure and border metadata."""
+    """Own welcome/waiting row/spacer/button infrastructure and border metadata."""
 
     def __init__(self, host: ChatChromeHost, *, locale_controller: LocaleController | None = None) -> None:
         self._host = host
         self._locale_controller = locale_controller
         self._welcome: WelcomeWidget | None = None
+        self._waiting_row: WaitingRow | None = None
         self._bottom_spacer: ChatBottomSpacer | None = None
         self._scroll_to_bottom_button: ScrollToBottomButton | None = None
         self._session_id: str = ""
@@ -146,6 +148,11 @@ class ChatPanelChrome:
     @welcome.setter
     def welcome(self, widget: WelcomeWidget | None) -> None:
         self._welcome = widget
+
+    @property
+    def waiting_row(self) -> WaitingRow | None:
+        """Current waiting row widget: transcript entries mount above it."""
+        return self._waiting_row
 
     @property
     def bottom_spacer(self) -> ChatBottomSpacer | None:
@@ -175,25 +182,35 @@ class ChatPanelChrome:
         """Current workspace cwd metadata."""
         return self._workspace_cwd
 
-    def initial_widgets(self) -> tuple[WelcomeWidget, ChatBottomSpacer, ScrollToBottomButton]:
+    def initial_widgets(
+        self,
+    ) -> tuple[WelcomeWidget, WaitingRow, ChatBottomSpacer, ScrollToBottomButton]:
         """Create initial persistent chrome widgets in mount order."""
         return self._create_widgets()
 
     def detach_infrastructure_refs(self) -> None:
         """Forget current chrome widget refs before async child removal."""
         self._welcome = None
+        self._waiting_row = None
         self._bottom_spacer = None
         self._scroll_to_bottom_button = None
 
-    def rebuild_widgets(self) -> tuple[WelcomeWidget, ChatBottomSpacer, ScrollToBottomButton]:
+    def rebuild_widgets(
+        self,
+    ) -> tuple[WelcomeWidget, WaitingRow, ChatBottomSpacer, ScrollToBottomButton]:
         """Create fresh persistent chrome widgets after transcript clear."""
         return self._create_widgets()
 
-    def _create_widgets(self) -> tuple[WelcomeWidget, ChatBottomSpacer, ScrollToBottomButton]:
+    def _create_widgets(
+        self,
+    ) -> tuple[WelcomeWidget, WaitingRow, ChatBottomSpacer, ScrollToBottomButton]:
         # Rebuild from panel metadata, which survives transcript and mode changes.
         welcome = WelcomeWidget(
             CHAT_LOGO, title=self._host.profile_name, cwd=self._host.workspace_cwd, notice=self._update_notice_text()
         )
+        # Shown only while a running turn waits.
+        waiting = WaitingRow()
+        waiting.display = False
         spacer = ChatBottomSpacer()
         spacer.display = False
         button = ScrollToBottomButton(
@@ -201,9 +218,10 @@ class ChatPanelChrome:
             tooltip=self._render_content(_CHAT_SCROLL_TO_BOTTOM_TOOLTIP.bind(shortcut="Ctrl+End")),
         )
         self._welcome = welcome
+        self._waiting_row = waiting
         self._bottom_spacer = spacer
         self._scroll_to_bottom_button = button
-        return welcome, spacer, button
+        return welcome, waiting, spacer, button
 
     async def dismiss_welcome(self) -> None:
         """Remove the welcome widget on first transcript content."""
@@ -306,7 +324,12 @@ class ChatPanelChrome:
 
     def is_infrastructure(self, widget: Widget) -> bool:
         """Return whether ``widget`` is persistent chrome infrastructure."""
-        return widget is self._welcome or widget is self._bottom_spacer or widget is self._scroll_to_bottom_button
+        return (
+            widget is self._welcome
+            or widget is self._waiting_row
+            or widget is self._bottom_spacer
+            or widget is self._scroll_to_bottom_button
+        )
 
     def handle_click(self, event: Click) -> None:
         """Handle border/title/subtitle clicks."""

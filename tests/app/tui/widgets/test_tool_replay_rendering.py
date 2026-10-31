@@ -26,6 +26,7 @@ from chrys.app.tui.widgets.chat.tool_call import (
     ToolCall,
     ToolCardHeader,
     ToolGroup,
+    ToolGroupTitle,
 )
 from chrys.app.tui.widgets.chat.tool_renderers import register_kind_renderer
 from chrys.app.tui.widgets.hatch import HATCH_GLYPH
@@ -102,8 +103,7 @@ async def test_replay_history_defers_tool_renderer_creation_until_expand(monkeyp
         assert group._tool_records["tool1#0"].duration_known is True
         expected_tool_timestamp = format_message_created_at("2026-08-19T01:02:03+00:00")
         assert group._tool_records["tool1#0"].timestamp == expected_tool_timestamp
-        assert group._elapsed_ms() == 0
-        assert group._timer is None
+        assert group.query_one(ToolGroupTitle).render().plain == "▸ Called plain_tool"
 
         group.collapsed = False
         await wait_for(lambda: created, pilot=pilot, description="created")
@@ -272,7 +272,7 @@ async def test_live_zero_duration_tool_does_not_gain_replay_suffix_after_rebuild
         await panel.add_user_message("run")
         await panel.add_tool_start("live", "plain_tool", "", args={})
         await panel.add_tool_result("live", "plain_tool", "done", 0)
-        await panel.add_agent_message("finished", is_final=True)
+        await panel.add_agent_message("finished")
 
         group = panel.query_one(ToolGroup)
         await wait_for(lambda: not group._content_mounted, pilot=pilot, description="not group._content_mounted")
@@ -363,8 +363,8 @@ async def test_replay_history_bounds_each_textual_registration_batch(monkeypatch
         cp.set_replay_progress_callback(lambda current, total: progress.append((current, total)))
         await cp.replay_history(messages)
 
-        # The restore's progress covers the newest batch, which is all that
-        # mounts before replay returns.
+        # Visible entries retain the original foreground cap even when
+        # their rows would fit in the three-viewport budget.
         assert batch_sizes == [batch_size]
         assert progress == [(0, batch_size), (batch_size, batch_size)]
 
@@ -375,6 +375,31 @@ async def test_replay_history_bounds_each_textual_registration_batch(monkeypatch
         assert [child._text for child in cp.children if isinstance(child, UserMessage)] == [
             f"message {index}" for index in range(len(messages))
         ]
+
+
+async def test_replay_foreground_has_a_hard_cap_even_for_hidden_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    widgets: list[Widget] = [UserMessage("prompt")]
+    for _ in range(300):
+        hidden = AgentMessage("intermediate")
+        hidden.set_process_hidden(True)
+        widgets.append(hidden)
+    widgets.append(AgentMessage("answer"))
+    async with ChatPanelApp().run_test() as pilot:
+        panel = pilot.app.query_one(ChatPanel)
+        mount = panel.mount
+        batches: list[int] = []
+
+        def record_mount(*entries: Widget, **kwargs: object):
+            batches.append(len(entries))
+            return mount(*entries, **kwargs)
+
+        monkeypatch.setattr(panel, "mount", record_mount)
+        await panel.mount_transcript_widgets(widgets)
+        assert batches == [32, 32, 32, 32]
+        assert len(panel.pending_transcript_widgets()) == len(widgets) - 128
+        await panel.wait_replay_complete()
+        assert not panel.pending_transcript_widgets()
+        assert max(batches) <= 32
 
 
 async def test_replay_history_duplicate_call_id_distinct_snapshots() -> None:

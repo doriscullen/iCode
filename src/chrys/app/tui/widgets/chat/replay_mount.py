@@ -38,8 +38,14 @@ import logging
 
 from textual.widget import Widget
 
-from chrys.app.tui.widgets.chat.messages import AgentMessage, UserMessage
+from chrys.app.tui.widgets.chat.messages import (
+    AgentMessage,
+    StreamedMarkdownMessage,
+    UserMessage,
+    folds_with_turn,
+)
 from chrys.app.tui.widgets.chat.ports import ReplayMountHost
+from chrys.app.tui.widgets.chat.process_block import ProcessBlock
 from chrys.app.tui.widgets.chat.scroll_controller import ChatGcPauseClaim
 from chrys.app.tui.widgets.chat.tool_call import ToolGroup
 
@@ -54,15 +60,23 @@ _MIN_TAIL_ENTRIES = 2
 _PREPEND_BATCH_ROWS = 300
 _MIN_WRAP_WIDTH = 20
 _ENTRY_CHROME_ROWS = 3
+_MAX_FOREGROUND_ENTRIES = 4 * REPLAY_MOUNT_BATCH_SIZE
 
 
 def estimated_rows(widget: Widget, width: int) -> int:
     """Rough rendered height of an unmounted transcript entry.
 
     Only sizes batches, so it favors being cheap over exact: message text
-    counts its lines plus soft wraps at ``width``; other entries replay
-    collapsed and count as their header and margins.
+    counts its lines plus soft wraps at ``width``; folded thinking and tool
+    groups are one row with no margin, and other entries replay collapsed
+    and count as their header and margins.
     """
+    if not widget.display:
+        return 0
+    if isinstance(widget, ProcessBlock) or (
+        isinstance(widget, (StreamedMarkdownMessage, ToolGroup)) and widget.collapsed
+    ):
+        return 1
     if not isinstance(widget, (AgentMessage, UserMessage)):
         return _ENTRY_CHROME_ROWS
     text = widget.text
@@ -115,6 +129,8 @@ class ReplayMountController:
             row_budget=_TAIL_VIEWPORTS * max(_MIN_VIEWPORT_ROWS, viewport.height),
             min_entries=_MIN_TAIL_ENTRIES,
             width=viewport.width,
+            max_entries=_MAX_FOREGROUND_ENTRIES,
+            max_visible_entries=REPLAY_MOUNT_BATCH_SIZE,
         )
         if tail_start == 0:
             await self._mount_foreground(widgets)
@@ -166,15 +182,18 @@ class ReplayMountController:
         if task is not None and not task.done():
             task.cancel()
 
-    def pending_tool_groups_collapsed(self) -> bool | None:
-        """Collapsed state pending tool groups will mount with; None without any."""
-        if not any(isinstance(widget, ToolGroup) for widget in self._pending):
+    def pending_folds_collapsed(self) -> bool | None:
+        """Collapsed state pending tool groups and thinking will mount with; None without any."""
+        if not any(
+            (isinstance(widget, ToolGroup) or folds_with_turn(widget)) and not widget.process_hidden
+            for widget in self._pending
+        ):
             return None
-        # Replay builds every tool group collapsed.
+        # Replay builds every tool group and thinking block collapsed.
         return True if self._fold_collapsed is None else self._fold_collapsed
 
     def set_fold_state(self, collapsed: bool) -> None:
-        """Apply a fold-all choice to tool groups that mount after it."""
+        """Apply a fold-all choice to tool groups and thinking that mount after it."""
         # The whole prepend, not just ``pending``: the last batch has left it while it mounts.
         if self._task is not None:
             self._fold_collapsed = collapsed
@@ -265,10 +284,14 @@ class ReplayMountController:
             for root in batch:
                 if not root.is_attached:
                     continue
+                if isinstance(root, StreamedMarkdownMessage):
+                    if root.foldable and not root.process_hidden:
+                        root.collapsed = collapsed
+                    continue
                 groups = [root] if isinstance(root, ToolGroup) else []
                 groups.extend(root.query(ToolGroup))
                 for group in groups:
-                    if not group.collapse_locked:
+                    if not group.collapse_locked and not group.process_hidden:
                         group.collapsed = collapsed
         # Mounted is not laid out: the batch gets its geometry on the next refresh.
         if not self._host.call_after_refresh(self._laid_out, batch):
@@ -312,11 +335,27 @@ class ReplayMountController:
         gc_pause.release(collect_first=collect_first)
 
     @staticmethod
-    def _batch_start(widgets: list[Widget], end: int, *, row_budget: int, min_entries: int, width: int) -> int:
+    def _batch_start(
+        widgets: list[Widget],
+        end: int,
+        *,
+        row_budget: int,
+        min_entries: int,
+        width: int,
+        max_entries: int = REPLAY_MOUNT_BATCH_SIZE,
+        max_visible_entries: int = REPLAY_MOUNT_BATCH_SIZE,
+    ) -> int:
         """First index of the entries before ``end`` that fill ``row_budget`` rows."""
         start = end
         rows = 0
-        while start > 0 and end - start < REPLAY_MOUNT_BATCH_SIZE and (rows < row_budget or end - start < min_entries):
+        visible_entries = 0
+        while (
+            start > 0
+            and end - start < max_entries
+            and visible_entries < max_visible_entries
+            and (rows < row_budget or end - start < min_entries)
+        ):
             start -= 1
+            visible_entries += int(widgets[start].display)
             rows += estimated_rows(widgets[start], width)
         return start

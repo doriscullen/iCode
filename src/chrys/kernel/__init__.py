@@ -18,6 +18,7 @@ from ._loop_recorder import LoopRecorder, LoopRecorderSnapshot
 from .agent import Agent
 from .client import (
     CONVERSATION_HANDLE_KEYS,
+    EXHAUSTION_TAIL_KWARG,
     BaseChatClient,
     StorageModeResolution,
     SupportsAclose,
@@ -60,6 +61,7 @@ from .compaction import (
     messages_contain_tool_calls,
     project_included_messages,
     raise_if_context_window_filled,
+    recount_user_messages,
     set_excluded,
 )
 from .images import is_image_content, is_image_media_type
@@ -67,7 +69,14 @@ from .instrumentation import (
     AgentTelemetryLayer,
     ChatTelemetryLayer,
 )
-from .loop import ConsumedInjectionMessageProbe, StallExhaustedAction, ToolLoopLayer, WireRetryPolicy
+from .loop import (
+    RESPONSE_READY_KWARG,
+    ConsumedInjectionMessageProbe,
+    ResponseReadyObserver,
+    StallExhaustedAction,
+    ToolLoopLayer,
+    WireRetryPolicy,
+)
 from .middleware import (
     ChatContext,
     ChatMiddleware,
@@ -141,11 +150,13 @@ __all__ = [
     "CONVERSATION_HANDLE_KEYS",
     "EXCLUDED_KEY",
     "EXCLUDE_REASON_KEY",
+    "EXHAUSTION_TAIL_KWARG",
     "GROUP_ANNOTATION_KEY",
     "GROUP_ID_KEY",
     "GROUP_KIND_KEY",
     "LOCAL_HISTORY_CONVERSATION_ID",
     "OPENAI_OUTPUT_MESSAGE_ENVELOPE_KEY",
+    "RESPONSE_READY_KWARG",
     "RETRY_BOUNDARY_UPDATE_KEY",
     "SKIP_PARSING",
     "SUMMARIZED_BY_SUMMARY_ID_KEY",
@@ -202,6 +213,7 @@ __all__ = [
     "Message",
     "MiddlewareSplit",
     "MiddlewareTermination",
+    "ResponseReadyObserver",
     "ResponseStream",
     "Role",
     "ServiceFallbackHistoryProvider",
@@ -244,6 +256,7 @@ __all__ = [
     "prepend_instructions_to_messages",
     "project_included_messages",
     "raise_if_context_window_filled",
+    "recount_user_messages",
     "report_wire_progress",
     "resolve_storage_mode_and_handles",
     "set_excluded",

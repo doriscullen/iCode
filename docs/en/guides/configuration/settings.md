@@ -24,7 +24,7 @@ You can also open a tab directly with `/settings <tab>`:
 | Models & Agents | `models` | Default agent, model roles, and request retries |
 | Security | `security` | Approval, project trust, diagnostics, and telemetry |
 | Sessions | `sessions` | Session titles, storage, and rollback |
-| Tools | `tools` | File search, web tools, agent questions, tool detail display, and workspace notices |
+| Tools | `tools` | File search, images, web tools, agent questions, tool detail display, and workspace notices |
 | Notifications | `notifications` | Notification toggles, delivery methods, and events |
 
 For example, enter `/settings security` to open the **Security** tab directly.
@@ -55,11 +55,20 @@ The "Takes effect" column in the following tables describes each setting's usual
 | Theme | Changes the TUI theme. To adjust colors or create a custom theme, see [Customize themes](themes.md). | Immediately |
 | UI Language | Changes only iCode interface text, not conversation content, the model's output language, or existing records. You can also switch the interface language with `/language`. | Immediately |
 
+#### Display preferences
+
+| Setting | Effect and notes | Takes effect |
+| --- | --- | --- |
+| Expand thinking by default | Disabled by default (`ui.chat.show_thinking`). When enabled, new thinking is expanded above the reply while the model writes it, when the model service returns it as readable text. When disabled, it stays on one line, which shows the newest words as they arrive. Either way, it folds to one line showing how the thinking begins once the model moves on to a tool call or its reply. You can click it at any time to read it in full. Thinking the service returns only in encrypted form is never shown. Thinking already in the conversation keeps its state when you change this. | Immediately |
+| Expand tool details by default | Disabled by default (`ui.chat.tool_groups_expanded`). When enabled, new tool groups are expanded by default. When disabled, they are collapsed and show only a summary and the current operation. You can click a tool group at any time to expand its details. | Immediately |
+| Automatically fold completed turns | Enabled by default (`ui.chat.fold_finished_turns`). After a successful reply, folds thinking, tool calls and intermediate replies under a header that counts the tool calls by kind, such as `12 tool calls · 8 reads · 4 commands`, or **Activity** when there were no tools or the turn is in compressed history. User messages, including mid-turn additions, and the final reply remain visible. Click the header to toggle one section, or type `/fold` to collapse or expand activity sections, tool groups, thinking and text between tool calls with the keyboard. Errors, interruptions and the last turn recovered after a crash stay visible; a turn without a visible final reply is not automatically folded. Existing folds keep your choice. | Future completed turns and sessions you open afterwards |
+| Full-color images | Enabled by default (`ui.chat.image_graphics`). In Ghostty, kitty and iTerm2 3.7.5 or later, images in the conversation, such as attached screenshots and images that tools return, are shown in full color at the terminal's own resolution; in WezTerm, VS Code and Windows Terminal 1.22 or later, at 10 by 20 pixels to a character cell. VS Code shows them only with `terminal.integrated.enableImages` on and GPU acceleration (`terminal.integrated.gpuAcceleration`) not turned off. Over SSH, Ghostty, kitty and iTerm2 show them in full color too when `COLORTERM=truecolor` is set on the remote host, for example in its shell profile. To tell which terminal it runs in, iCode asks the terminal as it starts; a terminal that never answers delays the start by up to a second and a half. In other terminals, inside tmux, screen or Zellij, or with this setting off, images are drawn with colored blocks, two pixels to a character cell. In WezTerm, VS Code and Windows Terminal, an image shows as colored blocks while the conversation scrolls and sharpens once it stops. If images still show as blocks in Windows Terminal, start iCode from a Windows Terminal tab rather than from a console window that Windows opened in Windows Terminal. | After restart |
+
 #### Input
 
 | Setting | Effect and notes | Takes effect |
 | --- | --- | --- |
-| Save prompt history | Saves submitted input across sessions for reuse. When no other dialog covers the main screen, press **Ctrl+R** to open the prompt history list above the input field. Click an entry, or select it with the up and down arrow keys and press **Enter**, to copy the prompt into the input field. The history file, `prompt_history.jsonl`, is stored in `~/.chrys/` on macOS and Linux, or `%APPDATA%\chrys\` on Windows. Turning this setting off does not delete the file; iCode stops reading it, and **Ctrl+R** shows "No results". Re-enable the setting and restart iCode to read the file's entries again. To clear the history, delete the history file; deletion cannot be undone. | After restart |
+| Save prompt history | Saves submitted input across sessions for reuse. When no other dialog covers the main screen, press **Ctrl+R** to open the prompt history list above the input field. Type to search it; the most relevant prompts are listed first. Press **Ctrl+R** again, the up and down arrow keys, or **Page Up** and **Page Down** to move through the list. Click an entry, or select it with the up and down arrow keys and press **Enter**, to copy the prompt into the input field. The history file, `prompt_history.jsonl`, is stored in `~/.chrys/` on macOS and Linux, or `%APPDATA%\chrys\` on Windows. Turning this setting off does not delete the file; iCode stops reading it, and **Ctrl+R** says that prompt history is off. Re-enable the setting and restart iCode to read the file's entries again. To clear the history, delete the history file; deletion cannot be undone. | After restart |
 
 When no suggestion list is open, **Up** and **Down** move through the rows of the prompt, including automatically wrapped rows. **Up** recalls an older prompt only from the first row. While browsing history, **Down** moves to a newer prompt only from the last row; moving past the newest entry restores your draft.
 
@@ -91,7 +100,7 @@ This tab selects existing agent or model profiles; it does not edit them. For th
 
 | Setting | Effect and notes | Takes effect |
 | --- | --- | --- |
-| Max transient retries | Sets the maximum number of automatic retries for errors that may resolve shortly, such as temporary network interruptions, request timeouts, temporary model service unavailability, or server rate limits. It does not retry problems that waiting cannot resolve, such as invalid model configuration or request parameters. A higher limit gives temporary failures more chances to recover; if retries keep failing, it also increases the wait and the number of model requests before the final failure. Leave blank to use the TUI default; set to `0` to disable automatic retries. This setting does not cover the one resend after iCode compacts a full context window. | On close |
+| Max transient retries | Sets the maximum number of automatic retries for errors that may resolve shortly, such as temporary network interruptions, request timeouts, temporary model service unavailability, or server rate limits. It does not retry problems that waiting cannot resolve, such as invalid model configuration or request parameters. A higher limit gives temporary failures more chances to recover; if retries keep failing, it also increases the wait and the number of model requests before the final failure. Leave blank to use the TUI default; set to `0` to disable automatic retries. This setting does not cover the one resend after iCode compacts a full context window, or the one resend of a reply that came back with no answer. | On close |
 
 ### Security
 
@@ -175,6 +184,12 @@ For telemetry data types, storage locations, endpoint precedence, and collector 
 | --- | --- | --- |
 | Respect .gitignore | Applies Git ignore rules to grep and glob searches. When off, hidden paths are still skipped, and other ignore files such as `.ignore` still apply. | On close |
 
+#### Images
+
+| Setting | Effect and notes | Takes effect |
+| --- | --- | --- |
+| Image size limit (KB) | The largest an image's file can be when it is sent to the model, from 32 to 3072 KB. The default is 256. In the request an image takes about a third more than its file, since it is sent as text. A larger image that you attach, that the agent views, or that an ACP client sends is compressed to a JPEG within the limit; the image file itself is not changed. Each new turn and each retry also compresses the images sent earlier in the session that are larger than the limit, and the session keeps the compressed copies, so an image that an MCP tool returns is compressed from the next turn or retry on. If a request with images fails because it is too large, for example with an HTTP 413 error from a gateway, lower the limit and retry. With a lower limit the model sees less detail in each image. | On close |
+
 #### Web search
 
 These settings apply to agents that include the web tools, which are off by default. See [Configure web tools](./web-tools.md). An agent profile that sets its own mode, result count, or timeout overrides these values for that agent. Project settings cannot change them.
@@ -198,12 +213,6 @@ Values are checked with the same rules the web tools use before they are saved, 
 | --- | --- | --- |
 | Show questions in the chat | When enabled, the agent's questions appear directly in the conversation. When disabled, they appear in a popup. | On close |
 | Ask-user timeout (seconds) | Sets how long iCode waits for an answer. When left blank, it uses the default value shown in the TUI. If no answer arrives before the timeout, iCode returns a timeout result to the agent. Set to `0` to wait until an answer arrives or the task is interrupted. When using an ACP client such as an IDE plugin, `ask_user` has no server-side time limit by default; to set one, use `--ask-user-timeout` when starting the ACP server. | On close |
-
-#### Display
-
-| Setting | Effect and notes | Takes effect |
-| --- | --- | --- |
-| Expand tool details by default | When enabled, new tool groups are expanded by default. When disabled, they are collapsed and show only a summary and the current operation. You can click a tool group at any time to expand its details. | Immediately |
 
 #### Workspace notice
 

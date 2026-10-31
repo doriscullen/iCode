@@ -10,10 +10,11 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from chrys.foundation.events.types import TurnStarted
+from chrys.foundation.events.types import InvocationAnswerWithdrawn, TurnStarted
 from chrys.foundation.models.history_markers import HistoryMarkerKind
 from chrys.foundation.models.turns import current_turn_start, is_continuation_message
 from chrys.foundation.trajectory.ids import new_analytics_id
+from chrys.foundation.util.once_close import finish_close
 from chrys.orchestration.engine import trajectory as trajectory_recorder
 from chrys.orchestration.engine.rollback import capture_snapshot_writer
 from chrys.orchestration.engine.run.finalizer import PostRunOutcome, TurnFinalizer, _expire_current_run_scope
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from chrys.foundation.config.settings_store import SettingsHandle
     from chrys.foundation.events.bus import EventBus
     from chrys.foundation.events.types import RuntimeSkillDetails
+    from chrys.kernel import Message
     from chrys.orchestration.engine.execution import CurrentRunInjectionWindow, CurrentRunScope
     from chrys.orchestration.engine.run.turn_state import TurnRuntimeState
     from chrys.orchestration.engine.state.active_session import ActiveSession
@@ -48,6 +50,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _user_request_text(message: Message) -> str:
+    """What the user asked in *message*: the text they typed when it was sent otherwise, else its text."""
+    typed = message.additional_properties.get(HistoryMarkerKind.TYPED_TEXT_KEY)
+    return (typed if isinstance(typed, str) and typed else message.text or "").strip()
 
 
 def _resumed_turn(history_state: dict[str, Any], *, turn_number: int) -> TurnRecord | None:
@@ -129,10 +137,21 @@ class TurnRunner:
         admission_preparation: PreparationTrace | None = None,
         binding_failure: Exception | None = None,
         user_message_id: str | None = None,
+        typed_text: str | None = None,
     ) -> None:
-        """Execute a fresh agent turn and finalize it."""
+        """Execute a fresh agent turn and finalize it.
+
+        *text* is the message as sent; *typed_text* what the user typed, when
+        that differs (a prompt shortcut's commands spliced in): hooks, the skill
+        reference and the approval judge read the typed text — command output
+        is data, not the user's request.
+        """
         _ = injection_window
-        self._current.require_loaded().bindings.inputs.begin_invocation()
+        typed = typed_text if typed_text is not None else text
+        self._turn_state.pass_started_at = created_at
+        self._current.require_loaded().bindings.inputs.begin_invocation(
+            typed_text=typed_text if typed_text is not None and typed_text != text else None
+        )
         if contents is None:
             contents = await self._prepare_user_contents(text)
             if contents is None:
@@ -162,16 +181,17 @@ class TurnRunner:
                 await preamble.started()
                 self._bind_turn_preamble(preamble)
             await self._fire_before_turn(
-                text,
+                typed,
                 target_operation_id=preamble.operation_id
                 if preamble is not None and preamble.start_committed
                 else None,
             )
             await self._compute_workspace_notice(is_retry=False)
+            await self._content.shrink_history_images()
             write_rollback_snapshot = capture_snapshot_writer(self._session, self._settings_handle)
             await asyncio.to_thread(write_rollback_snapshot)
             await self._refresh_runtime_skills(update_active_turn=False)
-            self._queue_skill_reference_reminder(text, for_next_turn=True)
+            self._queue_skill_reference_reminder(typed, for_next_turn=True)
             if self._current.loaded is not None:
                 if run_scope is not None:
                     self._current.require_loaded().reminder_middleware.prepare_turn(
@@ -182,7 +202,7 @@ class TurnRunner:
                     self._current.require_loaded().reminder_middleware.prepare_turn(
                         usage=self._session.runtime_meta.last_usage_details or None
                     )
-            self._current.require_loaded().bindings.approval.set_user_messages([text] if text else [])
+            self._current.require_loaded().bindings.approval.set_user_messages([typed] if typed else [])
             self._turn_state.set_current_input(text, contents, created_at)
             if preamble is not None:
                 await preamble.finished(outcome=PreparationOutcome.HANDOFF)
@@ -206,7 +226,9 @@ class TurnRunner:
             else:
                 self._current.require_loaded().bindings.record_outcome(
                     await self._current.require_loaded().bindings.backend.run(
-                        self._current.require_loaded().bindings.inputs.fresh_request(contents, created_at=created_at)
+                        self._current.require_loaded().bindings.inputs.fresh_request(
+                            contents, created_at=created_at, typed_text=typed_text
+                        )
                     )
                 )
         except (StaleContinuation, OverlappingRun, PreparedClosed, UnsupportedRequest) as exc:
@@ -244,6 +266,7 @@ class TurnRunner:
     ) -> None:
         """Resume the agent from current state and finalize it."""
         _ = injection_window
+        self._turn_state.pass_started_at = created_at
         # Retry keeps the invocation, not its input: until retry_request binds
         # this pass's message, a recovery checkpoint must not lend the previous
         # input's reminder record to unsent guidance.
@@ -278,6 +301,8 @@ class TurnRunner:
                 else None,
             )
             await self._compute_workspace_notice(is_retry=True)
+            # A retry is how a request refused as too large is sent again once the image limit is lowered.
+            await self._content.shrink_history_images()
             if self._current.loaded is not None:
                 if run_scope is not None:
                     self._current.require_loaded().reminder_middleware.prepare_turn(
@@ -324,12 +349,15 @@ class TurnRunner:
                     )
             else:
                 async with self._current.require_loaded().bindings.inputs.retry_request(
-                    additional_text=additional_text, created_at=created_at
+                    additional_text=additional_text, created_at=created_at, withdraw=self._withdraw_answer
                 ) as request:
                     if request is not None:
                         try:
                             if binding_failure is not None:
                                 self._record_admission_failure(binding_failure)
+                            elif self._turn_state.lease.consume_pre_executor_interrupt():
+                                # Stopped while frontends heard the dropped answer's withdrawal.
+                                self._current.require_loaded().bindings.record_pre_run_interrupt()
                             else:
                                 self._current.require_loaded().bindings.record_outcome(
                                     await self._current.require_loaded().bindings.backend.run(request)
@@ -439,6 +467,18 @@ class TurnRunner:
                 user_message_id=event_user_message_id,
             )
         )
+
+    async def _withdraw_answer(self, segment_ids: tuple[str, ...]) -> None:
+        """History dropped the answer these segments showed: every frontend withdraws it.
+
+        Delivered whole even when the turn is cancelled meanwhile, since the drop is already done.
+        """
+        event = InvocationAnswerWithdrawn(
+            origin=self._current.require_loaded().bindings.inputs.origin,
+            session_id=self._session.session_id,
+            segment_ids=segment_ids,
+        )
+        await finish_close(asyncio.create_task(self._bus.publish(event)))
 
     async def _record_trajectory_turn_started(
         self,
@@ -651,7 +691,7 @@ class TurnRunner:
         messages: list[str] = []
         for message in history_messages[start:]:
             if message.role == "user" and not is_continuation_message(message):
-                text = (message.text or "").strip()
+                text = _user_request_text(message)
                 if text:
                     messages.append(text)
         return messages
@@ -666,7 +706,7 @@ class TurnRunner:
         """
         for message in reversed(self._history.messages):
             if message.role == "user" and not is_continuation_message(message):
-                text = (message.text or "").strip()
+                text = _user_request_text(message)
                 if text:
                     return text
         return ""
@@ -728,5 +768,6 @@ class TurnRunner:
         return dropped_retry_cwd
 
     def _clear_current_input(self) -> None:
-        """Clear current-turn recovery input after run finalization."""
+        """Clear current-turn recovery input, and when its pass began, after run finalization."""
         self._turn_state.clear_current_input()
+        self._turn_state.pass_started_at = None

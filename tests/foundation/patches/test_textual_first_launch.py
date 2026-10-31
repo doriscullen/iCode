@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import importlib.util
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -13,14 +11,12 @@ from pathlib import Path
 import pytest
 
 from chrys.foundation.patches import textual_block_border, textual_callback_cache, textual_utf8_decoder
+from tests.support.installed_packages import copy_installed_package
 
 
 @pytest.mark.parametrize("scenario", ["block-border", "reactive-callback", "utf8-drivers"])
 def test_patches_reach_preimported_consumers(tmp_path: Path, scenario: str) -> None:
-    spec = importlib.util.find_spec("textual")
-    assert spec is not None and spec.origin is not None
-    package = tmp_path / "textual"
-    shutil.copytree(Path(spec.origin).parent, package, ignore=shutil.ignore_patterns("__pycache__"))
+    package = copy_installed_package("textual", tmp_path)
     reversals = {
         "_styles_cache.py": [(textual_block_border._NEW, textual_block_border._OLD)],
         "_callback.py": [
@@ -48,7 +44,10 @@ from contextlib import nullcontext
 from functools import partial
 
 sys.path.insert(0, sys.argv[1])
-from chrys.app.tui.app import ChrysApp
+# Each consumer checked below is imported before apply_all(), as Textual is
+# before bootstrap. Neither Chrys nor the rest of Textual binds a patched name
+# by value, so the app's own import, the bulk of a cold start, would add no
+# consumer to repair.
 from chrys.foundation.patches import apply_all
 from chrys.foundation.platform import get_platform
 import textual._callback as callback

@@ -37,7 +37,6 @@ import contextlib
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,7 +45,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final
 
-from chrys.foundation.platform import windows_program_files_dirs
+from chrys.foundation.models.hook_runs import HookResultFileStatus
 from chrys.foundation.platform.output_capture import BoundedCapture, drain_process_pipes
 from chrys.foundation.platform.process import (
     SubprocessStoppedError,
@@ -57,8 +56,9 @@ from chrys.foundation.platform.runtime_paths import (
     is_frozen_runtime,
     reorder_path_demoting_runtime,
     strip_python_runtime_overrides,
-    which_excluding_runtime,
 )
+from chrys.foundation.platform.script_commands import build_script_command
+from chrys.foundation.tool_execution_stamp import encode_json_like
 
 if TYPE_CHECKING:
     from chrys.service.hooks.outbox import OutboxJob
@@ -90,12 +90,19 @@ class HookResult:
     and for timeouts that hit the SIGKILL fallback.
     """
     timed_out: bool = False
+    stopped: bool = False
+    """The process entered job-control stopped state and was terminated; ``timed_out`` is set too."""
     decision: dict[str, Any] = field(default_factory=dict)
     """Parsed JSON from ``CHRYS_HOOK_RESULT``; empty dict if the file
     was absent / empty / malformed.
     """
     stdout: str = ""
     stderr: str = ""
+    stdout_dropped: int = 0
+    stderr_dropped: int = 0
+    """Bytes cut from the middle of each stream past ``HOOK_OUTPUT_CAPTURE_LIMIT_BYTES``."""
+    result_file: HookResultFileStatus = "missing"
+    """Whether the result file was read (``ok``), absent or empty, or ignored as invalid."""
     duration_ms: int = 0
 
 
@@ -108,76 +115,6 @@ class HookInvocation:
     cwd: str
     result_path: Path
     payload_path: Path
-
-
-# ---------------------------------------------------------------------------
-# Interpreter detection (mirrors chrys/service/skills/runner.py)
-# ---------------------------------------------------------------------------
-
-_INTERPRETERS: dict[str, list[str]] = {
-    ".js": ["node"],
-    ".mjs": ["node"],
-    ".ts": ["npx", "tsx"],
-    ".rb": ["ruby"],
-    ".pl": ["perl"],
-}
-_SHELL_SCRIPT_EXTS = frozenset({".sh", ".bash", ".zsh"})
-
-
-def _find_python_runner() -> list[str]:
-    runner = _find_python_runner_on_path(fallback_to_runtime=False)
-    if runner is not None:
-        return runner
-    runner = _find_python_runner_on_path(fallback_to_runtime=True)
-    if runner is not None:
-        return runner
-    return [sys.executable]
-
-
-def _find_python_runner_on_path(*, fallback_to_runtime: bool) -> list[str] | None:
-    uv = which_excluding_runtime("uv", fallback_to_runtime=fallback_to_runtime)
-    if uv:
-        return [uv, "run"]
-    for name in ("python3", "python"):
-        path = which_excluding_runtime(name, fallback_to_runtime=fallback_to_runtime)
-        if path:
-            return [path]
-    return None
-
-
-def _find_powershell() -> str:
-    for name in ("pwsh", "powershell"):
-        path = shutil.which(name)
-        if path:
-            return path
-    return "pwsh"
-
-
-def _find_bash() -> str:
-    for name in ("bash", "sh"):
-        path = shutil.which(name)
-        if path:
-            return path
-    for base in windows_program_files_dirs():
-        git_bash = os.path.join(base, "Git", "bin", "bash.exe")
-        if os.path.isfile(git_bash):
-            return git_bash
-    return "bash"
-
-
-def build_script_command(script_path: Path) -> list[str]:
-    """The argv that starts *script_path*: the program its extension calls for, then the script."""
-    suffix = script_path.suffix.lower()
-    if suffix == ".py":
-        return [*_find_python_runner(), str(script_path)]
-    if suffix == ".ps1":
-        return [_find_powershell(), "-NoProfile", "-File", str(script_path)]
-    if suffix in _SHELL_SCRIPT_EXTS:
-        return [_find_bash(), str(script_path)]
-    interpreter = _INTERPRETERS.get(suffix)
-    if interpreter is not None:
-        return [*interpreter, str(script_path)]
-    return [*_find_python_runner(), str(script_path)]
 
 
 # ---------------------------------------------------------------------------
@@ -228,18 +165,34 @@ class HookRunner:
     def hooks_dir(self) -> Path:
         return self._hooks_dir
 
-    async def run_and_wait(self, hook: HookConfig, payload: dict[str, Any]) -> HookResult:
+    async def run_and_wait(
+        self,
+        hook: HookConfig,
+        payload: dict[str, Any],
+        *,
+        payload_text: str | None = None,
+        result: HookResult | None = None,
+    ) -> HookResult:
         """Spawn *hook* with stdio pipes and await it (with timeout).
 
         Used for ``blocking`` and ``async`` modes.  The async variant
         only differs in *who* awaits — the manager does, after dispatch
-        returns — so this entry point is shared.
+        returns — so this entry point is shared. *payload_text*, when
+        given, is written to the payload file as it is, in place of
+        serializing *payload*. *result*, when given, is filled and returned
+        in place of a new one: a caller whose wait is cancelled keeps what
+        the hook printed until then.
         """
         start = datetime.now(UTC)
-        result = HookResult(hook_id=hook.id, exit_code=None)
+        if result is None:
+            result = HookResult(hook_id=hook.id, exit_code=None)
         invocation: HookInvocation | None = None
+        # Outside the subprocess block: a run that times out, is stopped or
+        # is cancelled keeps what it printed until then.
+        stdout = BoundedCapture(HOOK_OUTPUT_CAPTURE_LIMIT_BYTES)
+        stderr = BoundedCapture(HOOK_OUTPUT_CAPTURE_LIMIT_BYTES)
         try:
-            invocation = self._build_invocation(hook, payload)
+            invocation = self._build_invocation(hook, payload, payload_text=payload_text)
             async with managed_subprocess(
                 *invocation.cmd,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -249,18 +202,16 @@ class HookRunner:
                 env=invocation.env,
             ) as proc:
                 process_group_id = getattr(proc, "pid", None) if sys.platform != "win32" else None
-                stdout = BoundedCapture(HOOK_OUTPUT_CAPTURE_LIMIT_BYTES)
-                stderr = BoundedCapture(HOOK_OUTPUT_CAPTURE_LIMIT_BYTES)
                 await wait_for_subprocess(
                     drain_process_pipes(proc, stdout, stderr),
                     timeout=hook.execution.timeout_seconds,
                     process_group_id=process_group_id,
                 )
                 result.exit_code = proc.returncode
-                result.stdout = stdout.snapshot().text()
-                result.stderr = stderr.snapshot().text()
+                _take_output(result, stdout, stderr)
         except TimeoutError:
             result.timed_out = True
+            _take_output(result, stdout, stderr)
             logger.warning(
                 "Hook %r timed out after %.1fs",
                 hook.id,
@@ -268,16 +219,21 @@ class HookRunner:
             )
             return result
         except SubprocessStoppedError:
-            result.timed_out = True
-            result.stderr = "Hook process entered stopped state and was terminated."
+            result.timed_out = result.stopped = True
+            _take_output(result, stdout, stderr)
+            note = "Hook process entered stopped state and was terminated."
+            result.stderr = f"{result.stderr.rstrip()}\n{note}" if result.stderr.strip() else note
             logger.warning("Hook %r entered stopped state and was terminated", hook.id)
             return result
+        except asyncio.CancelledError:
+            _take_output(result, stdout, stderr)
+            raise
         except (FileNotFoundError, OSError, ValueError) as exc:
             result.exit_code = None
             result.stderr = str(exc)
         finally:
             if invocation is not None:
-                result.decision = _read_result_file(invocation.result_path)
+                result.decision, result.result_file = _read_result_file(invocation.result_path)
                 _cleanup_invocation_files(invocation)
             result.duration_ms = int((datetime.now(UTC) - start).total_seconds() * 1000)
         return result
@@ -288,6 +244,8 @@ class HookRunner:
         self,
         hook: HookConfig,
         payload: dict[str, Any],
+        *,
+        payload_text: str | None = None,
     ) -> HookInvocation:
         """Build the (argv, env, cwd) triple for a hook invocation."""
         workspace_cwd = payload.get("cwd") or os.getcwd()
@@ -339,7 +297,10 @@ class HookRunner:
             _set_owner_only(payload_fd)
             with os.fdopen(payload_fd, "w", encoding="utf-8") as f:
                 payload_fd = -1
-                json.dump(payload, f, default=str)
+                if payload_text is None:
+                    f.write(encode_json_like(payload))
+                else:
+                    f.write(payload_text)
             env["CHRYS_HOOK_PAYLOAD_FILE"] = payload_path
 
             # Result file: hooks write their decision here so stdout/stderr
@@ -405,21 +366,23 @@ class HookRunner:
         payload: dict[str, Any],
         *,
         job: OutboxJob | None = None,
-    ) -> None:
-        """Spawn a detached worker, redirecting stdio to a log file.
+        payload_text: str | None = None,
+    ) -> Path:
+        """Spawn a detached worker, redirecting stdio to a log file; return that log's path.
 
         The worker runs the real hook command, updates durable outbox state,
         and cleans temp files.  On POSIX the worker starts a new session; on
         Windows it starts in a detached process group.  Either way it outlives
-        the parent Chrys process.
+        the parent Chrys process. The log is named by the second the run
+        started, so runs of one hook in the same second share it.
         """
-        invocation = self._build_invocation(hook, payload)
+        invocation = self._build_invocation(hook, payload, payload_text=payload_text)
         invocation_path: Path | None = None
         log_file: Any | None = None
+        log_path = self._log_path_for(hook, payload)
 
         try:
             invocation_path = self._write_detached_invocation(invocation, hook_id=hook.id, job=job)
-            log_path = self._log_path_for(hook, payload)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = _open_owner_only_append(log_path)
             worker_env = os.environ.copy()
@@ -456,6 +419,7 @@ class HookRunner:
             if log_file is not None:
                 with contextlib.suppress(OSError):
                     log_file.close()
+        return log_path
 
     def _write_detached_invocation(
         self,
@@ -507,35 +471,44 @@ class HookRunner:
 # ---------------------------------------------------------------------------
 
 
-def _read_result_file(path: Path) -> dict[str, Any]:
-    """Parse ``CHRYS_HOOK_RESULT``; return ``{}`` on absent/empty/invalid."""
+def _read_result_file(path: Path) -> tuple[dict[str, Any], HookResultFileStatus]:
+    """Parse ``CHRYS_HOOK_RESULT`` (``{}`` when absent, empty or invalid), and say which it was."""
     try:
         with path.open("rb") as result_file:
             raw = result_file.read(HOOK_RESULT_FILE_MAX_BYTES + 1)
     except OSError:
-        return {}
+        return {}, "missing"
     if len(raw) > HOOK_RESULT_FILE_MAX_BYTES:
         logger.warning(
             "Hook result file %s exceeded the %d-byte limit and was ignored",
             path,
             HOOK_RESULT_FILE_MAX_BYTES,
         )
-        return {}
+        return {}, "invalid"
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError:
-        return {}
+        return {}, "invalid"
     if not text:
-        return {}
+        return {}, "missing"
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
         logger.warning("Hook result file %s contained invalid JSON: %s", path, exc)
-        return {}
+        return {}, "invalid"
     if not isinstance(parsed, dict):
         logger.warning("Hook result file %s must be a JSON object, got %s", path, type(parsed).__name__)
-        return {}
-    return parsed
+        return {}, "invalid"
+    return parsed, "ok"
+
+
+def _take_output(result: HookResult, stdout: BoundedCapture, stderr: BoundedCapture) -> None:
+    out = stdout.snapshot()
+    err = stderr.snapshot()
+    result.stdout = out.text()
+    result.stderr = err.text()
+    result.stdout_dropped = out.dropped
+    result.stderr_dropped = err.dropped
 
 
 def _cleanup_invocation_files(invocation: HookInvocation) -> None:

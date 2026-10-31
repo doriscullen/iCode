@@ -132,12 +132,13 @@ Provider "Anthropic", base URL `https://api.anthropic.com`. Don't add `/v1` to t
 | What you want | Key | Value |
 | --- | --- | --- |
 | Prompt caching | `extra_body` | `{"cache_control": {"type": "ephemeral"}}` |
-| Adaptive thinking | `thinking` | `{"type": "adaptive"}` |
+| Adaptive thinking with readable summaries | `thinking` | `{"type": "adaptive", "display": "summarized"}` |
 | Thinking with a fixed budget (older models) | `thinking` | `{"type": "enabled", "budget_tokens": 8000}` |
 | Effort | `output_config` | `{"effort": "medium"}` |
 | Interleaved thinking on older models at another address | `additional_beta_flags` | `["interleaved-thinking-2025-05-14"]` |
 
 - Use `adaptive` only on models that support it; recent models reject the older `enabled`/`budget_tokens` form. For ordinary fixed-budget thinking, set "Max Output Tokens" higher than `budget_tokens` (manual interleaved thinking has different budget rules).
+- `display: "summarized"` asks the service to return a readable summary of the model's thinking. Newer Claude models, including Opus 5.5 and Fable 5.1, hide this text by default. Add `"display": "summarized"` to your existing `thinking` object to request it; iCode's "Expand thinking by default" setting only chooses whether returned text shows expanded or on one line while it streams, and does not request it from the service. To hide the summary at the API level, use `"display": "omitted"`; this leaves thinking enabled and does not reduce its token charges.
 - Newer Claude models reject non-default `temperature`, `top_p`, and `top_k` values, so leave them unset.
 - `additional_beta_flags` and `betas` add beta flags to the request, as does an `anthropic-beta` header in "HTTP Extra Headers". iCode sends them all, after its own flags, in one `anthropic-beta` header. An `anthropic-beta` key in an `extra_headers` row replaces all of these flags, iCode's own included; iCode then adds only the flags the thinking settings need.
 - With fixed-budget thinking at Anthropic's own address, iCode adds the interleaved-thinking flag itself; see [Claude thinking settings](./models.md#claude-thinking-settings). At another address, add it yourself as in the table above. Adaptive thinking already interleaves and needs no flag. Interleaving depends on the exact model, and accepting a beta flag does not mean it takes effect.
@@ -155,6 +156,14 @@ Provider "DeepSeek (OpenAI)", API style "Chat Completions", with the default bas
 | Reasoning effort | `reasoning_effort` | `high` |
 
 The current API enables thinking by default and accepts `low`, `high`, or `max` effort. In thinking mode, `temperature`, `presence_penalty`, and `frequency_penalty` are ignored; `top_p` is effective only from 0.95 to 1.0. Older model IDs may have different capabilities.
+
+DeepSeek also supports the Responses API. Server-side `web_search` requires Responses and a `tools` row; see DeepSeek's documentation for supported models.
+
+| What you want | Key | Value |
+| --- | --- | --- |
+| Server-side web search (Responses) | `tools` | `[{"type": "web_search"}]` |
+
+The declaration makes the provider own the `web_search` name; if the agent also enables the local `web_search`, iCode turns the local tool off for that run and shows a notice. Provider-run search is not covered by iCode approval or network settings. You can also use the local `web_search` with DeepSeek's Search API; see [Configure web tools](./web-tools.md#deepseek-search-api).
 
 Documentation: [Thinking mode](https://api-docs.deepseek.com/guides/thinking_mode), [Context caching](https://api-docs.deepseek.com/guides/kv_cache), [API reference](https://api-docs.deepseek.com/api/create-chat-completion).
 

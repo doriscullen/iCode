@@ -4,17 +4,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
-import re
-from collections.abc import Callable
+import logging
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeGuard
 
-from rich.console import Group
+from rich.cells import cell_len
 from rich.text import Text
 from textual.containers import Horizontal
-from textual.geometry import Region
+from textual.css.query import NoMatches
+from textual.geometry import Region, Size
 from textual.message import Message
 from textual.reactive import reactive
 from textual.selection import Selection
@@ -25,9 +28,34 @@ from textual.widgets import Button, Static
 from chrys.app.tui.clipboard import copy_text_to_clipboards
 from chrys.app.tui.copy_messages import COPIED_TITLE
 from chrys.app.tui.i18n import render_str, widget_localizer
+from chrys.app.tui.support.gc_freeze import (
+    GcAbsorbReason,
+    GcAbsorbRequested,
+    GcReclaimReason,
+    GcReclaimRequested,
+    GcRemovedContent,
+    current_gc_freeze_epoch,
+)
+from chrys.app.tui.util.removal import remove_all_shielded, remove_shielded
+from chrys.app.tui.util.shimmer import FRAME_SECONDS
 from chrys.app.tui.util.source_text import sanitize_source_text
-from chrys.app.tui.widgets.chat.image_preview import ChatImagePreview, ImagePreviewGrid, extract_image_previews
+from chrys.app.tui.widgets.chat.fold_gap import FOLD_GAP_ROWS, FoldGap
+from chrys.app.tui.widgets.chat.fold_rows import (
+    AGENT_LABEL,
+    FOLDED_ARROW,
+    FOLDED_LABEL,
+    OPEN_ARROW,
+    THINKING_LABEL,
+    THOUGHT_LABEL,
+    text_preview,
+    text_tail,
+)
+from chrys.app.tui.widgets.chat.image_preview import extract_image_previews
+from chrys.app.tui.widgets.chat.image_view import TerminalImages
+from chrys.app.tui.widgets.chat.process_visibility import ProcessMember
+from chrys.app.tui.widgets.chat.transcript_panel import note_fold
 from chrys.app.tui.widgets.click_affordance import ClickAffordance
+from chrys.app.tui.widgets.loading import GatedAnimation
 from chrys.app.tui.widgets.markdown import VirtualizedMarkdown
 from chrys.app.tui.widgets.markdown.parser import create_user_text_markdown_parser
 from chrys.foundation.i18n import DisplayBlock, MessageRef, msg
@@ -35,10 +63,12 @@ from chrys.foundation.i18n.formatting import format_message
 from chrys.foundation.util.time import parse_created_at
 
 if TYPE_CHECKING:
-    from textual.app import ComposeResult
+    from textual.app import ComposeResult, RenderResult
+    from textual.await_complete import AwaitComplete
 
+    from chrys.foundation.models.invocations import ContentChannel
 
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 INTERRUPTED_ERROR_HEADER_MESSAGE = msg(
     "transcript.interrupted.error_header",
@@ -67,15 +97,21 @@ INTERRUPTED_CONTINUE_ACTION_MESSAGE = msg(
     fallback="Continue",
 )
 _AGENT_RESPONSE_COPIED = msg("tui.copy.agent_response", fallback="Copied agent response")
-_THINK_PREFIX = msg("tui.chat.think_prefix", fallback="Think: {body}", multiline=True)
 _AGENT_RESPONSE_COPY_TOOLTIP = msg(
     "tui.chat.copy_agent_response_tooltip",
     fallback="Copy raw agent response",
 )
 COPY_MESSAGE_BUTTON = msg("tui.chat.copy_message_button", fallback="copy")
+_STREAMED_BODY_INTERVAL_SECONDS = 0.2
+"""Shortest time between two markdown updates of a streaming message.
+
+Each one parses the whole text again, allocating a new parse, and once it adds
+a row lays out the whole transcript again: one per delta would keep a CPU core
+busy and the garbage collector behind it.
+"""
 _USER_MESSAGE_COPIED = msg("tui.copy.user_message", fallback="Copied your message")
 _USER_MESSAGE_COPY_TOOLTIP = msg("tui.chat.copy_user_message_tooltip", fallback="Copy your raw message")
-_AGENT_FALLBACK_LABEL = msg("tui.chat.agent_fallback_label", fallback="Agent")
+_THINKING_SUMMARY_LABEL = msg("tui.chat.thinking_summary_label", fallback="Thinking summary")
 _RETRY_MESSAGE = msg(
     "tui.chat.retry_message",
     fallback="{message} Retrying in {delay_seconds}s ({attempt}/{max_attempts})...",
@@ -115,58 +151,35 @@ def resolve_interrupted_message_copy(
     )
 
 
+def _aware_created_at(value: Any) -> datetime | None:
+    """A persisted message timestamp; one with no zone is UTC."""
+    dt = parse_created_at(value)
+    if dt is not None and (dt.tzinfo is None or dt.utcoffset() is None):
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
 def format_message_created_at(value: Any) -> str:
     """Format a persisted message timestamp in the user's local time."""
-    dt = parse_created_at(value)
+    dt = _aware_created_at(value)
     if dt is None:
         return ""
 
-    if dt.tzinfo is None or dt.utcoffset() is None:
-        dt = dt.replace(tzinfo=UTC)
     local = dt.astimezone()
     hour = local.hour % 12 or 12
     suffix = "AM" if local.hour < 12 else "PM"
     return f"- {hour}:{local.minute:02d} {suffix}"
 
 
-def strip_think(text: str) -> str:
-    """Remove ``<think>…</think>`` blocks entirely."""
-    return _THINK_RE.sub("", text).strip()
+def turn_duration_ms(started_at: Any, finished_at: Any) -> int | None:
+    """How long a turn took to its answer, in milliseconds: from when its pass began to when the answer finished.
 
-
-def think_to_italic(
-    text: str,
-    render_message: Callable[[MessageRef], str] = format_message,
-) -> str:
-    """Convert ``<think>…</think>`` blocks to italic markdown with a *Think:* prefix."""
-
-    def _repl(m: re.Match[str]) -> str:
-        inner = m.group(1).strip()
-        if not inner:
-            return ""
-        # Wrap each paragraph with * for italic.  A single * pair around a
-        # multi-paragraph block breaks in CommonMark, so wrap per paragraph.
-        parts: list[str] = []
-        for para in re.split(r"\n{2,}", inner):
-            stripped = para.strip()
-            if stripped:
-                parts.append(f"*{stripped}*")
-        body = "\n\n".join(parts)
-        return render_message(_THINK_PREFIX.bind(body=DisplayBlock(body)))
-
-    return _THINK_RE.sub(_repl, text).strip()
-
-
-def process_think_tags(
-    text: str,
-    *,
-    intermediate: bool = False,
-    render_message: Callable[[MessageRef], str] = format_message,
-) -> str:
-    """Process ``<think>`` tags: italic for intermediate messages, strip for final."""
-    if not text:
-        return text
-    return think_to_italic(text, render_message) if intermediate else strip_think(text)
+    None unless both are timestamps, in that order.
+    """
+    start, end = _aware_created_at(started_at), _aware_created_at(finished_at)
+    if start is None or end is None or end < start:
+        return None
+    return (end - start) // timedelta(milliseconds=1)
 
 
 def format_chat_copy_payload(messages: list[tuple[str, str]]) -> str:
@@ -174,11 +187,9 @@ def format_chat_copy_payload(messages: list[tuple[str, str]]) -> str:
     return "\n\n".join(f"[{name}]\n{text}" for name, text in messages)
 
 
-def _user_header_text(*, timestamp: str, is_injection: bool) -> Text:
+def _user_header_text(*, timestamp: str) -> Text:
     """The user message header: the ``You`` label and its timestamp."""
     header = Text()
-    if is_injection:
-        header.append("└ ", style="dim")
     header.append("\u276f You", style="bold cyan")
     if timestamp:
         header.append(f" {timestamp}", style="dim")
@@ -197,50 +208,14 @@ class _UserHeader(Static):
         return "[You]", "\n"
 
 
-class _UserImagePreview(Static):
-    """Non-selectable image-preview renderer for a user message."""
-
-    ALLOW_SELECT = False
+class _UserImagePreview(TerminalImages):
+    """The images a user message carries, one blank row below its text."""
 
     DEFAULT_CSS = """
     _UserImagePreview {
-        height: auto;
-        background: transparent;
+        padding-top: 1;
     }
     """
-
-    def __init__(self, image_previews: list[ChatImagePreview], *, is_injection: bool) -> None:
-        self._image_previews = image_previews
-        self._is_injection = is_injection
-        self._image_preview_lines: dict[tuple[int, str], list[Text]] = {}
-        super().__init__()
-
-    def render(self) -> Group:
-        max_width = self.content_size.width or self.size.width or 80
-        indent = "  " if self._is_injection else ""
-        return Group(Text(""), *self._render_image_preview_lines(max_width=max_width, indent=indent))
-
-    def _render_image_preview_lines(self, *, max_width: int, indent: str) -> list[Text]:
-        """Return cached image-preview render lines for the current message width."""
-        key = (max_width, indent)
-        lines = self._image_preview_lines.get(key)
-        if lines is None:
-            grid = ImagePreviewGrid(
-                self._image_previews,
-                max_width=max_width,
-                indent=indent,
-            )
-            lines = grid.render_lines()
-            self._image_preview_lines[key] = lines
-        return lines
-
-    def on_resize(self, _event: Any = None) -> None:
-        """Refresh image previews when terminal width changes."""
-        self.refresh()
-
-    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
-        _ = selection
-        return None
 
 
 class MessageHeaderRow(Horizontal):
@@ -257,6 +232,9 @@ class MessageHeaderRow(Horizontal):
         width: auto;
         height: 1;
         padding: 0 1 0 0;
+    }
+    MessageHeaderRow > .fold-row-header {
+        width: 1fr;
     }
     MessageHeaderRow > MessageCopyButton {
         display: none;
@@ -304,12 +282,17 @@ class UserMessage(Widget):
     """
 
     DEFAULT_CSS = """
+    /* A column short of the right edge: its background ends apart from the scrollbar. */
     UserMessage {
-        margin: 1 0;
+        margin: 1 1 1 0;
         padding: 0 1 0 1;
         border-left: thick $tui-border-user-message $border-opacity;
-        background: $boost;
+        background: $tui-user-message-background;
         height: auto;
+    }
+    /* The terminal owns an ANSI theme's background, which no tint can be worked out over. */
+    UserMessage:ansi {
+        background: $boost;
     }
     UserMessage.-compressed {
         border-left: thick $tui-border-neutral-160 $border-opacity;
@@ -327,24 +310,15 @@ class UserMessage(Widget):
         background: $tui-ansi-turn-background;
         border-left: thick $tui-border-neutral-128;
     }
-    /* An injected note never has a left border, selected or not: the :ansi twin
-       ties the selected rule's specificity and wins by coming after it. */
+    /* A note sent mid-turn looks like any user message, indented to the calls of the turn around it. */
     UserMessage.-injection {
-        margin-left: 2;
-        margin-top: 0;
-        border-left: none;
-    }
-    UserMessage.-injection:ansi {
-        border-left: none;
+        margin: 1 1 1 2;
     }
     UserMessage > VirtualizedMarkdown {
         padding: 0;
         height: auto;
         min-height: 1;
         background: transparent;
-    }
-    UserMessage.-injection > VirtualizedMarkdown {
-        padding: 0 0 0 2;
     }
     """
 
@@ -369,7 +343,7 @@ class UserMessage(Widget):
 
     def compose(self) -> ComposeResult:
         with MessageHeaderRow():
-            yield _UserHeader(_user_header_text(timestamp=self._ts, is_injection=self._is_injection))
+            yield _UserHeader(_user_header_text(timestamp=self._ts))
             copy_button = MessageCopyButton(
                 tooltip=self._render_message(_USER_MESSAGE_COPY_TOOLTIP.bind()),
                 text=self._render_message(COPY_MESSAGE_BUTTON.bind()),
@@ -381,7 +355,7 @@ class UserMessage(Widget):
             parser_factory=create_user_text_markdown_parser,
         )
         if self._image_previews:
-            yield _UserImagePreview(self._image_previews, is_injection=self._is_injection)
+            yield _UserImagePreview(self._image_previews)
 
     @property
     def text(self) -> str:
@@ -392,6 +366,11 @@ class UserMessage(Widget):
     def is_injection(self) -> bool:
         """Whether this user message is a mid-turn injection."""
         return self._is_injection
+
+    @property
+    def is_compressed(self) -> bool:
+        """Whether this message belongs to archived, compressed history."""
+        return self._compressed
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
         """User message content is copied by its header/body children."""
@@ -427,7 +406,7 @@ class UserMessage(Widget):
 
 
 class _AgentHeader(Static):
-    """Clickable header for AgentMessage — posts Clicked on click."""
+    """Clickable header of an AgentMessage or ThinkingMessage — posts Clicked on click."""
 
     class Clicked(Message):
         """Posted when the header is clicked."""
@@ -441,157 +420,328 @@ class _AgentHeader(Static):
         return f"[{self._copy_label}]", "\n"
 
     def on_click(self) -> None:
-        self.post_message(self.Clicked())
+        # A drag across the header ends in a click too; the text it selected stays, and nothing folds.
+        if self.screen.selections.get(self) is None:
+            self.post_message(self.Clicked())
 
 
-class AgentMessage(Widget):
-    """Agent message with markdown rendering and streaming support.
+class _ShownRow(NamedTuple):
+    """A fold row header's row as it paints."""
 
-    Uses VirtualizedMarkdown for rich rendering of agent responses including
-    code blocks, tables, lists, and other markdown elements.
-    Click the header to collapse/expand the message body.
+    label: str
+    """The label, as a selection copies it."""
+    head: str
+    """The arrow, then the label the row shows and what parts it from the preview."""
+    label_end: int
+    """Where the label shown in *head* ends; it starts after the arrow."""
+    preview: str
+
+
+_ROW_LABEL_START = len(OPEN_ARROW) + 1
+_MARQUEE_CATCH_UP_SECONDS = 0.5
+"""How far a running row trails the streamed text: the text that arrived in about this long."""
+_MARQUEE_MIN_CHARS_PER_SECOND = 24.0
+"""The slowest a running row moves while it trails the text, so the last words arrive soon."""
+_MARQUEE_MAX_STEP_SECONDS = 0.25
+"""The longest pause a running row makes up for at once, after a stall in painting."""
+
+
+class _FoldRowHeader(GatedAnimation, _AgentHeader):
+    """The header of thinking or text between tool calls: open, its label; folded, a sentence of the opening of its text.
+
+    Folded, the text follows the label and a colon (``Thought: …``), or stands alone where the row is the agent's
+    own words; it is cut to the row's width. The label takes the ``fold-row-header--label`` component's colour and
+    the text the ``--preview`` component's, which each kind of message sets, so its rows stand apart from others.
+
+    The row is worked out when it first paints after a fold, unfold or new label and kept until the next one: a
+    resize only cuts it again, and a language switch reaches it at its next fold, as it reaches other transcript
+    text, so what a selection's offsets index is always the row on screen. A thinking block folded inside a
+    hidden activity section never reads its preview.
+
+    Folded while its text streams, the row runs the newest of the text along it instead, coming in from the right
+    at the pace the text arrives, smoothed between the bursts it arrives in. Its refresh timer starts the first
+    time it runs, so a row that never does keeps none.
     """
 
-    DEFAULT_CSS = """
-    AgentMessage {
-        margin: 1 0;
-        padding: 0 0 0 1;
-        border-left: thick $tui-border-agent-message $border-opacity;
-        height: auto;
-    }
-    AgentMessage.--intermediate {
-        border-left: thick $tui-border-neutral-gray $border-opacity;
-        color: $text-muted;
-    }
-    AgentMessage.--intermediate > VirtualizedMarkdown {
-        color: $text-muted;
-    }
-    AgentMessage.--compressed {
-        border-left: thick $tui-border-neutral-100 $border-opacity;
-        color: $text-muted;
-    }
-    AgentMessage.--compressed > VirtualizedMarkdown {
-        color: $text-muted;
-    }
-    AgentMessage.--structured-completion > VirtualizedMarkdown {
-        color: $success;
-    }
-    AgentMessage > VirtualizedMarkdown {
-        padding: 0;
-        height: auto;
-        min-height: 1;
-        background: transparent;
-    }
-    AgentMessage > .agent-cursor {
-        height: 1;
-        padding: 0 1;
-    }
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"fold-row-header--label", "fold-row-header--preview"}
+    _animating = False
+
+    def __init__(
+        self, label: MessageRef, *, collapsed: bool, text: str, folded_label: bool = True, streaming: bool = False
+    ) -> None:
+        self._label = label
+        self._folded_label = folded_label
+        """Whether the folded row names its label before the text."""
+        self._collapsed = collapsed
+        self._text = text
+        self._streaming = streaming
+        """Whether the text still streams; never ``_running``, which is MessagePump's own state."""
+        self._marquee_end = 0.0
+        """How far into the text a running row has got, in characters: a row folded as it streamed starts at 0."""
+        self._marquee_at: float | None = None
+        """When the running row last moved (``time.monotonic()``); None until it first paints."""
+        self._marquee_shown = ""
+        """The text a running row last painted after its label, as a selection copies it."""
+        self._preview_source: str | None = None
+        self._preview = ""
+        self._row: _ShownRow | None = None
+        """The row as it last painted; None until it next paints."""
+        super().__init__("", Text())
+        # Not mounted yet: mounting styles it.
+        self.add_class("fold-row-header", update=False)
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Copy the label as a transcript label, and from a folded row the preview text the selection covers.
+
+        Offsets are characters of the row; a selection running on past the row copies the whole preview,
+        past where the row cuts it.
+        """
+        label, head, _, preview = self._shown_row()
+        if self._runs:
+            preview = self._marquee_shown
+        if not preview:
+            return f"[{label}]", "\n"
+        start = 0 if selection.start is None else selection.start.x
+        end = None if selection.end is None else selection.end.x
+        covered = (head + preview)[max(start, len(head)) : end]
+        copied = " ".join(part for part in (f"[{label}]" if start < len(head) else "", covered) if part)
+        return copied, "\n"
+
+    def show(self, *, collapsed: bool, text: str, label: MessageRef | None = None, streaming: bool = False) -> None:
+        """Show the folded row for *text*, or the open header, under *label* when given; one row, so no layout.
+
+        Folded while *streaming*, the row runs the newest of the text.
+        """
+        relabelled = label is not None and label != self._label
+        reshaped = relabelled or collapsed != self._collapsed or streaming != self._streaming
+        if not (reshaped or (collapsed and text is not self._text)):
+            return
+        if collapsed and streaming and not self._runs:
+            # Folded as it streams: the row goes on from the newest text, not from its start.
+            self._marquee_end, self._marquee_at = float(len(text)), None
+        if label is not None:
+            self._label = label
+        self._collapsed, self._text, self._streaming = collapsed, text, streaming
+        if reshaped or not self._runs:
+            # A running row reads the newest text as it paints.
+            self._row = None
+        self._sync_marquee()
+        self.refresh(layout=False)
+
+    @property
+    def _runs(self) -> bool:
+        """Whether the row runs the streamed text along it."""
+        return self._collapsed and self._streaming and self._folded_label
+
+    def on_mount(self) -> None:
+        if self._runs:
+            # Mounted folded as its text streams; ``is_mounted`` reads True only once the mount handlers return.
+            self.auto_refresh = FRAME_SECONDS
+        self._sync_marquee()
+
+    def _sync_marquee(self) -> None:
+        if not self._runs:
+            self.pause_animation()
+            return
+        if self._auto_refresh_timer is None and self.is_mounted:
+            self.auto_refresh = FRAME_SECONDS
+        self.resume_animation()
+
+    def _advance_marquee(self) -> int:
+        """How far into the text the running row reaches as it paints now, in characters."""
+        end = len(self._text)
+        now = time.monotonic()
+        if self.app.animation_level == "none":
+            self._marquee_end = float(end)
+        elif self._marquee_end < end and self._marquee_at is not None:
+            behind = end - self._marquee_end
+            speed = max(behind / _MARQUEE_CATCH_UP_SECONDS, _MARQUEE_MIN_CHARS_PER_SECOND)
+            step = speed * min(now - self._marquee_at, _MARQUEE_MAX_STEP_SECONDS)
+            self._marquee_end = min(self._marquee_end + step, float(end))
+        self._marquee_at = now
+        return int(self._marquee_end)
+
+    def _shown_row(self) -> _ShownRow:
+        if self._row is not None:
+            return self._row
+        localizer = widget_localizer(self)
+        label = render_str(localizer, self._label)
+        if self._runs:
+            # The text after the label is the newest of it as the row paints.
+            shown = render_str(localizer, FOLDED_LABEL.bind(label=label))
+            self._row = _ShownRow(label, f"{FOLDED_ARROW} {shown}", _ROW_LABEL_START + len(shown.rstrip()), "")
+            return self._row
+        if self._collapsed and self._preview_source is not self._text:
+            self._preview_source = self._text
+            self._preview = text_preview(self._text)
+        if not self._collapsed or not self._preview:
+            arrow = FOLDED_ARROW if self._collapsed else OPEN_ARROW
+            self._row = _ShownRow(label, f"{arrow} {label}", _ROW_LABEL_START + len(label), "")
+        elif self._folded_label:
+            shown = render_str(localizer, FOLDED_LABEL.bind(label=label))
+            label_end = _ROW_LABEL_START + len(shown.rstrip())
+            self._row = _ShownRow(label, f"{FOLDED_ARROW} {shown}", label_end, self._preview)
+        else:
+            self._row = _ShownRow(label, f"{FOLDED_ARROW} ", _ROW_LABEL_START, self._preview)
+        return self._row
+
+    def render(self) -> Text:
+        row = self._shown_row()
+        width = self.content_size.width
+        preview = row.preview
+        if self._runs:
+            preview = text_tail(self._text, self._advance_marquee(), max(width - cell_len(row.head), 0))
+            self._marquee_shown = preview
+        text = Text(row.head + preview)
+        text.stylize(self.text_style_of("fold-row-header--label"), _ROW_LABEL_START, row.label_end)
+        if preview:
+            text.stylize(self.text_style_of("fold-row-header--preview"), len(row.head))
+        if width:
+            text.truncate(width, overflow="ellipsis")
+        return text
+
+
+class _AgentReplyHeader(_FoldRowHeader):
+    """An agent message's header: the reply's own header, or a fold row once its text sits between tool calls.
+
+    Folded, that row is the agent's own words, with no label before them.
+    """
+
+    def __init__(self, copy_label: str, reply: Text | None, *, collapsed: bool, text: str) -> None:
+        super().__init__(AGENT_LABEL.bind(), collapsed=collapsed, text=text, folded_label=False)
+        self._copy_label = copy_label
+        self._reply = reply
+        """The reply header shown, or None for the fold row."""
+        self.set_class(reply is None, "fold-row-header", update=False)
+
+    def show_reply(self, reply: Text) -> None:
+        """Show *reply* as the reply's header; one row, so no layout."""
+        self._reply = reply
+        self.refresh(layout=False)
+
+    def show(self, *, collapsed: bool, text: str, label: MessageRef | None = None, streaming: bool = False) -> None:
+        if self._reply is not None:
+            # The text turned out to sit between tool calls: the row takes the header's width, cut to it.
+            self._reply = None
+            self._collapsed = collapsed
+            self._text = text
+            self._row = None
+            self.add_class("fold-row-header")
+            self.refresh()
+            return
+        super().show(collapsed=collapsed, text=text, label=label, streaming=streaming)
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        if self._reply is not None:
+            return f"[{self._copy_label}]", "\n"
+        return super().get_selection(selection)
+
+    def render(self) -> Text:
+        return super().render() if self._reply is None else self._reply
+
+
+class StreamedMarkdownMessage(FoldGap, ProcessMember):
+    """A transcript message whose markdown body can stream in.
+
+    Holds what streaming needs and what keeps it cheap: the body catches up at
+    most every ``_STREAMED_BODY_INTERVAL_SECONDS`` and a height change lays the
+    transcript out once. A subclass composes the header
+    and the body (:meth:`_new_body`) and reacts through :meth:`_refresh_header`
+    and :meth:`_on_final`; one whose body waits for it to open
+    (:meth:`_builds_body_on_opening`) hands a folded body no text and builds
+    its body the first time it opens.
     """
 
     collapsed: reactive[bool] = reactive(False)
 
-    def __init__(
-        self,
-        text: str = "",
-        is_final: bool = True,
-        profile_name: str = "",
-        is_intermediate: bool = False,
-        is_compressed: bool = False,
-        is_structured_completion: bool = False,
-        timestamp: str = "",
-        duration_ms: int | None = None,
-    ) -> None:
+    def __init__(self, text: str = "", *, is_final: bool = True, classes: str = "") -> None:
         self._source_text = text
-        self._processed_text = process_think_tags(text, intermediate=is_intermediate)
-        self._processed_text_stale = False
-        """``_source_text`` changed since ``_processed_text`` was derived; ``text`` re-derives it."""
         self._body_stale = False
         """The markdown body has not been handed the latest streamed text."""
         self._body_sync_scheduled = False
         """A callback that brings the markdown body up to date is queued on this widget."""
+        self._body_synced_at = float("-inf")
+        """When the markdown body was last handed new text (``time.monotonic()``)."""
+        self._measured_rows: tuple[int, int] | None = None
+        """The rows it was last measured at, as (content width, rows); None until measured."""
         self._is_final = is_final
-        self._profile_name = profile_name
-        self._is_intermediate = is_intermediate
-        self._is_compressed = is_compressed
-        self._is_structured_completion = is_structured_completion
-        self._ts = timestamp
-        self._duration_ms = duration_ms
         self._md_widget: VirtualizedMarkdown | None = None
-        self._background_strip_cache_key: tuple[int, int, int, str, str, int] | None = None
+        self._body_freeze_epoch: int | None = None
+        self._absorb_after_parse = False
+        """The body was handed its text on opening: that parse is stable content the GC freeze can take."""
+        self._body_structure_lock = asyncio.Lock()
+        self._body_parse: AwaitComplete | None = None
+        """The body's parse of the text it was last handed: it installs that text or newer."""
+        self._background_strip_cache_key: tuple[int, int, int, str, str, int, int] | None = None
         self._background_strip_cache: Strip | None = None
-        cls = ""
-        if is_intermediate:
-            cls = "--intermediate"
-        elif is_compressed:
-            cls = "--compressed"
-        elif is_structured_completion:
-            cls = "--structured-completion"
-        super().__init__(classes=cls)
+        super().__init__(classes=classes)
 
     @property
     def text(self) -> str:
-        """The response text with think blocks processed, as of the latest ``stream_update()``."""
-        if self._processed_text_stale:
-            self._processed_text = process_think_tags(self._source_text)
-            self._processed_text_stale = False
-        return self._processed_text
+        """The message text as of the latest ``stream_update()``."""
+        return self._source_text.strip()
 
     @property
-    def profile_name(self) -> str:
-        """The name of the agent that wrote this message; empty when none was given."""
-        return self._profile_name
+    def foldable(self) -> bool:
+        """Whether it folds to a one-row header with its turn, or on its own fold: never an answer."""
+        return False
 
-    def _header_text(self) -> Text:
-        label = self._copy_label()
-        arrow = "\u25b6" if self.collapsed else "\u25c7"
-        t = Text.assemble((f"{arrow} {label}", "bold green"))
-        if self._ts:
-            t.append(f" {self._ts}", style="dim")
-        if self._duration_ms is not None:
-            t.append(f" ({_format_duration_ms(self._duration_ms)})", style="dim")
-        return t
+    def render(self) -> RenderResult:
+        # Its header and body cover the rest: only its gap shows its own content.
+        return self.gap_text() if self.gap_above else super().render()
 
-    def _copy_label(self) -> str:
-        return self._profile_name or self._render_message(_AGENT_FALLBACK_LABEL.bind())
+    def _builds_body_on_opening(self) -> bool:
+        """Whether its body waits for it to open: built folded, it composes none, and a folded body is handed no text.
 
-    def _render_message(self, reference: MessageRef) -> str:
-        return render_str(widget_localizer(self), reference)
+        Opening builds the body from the newest text, or hands the one it kept that text. A hidden body handed text
+        would parse it, and lay the transcript out, for nothing.
+        """
+        return False
 
-    def compose(self) -> ComposeResult:
-        if self._is_intermediate:
-            self._processed_text = process_think_tags(
-                self._source_text,
-                intermediate=True,
-                render_message=self._render_message,
-            )
-            self._processed_text_stale = False
-        with MessageHeaderRow():
-            yield _AgentHeader(self._copy_label(), self._header_text())
-            copy_button = MessageCopyButton(
-                tooltip=self._render_message(_AGENT_RESPONSE_COPY_TOOLTIP.bind()),
-                text=self._render_message(COPY_MESSAGE_BUTTON.bind()),
-            )
-            copy_button.display = self._should_show_copy_button()
-            yield copy_button
+    def _releases_body_on_folding(self) -> bool:
+        """Whether, its body waiting for it to open, the body goes as it folds; removing it lays the transcript out."""
+        return False
+
+    def _shows_body(self) -> bool:
+        """Whether it shows its body: open, and, a body built or handed its text on opening, once that text shows.
+
+        Until then it ends folded: the row under it keeps its gap, and the transcript its height, until the body
+        takes their place.
+        """
+        body = self._md_widget
+        return not self.collapsed and body is not None and body.display
+
+    def _new_body(self) -> VirtualizedMarkdown:
+        """The markdown body, built from the current text, for :meth:`compose`."""
+        self._body_freeze_epoch = current_gc_freeze_epoch()
         self._md_widget = VirtualizedMarkdown(self.text)
+        self._body_parse = None
         # The body starts from the current text, so a queued sync has nothing to hand it.
         self._body_stale = False
-        yield self._md_widget
-        if not self._is_final:
-            yield Static(Text(" \u258d", style="bold green"), classes="agent-cursor")
+        return self._md_widget
+
+    def _refresh_header(self) -> None:
+        """Show the header as the message's state now reads (collapsed, timestamp)."""
+
+    def _on_final(self) -> None:
+        """A ``stream_update()`` made the text final and handed it to the body, whose parse may still be running.
+
+        Not called for a message built with its final text.
+        """
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
-        """Agent content is copied by its header/body children."""
+        """Message content is copied by its header/body children."""
         return None
 
     def render_lines(self, crop: Region) -> list[Strip]:
         """Render the repeated message chrome without per-row style work.
 
-        AgentMessage only paints a left border, padding, and transparent
+        The message only paints a left border, padding, and transparent
         background; child widgets render the header/body text. Every row of
         that chrome is identical, so a clipped parent scroll can reuse one
         strip instead of asking Textual's generic style renderer to rebuild
-        it for each visible markdown row.
+        it for each visible markdown row. Only its gap, when it shows one,
+        draws a guide of its own above them.
         """
         if not self.is_attached:
             return [Strip.blank(crop.width) for _ in crop.line_range]
@@ -601,6 +751,7 @@ class AgentMessage(Widget):
         if not self._can_reuse_chrome_strip():
             return super().render_lines(crop)
 
+        gap = FOLD_GAP_ROWS if self.gap_above else 0
         cache_key = (
             crop.x,
             crop.width,
@@ -611,16 +762,21 @@ class AgentMessage(Widget):
             # to Textual's current style invalidation model and covered by TUI
             # render-cache tests.
             self.styles._cache_key,
+            gap,
         )
         cached = self._background_strip_cache
         if cached is None or cache_key != self._background_strip_cache_key:
-            cached = Widget.render_lines(self, Region(crop.x, 0, crop.width, 1))[0]
+            cached = Widget.render_lines(self, Region(crop.x, gap, crop.width, 1))[0]
             self._background_strip_cache = cached
             self._background_strip_cache_key = cache_key
-        return [cached] * crop.height
+        lines = [cached] * crop.height
+        if crop.y < gap:
+            gap_lines = Widget.render_lines(self, Region(crop.x, crop.y, crop.width, min(gap, crop.bottom) - crop.y))
+            lines[: len(gap_lines)] = gap_lines
+        return lines
 
     def _can_reuse_chrome_strip(self) -> bool:
-        """Return true when every AgentMessage chrome row is visually identical."""
+        """Return true when every message chrome row is visually identical."""
         styles = self.styles
         if styles.gutter.height or self._border_title is not None or self._border_subtitle is not None:
             return False
@@ -642,22 +798,392 @@ class AgentMessage(Widget):
         super().notify_style_update()
 
     def watch_collapsed(self, collapsed: bool) -> None:
-        if self._md_widget is not None:
-            self._md_widget.display = not collapsed
-        with contextlib.suppress(Exception):
-            self.query_one(_AgentHeader).update(self._header_text())
+        if collapsed:
+            note_fold(self)
+        body = self._md_widget
+        if body is not None:
+            # A body kept folded and not handed the newest text shows once it shows that text (_sync_folded_body):
+            # shown at once, it would show the text it had for a frame and jump to the newest one's rows in the next.
+            body.display = not collapsed and not (self._builds_body_on_opening() and body.shown_source != self.text)
+        self._refresh_header()
+        if self._builds_body_on_opening() and (not collapsed or self._releases_body_on_folding()):
+            # Once it is mounted: a message folded before then has no body to build or release yet.
+            self.call_later(self._start_folded_body_sync)
+
+    def _start_folded_body_sync(self) -> None:
+        """Run :meth:`_sync_folded_body` beside this message's pump, not on it.
+
+        It waits for the body's parse as the body mounts or takes the newest text: on the pump, the messages the
+        message handles would wait too, its removal among them.
+        """
+        self.run_worker(self._sync_folded_body, group="folded-body")
+
+    def stream_update(self, text: str, is_final: bool = False) -> None:
+        """Update the message text (for streaming).
+
+        A non-final update only records the newest text: the markdown body
+        catches up at most every ``_STREAMED_BODY_INTERVAL_SECONDS``, so a
+        stream of deltas costs one markdown update per interval instead of one
+        per delta, while ``text`` always reads the newest text. A final update
+        hands the body its text at once, before the style and :meth:`_on_final` change.
+        """
+        self._source_text = text
+        self._body_stale = True
+        self._is_final = is_final
+        if is_final:
+            self._sync_body()
+            self.remove_class("--streaming")
+            self._on_final()
+        elif not self._body_sync_scheduled and self._body_takes_text():
+            delay = self._body_synced_at + _STREAMED_BODY_INTERVAL_SECONDS - time.monotonic()
+            if delay > 0:
+                self.set_timer(delay, self._run_scheduled_body_sync)
+                self._body_sync_scheduled = True
+                return
+            self._body_sync_scheduled = self.call_later(self._run_scheduled_body_sync)
+            if not self._body_sync_scheduled:
+                # The message pump is closing and refused the callback.
+                self._sync_body()
+
+    def append_text(self, text: str) -> None:
+        """Stream *text* onto the end of this message."""
+        self.stream_update(self._source_text + text)
+
+    def _run_scheduled_body_sync(self) -> None:
+        self._body_sync_scheduled = False
+        self._sync_body()
+
+    def _body_takes_text(self) -> bool:
+        """Whether there is a body to hand new text: a folded one that waits for the message to open is handed none."""
+        return self._md_widget is not None and not (self.collapsed and self._builds_body_on_opening())
+
+    def _sync_body(self) -> None:
+        """Hand the markdown body the current text if it has not seen it yet."""
+        body = self._md_widget
+        if not self._body_stale or body is None or not self._body_takes_text():
+            return
+        self._body_stale = False
+        self._body_synced_at = time.monotonic()
+        self._body_parse = body.update(self.text)
+
+    async def _sync_folded_body(self) -> None:
+        """Bring the body to the latest requested open state: release it folded, if it goes; build or update it open.
+
+        A body opened before it shows the newest text, one it builds included, stays hidden until the parse of that
+        text installs, or fails and leaves the text it showed.
+        """
+        async with self._body_structure_lock:
+            if not self.is_mounted or self._closing or self._pruning or not self.app.is_running:
+                return
+            body = self._md_widget
+            if self.collapsed and body is not None and self._releases_body_on_folding():
+                epoch = self._body_freeze_epoch
+                removed = (
+                    GcRemovedContent.watch(built_at_epoch=epoch, nodes=body.walk_children(with_self=True))
+                    if epoch is not None and epoch == current_gc_freeze_epoch()
+                    else None
+                )
+                self._absorb_after_parse = False
+                with self.app.batch_update():
+                    if self.app.focused in body.walk_children(with_self=True):
+                        self.screen.set_focus(None, scroll_visible=False)
+                    try:
+                        await remove_shielded(body)
+                    finally:
+                        self._md_widget = None
+                        self._body_parse = None
+                        self._body_freeze_epoch = None
+                        self._clear_arrangement_cache()
+                        _ = self.displayed_children
+                self.post_message(
+                    GcReclaimRequested(GcReclaimReason.STABLE_CONTENT_REMOVED, prompt=False, removed=removed)
+                )
+            if self.collapsed or self._closing or self._pruning:
+                return
+            body = self._md_widget
+            if body is None:
+                # Built empty and handed the text once mounted: built with it, its mount would wait for the text's
+                # parse, and so would its removal. Until then it is no body to hand streamed text to.
+                epoch = current_gc_freeze_epoch()
+                body = VirtualizedMarkdown("")
+                body.display = False
+                await self.mount(body)
+                self._md_widget = body
+                self._body_freeze_epoch = epoch
+                self._body_stale = True
+                if self.collapsed or self._closing or self._pruning:
+                    return
+            elif body.display or body.shown_source == self.text:
+                body.display = True
+                if body.source == self.text:
+                    # Handed the newest text already: handing it again would parse it again for nothing.
+                    self._body_stale = False
+                else:
+                    # The text it was not handed while folded; its parse of final text is stable content, as below.
+                    self._absorb_after_parse = self._is_final
+                    self._sync_body()
+                return
+            self._body_stale = False
+            # Built or kept, its parse is stable content the GC freeze can take; text that still streams is not.
+            self._absorb_after_parse = self._is_final
+            if body.source == self.text and self._body_parse is not None and not self._body_parse.is_done:
+                # Handed the newest text already, as it streamed: that parse's end says when the body shows it. Handed
+                # again, the body would parse it again and replace the blocks the GC absorb went to. A parse that
+                # ended without showing it failed: the text is handed again.
+                installed = self._body_parse
+            else:
+                self._body_synced_at = time.monotonic()
+                installed = self._body_parse = body.update(self.text)
+        try:
+            await installed
+            # Its final text, handed as that parse ran (a final update is handed at once), is the text it shows with.
+            while (
+                self._is_final
+                and self._body_parse is not None
+                and self._body_parse is not installed
+                and self._md_widget is body
+                and not self.collapsed
+            ):
+                installed = self._body_parse
+                await installed
+        except Exception:
+            # It shows the text it had: better than none.
+            logger.warning("Parsing an opened message's text failed", exc_info=True)
+        if self._md_widget is body and not self.collapsed:
+            body.display = True
+
+    def on_virtualized_markdown_table_of_contents_updated(
+        self, event: VirtualizedMarkdown.TableOfContentsUpdated
+    ) -> None:
+        """The body installed a parse, as it announces after each: one of the text handed on opening is stable content."""
+        if self._absorb_after_parse and event.markdown is self._md_widget and event.markdown.shown_source == self.text:
+            self._absorb_after_parse = False
+            self.post_message(GcAbsorbRequested(GcAbsorbReason.STABLE_CONTENT_MOUNTED))
+
+    def _content_rows(self, container: Size, viewport: Size, width: int) -> int:
+        """Rows it gives up go in the layout that measures it, as a fold's do.
+
+        Until its closing markup arrives, a ``**`` or a link's URL can wrap a
+        line that then fits again. Noted as a fold, the shrink shows in the
+        panel's arrangement measuring it; a view that follows the bottom would
+        otherwise hold it a frame, in case the rows came back, and show the row
+        blank under the transcript's last line. The gap below it is not its
+        text's: it goes as an entry comes below it, whose rows the view then
+        follows down.
+        """
+        height = super()._content_rows(container, viewport, width)
+        measured = self._measured_rows
+        self._measured_rows = (width, height)
+        if measured is not None and measured[0] == width and height < measured[1]:
+            note_fold(self)
+        return height
+
+    def _size_updated(self, size: Size, virtual_size: Size, container_size: Size, layout: bool = True) -> bool:
+        # Textual sets a changed virtual size as a reactive that asks for another
+        # layout, but the layout calling this has placed the message already and a
+        # message shows no scrollbar: each row streamed text adds would lay the
+        # whole transcript out twice.
+        return super()._size_updated(size, virtual_size, container_size, layout=False)
+
+
+class AgentMessage(StreamedMarkdownMessage):
+    """Agent message with markdown rendering and streaming support.
+
+    Uses VirtualizedMarkdown for rich rendering of agent responses including
+    code blocks, tables, lists, and other markdown elements.
+    Click the header to collapse/expand the message body.
+    """
+
+    DEFAULT_CSS = """
+    AgentMessage {
+        margin: 1 0;
+        padding: 0 0 0 1;
+        border-left: thick $tui-border-agent-message $border-opacity;
+        height: auto;
+    }
+    AgentMessage.--intermediate, AgentMessage.--streaming {
+        border-left: thick $tui-border-neutral-gray $border-opacity;
+        color: $text-muted;
+    }
+    /* Text between tool calls, as thinking and tool groups: its guide meets theirs, a blank row below it. While it
+       streams, it keeps an answer's spacing, so an answer it turns out to be does not move as it ends. */
+    AgentMessage.--intermediate {
+        margin: 0;
+        border-left: solid $tui-border-neutral-gray $border-opacity;
+    }
+    AgentMessage.--intermediate > VirtualizedMarkdown, AgentMessage.--streaming > VirtualizedMarkdown {
+        color: $text-muted;
+    }
+    /* Open, as an open thinking body: its own guide under the header's fold arrow, its text two columns in from
+       the label, and a blank row under it, as under an open tool group's calls. The guide is the body's, so the
+       message keeps no vertical gutter and its chrome rows stay one shared strip. An answer's text stays under
+       its arrow. */
+    AgentMessage.--intermediate > VirtualizedMarkdown {
+        padding: 0 0 1 3;
+        border-left: solid $tui-border-neutral-gray $border-opacity;
+    }
+    /* Each kind of fold row its own colour: open, the label is the agent's green; folded, its words read bright,
+       as the agent's own, among muted thinking and tool rows. */
+    AgentMessage .fold-row-header > .fold-row-header--label {
+        color: $text-success;
+    }
+    AgentMessage .fold-row-header > .fold-row-header--preview {
+        color: $text;
+    }
+    AgentMessage.--compressed {
+        border-left: thick $tui-border-neutral-100 $border-opacity;
+        color: $text-muted;
+    }
+    AgentMessage.--compressed > VirtualizedMarkdown {
+        color: $text-muted;
+    }
+    AgentMessage.--structured-completion > VirtualizedMarkdown {
+        color: $success;
+    }
+    AgentMessage > VirtualizedMarkdown {
+        padding: 0;
+        height: auto;
+        min-height: 1;
+        background: transparent;
+        /* Sized by its text, the body never scrolls. While streamed text grows
+           past the height of the last arrange, a scrollbar would narrow it for
+           a frame and shift its code blocks' right edge. */
+        overflow-y: hidden;
+    }
+    """
+
+    @property
+    def is_process_final(self) -> bool:
+        """A visible answer to keep outside a successful turn's process."""
+        return (
+            self._is_final
+            and not self._is_intermediate
+            and not self._is_structured_completion
+            and not self.is_status
+            and bool(self.text)
+        )
+
+    def __init__(
+        self,
+        text: str = "",
+        is_final: bool = True,
+        profile_name: str = "",
+        is_intermediate: bool = False,
+        is_compressed: bool = False,
+        is_structured_completion: bool = False,
+        timestamp: str = "",
+        duration_ms: int | None = None,
+        segment_ids: Iterable[str] = (),
+        is_status: bool = False,
+        collapsed: bool = False,
+    ) -> None:
+        self.is_status = is_status
+        """Persisted lifecycle prose is not an agent's successful final answer."""
+        self.segment_ids = frozenset(segment_ids)
+        """The content segments whose answer text this message shows, for a bare Continue to withdraw."""
+        self._profile_name = profile_name
+        self._is_intermediate = is_intermediate
+        self._is_compressed = is_compressed
+        self._is_structured_completion = is_structured_completion
+        self._ts = timestamp
+        self._duration_ms = duration_ms
+        cls = ""
+        if is_intermediate:
+            cls = "--intermediate"
+        elif is_compressed:
+            cls = "--compressed"
+        elif is_structured_completion:
+            cls = "--structured-completion"
+        if not is_final:
+            # Muted until the text is known to be the answer, not text before tool calls.
+            cls = f"{cls} --streaming".strip()
+        super().__init__(text, is_final=is_final, classes=cls)
+        if collapsed and self.foldable:
+            # Built complete between tool calls, as the main chat's replay builds it: folded to its row, as replayed
+            # thinking. Before mount, and without the watcher.
+            self.set_reactive(StreamedMarkdownMessage.collapsed, True)
+
+    @property
+    def foldable(self) -> bool:
+        """Text between tool calls folds once complete; an answer never folds with its turn."""
+        return self._is_final and self._is_intermediate
+
+    def takes_fold_gap(self) -> bool:
+        # An answer keeps its margins instead.
+        return self._is_intermediate
+
+    def ends_folded(self) -> bool:
+        return self._is_intermediate and not self._shows_body()
+
+    def _builds_body_on_opening(self) -> bool:
+        # Text between tool calls, as thinking; an answer folded by hand keeps its body up to date. Folded as the turn
+        # goes on past it, the body it streamed in stays: removing it would lay the transcript out once more.
+        return self._is_intermediate
+
+    @property
+    def profile_name(self) -> str:
+        """The name of the agent that wrote this message; empty when none was given."""
+        return self._profile_name
+
+    def _header_text(self) -> Text:
+        label = self._copy_label()
+        arrow = FOLDED_ARROW if self.collapsed else OPEN_ARROW
+        t = Text.assemble((f"{arrow} {label}", "bold green"))
+        if self._ts:
+            t.append(f" {self._ts}", style="dim")
+        if self._duration_ms is not None:
+            t.append(f" ({_format_duration_ms(self._duration_ms)})", style="dim")
+        return t
+
+    def _copy_label(self) -> str:
+        return self._profile_name or self._render_message(AGENT_LABEL.bind())
+
+    def _render_message(self, reference: MessageRef) -> str:
+        return render_str(widget_localizer(self), reference)
+
+    def compose(self) -> ComposeResult:
+        with MessageHeaderRow():
+            yield _AgentReplyHeader(
+                self._copy_label(),
+                None if self._is_intermediate else self._header_text(),
+                collapsed=self.collapsed,
+                text=self._source_text,
+            )
+            copy_button = MessageCopyButton(
+                tooltip=self._render_message(_AGENT_RESPONSE_COPY_TOOLTIP.bind()),
+                text=self._render_message(COPY_MESSAGE_BUTTON.bind()),
+            )
+            copy_button.display = self._should_show_copy_button()
+            yield copy_button
+        if not (self.collapsed and self._builds_body_on_opening()):
+            body = self._new_body()
+            body.display = not self.collapsed
+            yield body
+
+    def _refresh_header(self) -> None:
+        with contextlib.suppress(NoMatches):
+            header = self.query_one(_AgentReplyHeader)
+            if self._is_intermediate:
+                header.show(collapsed=self.collapsed, text=self._source_text)
+            else:
+                header.show_reply(self._header_text())
+
+    def _on_final(self) -> None:
+        self._show_copy_button_if_ready()
 
     def on__agent_header_clicked(self) -> None:
         if self._is_final:
             self.collapsed = not self.collapsed
 
-    def set_timestamp(self, timestamp: str) -> None:
-        """Update the header timestamp."""
-        if not timestamp or timestamp == self._ts:
+    def set_timestamp(self, timestamp: str, *, duration_ms: int | None = None) -> None:
+        """Update the header timestamp, and how long the turn took to this answer (*duration_ms*) when given."""
+        timestamp = timestamp or self._ts
+        duration_ms = self._duration_ms if duration_ms is None else duration_ms
+        if (timestamp, duration_ms) == (self._ts, self._duration_ms):
             return
         self._ts = timestamp
-        with contextlib.suppress(Exception):
-            self.query_one(_AgentHeader).update(self._header_text())
+        self._duration_ms = duration_ms
+        self._refresh_header()
 
     def _should_show_copy_button(self) -> bool:
         """Return true when this widget represents a final raw agent response."""
@@ -700,47 +1226,151 @@ class AgentMessage(Widget):
             return
         self.copy_agent_response()
 
-    def stream_update(self, text: str, is_final: bool = False, *, timestamp: str = "") -> None:
-        """Update the message text (for streaming).
+    def stream_update(
+        self, text: str, is_final: bool = False, *, timestamp: str = "", duration_ms: int | None = None
+    ) -> None:
+        """Update the message text (for streaming); a *timestamp* and *duration_ms* go in the header first."""
+        self.set_timestamp(timestamp, duration_ms=duration_ms)
+        super().stream_update(text, is_final)
 
-        The main turn replays its buffered answer as a synchronous burst of
-        cumulative updates, one per line. A non-final update only records the
-        newest text: the markdown body catches up once per message-loop turn,
-        so a burst costs one think-tag pass and one markdown update instead of
-        one per line, while ``text`` always reads the newest text. A final
-        update hands the body its text before the cursor and copy button change.
+    def settle_intermediate(self, *, folded: bool = False) -> None:
+        """End streaming as text the agent wrote between tool calls: muted, under a fold row header, no copy button.
+
+        *folded*, it folds to its row first: its body parses the final text only if it opens.
         """
-        self._source_text = text
-        self._processed_text_stale = True
-        self._body_stale = True
-        self._is_final = is_final
-        if timestamp:
-            self.set_timestamp(timestamp)
-        if is_final:
-            self._sync_body()
-            try:
-                cursor = self.query_one(".agent-cursor")
-                cursor.remove()
-            except Exception:
-                pass
-            self._show_copy_button_if_ready()
-        elif not self._body_sync_scheduled:
-            self._body_sync_scheduled = self.call_later(self._run_scheduled_body_sync)
-            if not self._body_sync_scheduled:
-                # The message pump is closing and refused the callback.
-                self._sync_body()
+        self._is_intermediate = True
+        self.add_class("--intermediate")
+        if folded:
+            self.collapsed = True
+        self.stream_update(self._source_text, is_final=True)
+        self._refresh_header()
 
-    def _run_scheduled_body_sync(self) -> None:
-        self._body_sync_scheduled = False
-        self._sync_body()
 
-    def _sync_body(self) -> None:
-        """Hand the markdown body the current text if it has not seen it yet."""
-        if not self._body_stale:
-            return
-        self._body_stale = False
-        if self._md_widget is not None:
-            self._md_widget.update(self.text)
+class ThinkingMessage(StreamedMarkdownMessage):
+    """The model's readable thinking, muted, above what it led to.
+
+    It streams like an answer, open or folded to its row as it started, and
+    keeps that once complete; its header opens or folds it at any time. Folded
+    as it streams, its row runs the newest of the text. A replayed one starts
+    folded, and a folded one builds its body the first time it opens. It is
+    not part of the answer: it has no copy button, and copying the agent's
+    responses leaves it out.
+    """
+
+    DEFAULT_CSS = """
+    /* No vertical margin: folded rows sit one under another, their thin guides one line. */
+    ThinkingMessage {
+        margin: 0;
+        padding: 0 0 0 1;
+        border-left: solid $tui-border-neutral-gray $border-opacity;
+        height: auto;
+        color: $text-muted;
+    }
+    ThinkingMessage.--compressed, ThinkingMessage.--compressed > VirtualizedMarkdown {
+        border-left: solid $tui-border-neutral-100 $border-opacity;
+    }
+    /* Each kind of fold row its own colour: thinking's label is lavender, its text stays muted. */
+    ThinkingMessage .fold-row-header > .fold-row-header--label {
+        color: $text-primary;
+    }
+    /* Open: its own guide under the header's fold arrow, its text two columns in from the label, and a blank row
+       under it, as under an open tool group's calls. Folded rows keep none between them. */
+    ThinkingMessage > VirtualizedMarkdown {
+        padding: 0 0 1 3;
+        border-left: solid $tui-border-neutral-gray $border-opacity;
+        height: auto;
+        min-height: 1;
+        background: transparent;
+        color: $text-muted;
+        /* As an answer's body: sized by its text, it never scrolls. */
+        overflow-y: hidden;
+    }
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        *,
+        channel: ContentChannel = "reasoning",
+        segment_id: str = "",
+        is_final: bool = True,
+        collapsed: bool = False,
+        is_compressed: bool = False,
+    ) -> None:
+        self.segment_id = segment_id
+        """The content segment this message shows, for a retry that gives up its response to remove."""
+        self._channel = channel
+        self._header: _FoldRowHeader | None = None
+        super().__init__(text, is_final=is_final, classes="--compressed" if is_compressed else "")
+        if collapsed:
+            # Before mount, and without the watcher: the body is built when it first opens.
+            self.set_reactive(StreamedMarkdownMessage.collapsed, True)
+
+    @property
+    def foldable(self) -> bool:
+        """Whether it can fold now: once its text is complete."""
+        return self._is_final
+
+    def takes_fold_gap(self) -> bool:
+        return True
+
+    def ends_folded(self) -> bool:
+        return not self._shows_body()
+
+    def _label_ref(self) -> MessageRef:
+        if self._channel == "reasoning_summary":
+            return _THINKING_SUMMARY_LABEL.bind()
+        return (THOUGHT_LABEL if self._is_final else THINKING_LABEL).bind()
+
+    def compose(self) -> ComposeResult:
+        with MessageHeaderRow():
+            self._header = _FoldRowHeader(
+                self._label_ref(), collapsed=self.collapsed, text=self._source_text, streaming=not self._is_final
+            )
+            yield self._header
+        if not self.collapsed:
+            yield self._new_body()
+
+    def _builds_body_on_opening(self) -> bool:
+        return True
+
+    def _releases_body_on_folding(self) -> bool:
+        return True
+
+    def stream_update(self, text: str, is_final: bool = False) -> None:
+        super().stream_update(text, is_final)
+        if self.collapsed and not is_final:
+            # Its row runs the newest text; a final update shows the row's opening (_on_final).
+            self._refresh_header()
+
+    def _refresh_header(self) -> None:
+        if self._header is not None:
+            self._header.show(
+                collapsed=self.collapsed,
+                text=self._source_text,
+                label=self._label_ref(),
+                streaming=not self._is_final,
+            )
+
+    def _on_final(self) -> None:
+        # Thinking that streamed is now thought.
+        self._refresh_header()
+
+    def on__agent_header_clicked(self) -> None:
+        self.collapsed = not self.collapsed
+
+
+def folds_with_turn(widget: Widget) -> TypeGuard[ThinkingMessage | AgentMessage]:
+    """Whether a turn that folds folds *widget* to its one-row header: thinking, and complete text between tool calls."""
+    return isinstance(widget, ThinkingMessage) or (isinstance(widget, AgentMessage) and widget.foldable)
+
+
+async def remove_withdrawn_answer(container: Widget, segment_ids: Iterable[str]) -> None:
+    """Remove *container*'s agent messages that show any of *segment_ids*: an answer a retry asks for again."""
+    withdrawn = frozenset(segment_ids)
+    await remove_all_shielded(
+        child for child in container.children if isinstance(child, AgentMessage) and child.segment_ids & withdrawn
+    )
 
 
 class SystemMessage(Static):
@@ -770,7 +1400,7 @@ class ConversationStatusAction:
         """Posted when the inline retry/continue action is clicked."""
 
 
-class ErrorMessage(Widget):
+class ErrorMessage(ProcessMember):
     """Error display with red accent."""
 
     DEFAULT_CSS = """
@@ -853,7 +1483,7 @@ class ErrorMessage(Widget):
         self.post_message(ConversationStatusAction.Pressed())
 
 
-class RetryMessage(Static):
+class RetryMessage(Static, ProcessMember):
     """Transient retry notice — shown while the executor waits before retrying."""
 
     DEFAULT_CSS = """
@@ -893,7 +1523,7 @@ class RetryMessage(Static):
         return render_str(widget_localizer(self), reference)
 
 
-class InterruptedMessage(Widget):
+class InterruptedMessage(ProcessMember):
     """Interruption notice — yellow for user interrupts, red for errors."""
 
     DEFAULT_CSS = """

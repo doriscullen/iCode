@@ -16,9 +16,11 @@ from chrys.app.tui.screens.main.ports import (
 
 if TYPE_CHECKING:
     from chrys.app.tui.screens.main.state import MainScreenState
+    from chrys.app.tui.widgets.chrome.input_bar import ChatDraft
     from chrys.app.tui.widgets.sidebar.context import ContextUsageState
-    from chrys.foundation.events.types import ProvisionalPresentation
     from chrys.foundation.models.background_tasks import BackgroundTaskView
+    from chrys.foundation.models.hook_executions import HookExecutionView
+    from chrys.foundation.models.invocations import ContentChannel
     from chrys.foundation.models.todos import TodoItem
     from chrys.service.approval.policy import ApprovalMode
 
@@ -102,6 +104,12 @@ class MainScreenPresenter:
     def set_background_tasks(self, tasks: tuple[BackgroundTaskView, ...]) -> None:
         self._view.set_background_tasks(tasks)
 
+    def set_hook_executions(self, executions: tuple[HookExecutionView, ...]) -> None:
+        self._view.set_hook_executions(executions)
+
+    def hook_runs_changed(self) -> None:
+        self._view.hook_runs_changed()
+
     def set_header_approval_mode(self, mode: ApprovalMode) -> None:
         self._view.set_header_approval_mode(mode)
 
@@ -126,8 +134,8 @@ class MainScreenPresenter:
     def set_input_paste_cwd(self, cwd: str) -> None:
         self._view.set_input_paste_cwd(cwd)
 
-    def restore_input_text(self, text: str) -> InputRestore | None:
-        return self._view.restore_input_text(text)
+    def restore_input_text(self, draft: str | ChatDraft) -> InputRestore | None:
+        return self._view.restore_input_text(draft)
 
     def rewrite_restored_input(self, restore: InputRestore | None, text: str) -> bool:
         return self._view.rewrite_restored_input(restore, text)
@@ -159,14 +167,26 @@ class MainScreenPresenter:
     async def replay_history(self, *args: Any, **kwargs: Any) -> None:
         await self._view.replay_history(*args, **kwargs)
 
+    async def add_answer_delta(self, segment_id: str, text: str) -> None:
+        await self._view.add_answer_delta(segment_id, text)
+
+    def finish_answer_segment(self, segment_id: str, *, completed: bool) -> None:
+        self._view.finish_answer_segment(segment_id, completed=completed)
+
+    async def withdraw_answer(self, segment_ids: tuple[str, ...]) -> None:
+        await self._view.withdraw_answer(segment_ids)
+
+    async def add_thinking_delta(self, segment_id: str, channel: ContentChannel, text: str) -> None:
+        await self._view.add_thinking_delta(segment_id, channel, text)
+
+    def finish_thinking_segment(self, segment_id: str) -> None:
+        self._view.finish_thinking_segment(segment_id)
+
+    async def abandon_thinking(self, segment_ids: tuple[str, ...]) -> None:
+        await self._view.abandon_thinking(segment_ids)
+
     async def add_agent_message(self, *args: Any, **kwargs: Any) -> None:
         await self._view.add_agent_message(*args, **kwargs)
-
-    async def accept_presentation_attempt(self, attempt_id: str, segment_ids: tuple[str, ...]) -> None:
-        await self._view.accept_presentation_attempt(attempt_id, segment_ids)
-
-    async def reject_presentation_attempt(self, attempt_id: str) -> None:
-        await self._view.reject_presentation_attempt(attempt_id)
 
     async def add_user_injection(self, *args: Any, **kwargs: Any) -> None:
         await self._view.add_user_injection(*args, **kwargs)
@@ -239,31 +259,8 @@ class MainScreenPresenter:
             tool_name=tool_name,
         )
 
-    def add_sub_agent_message(
-        self,
-        agent_name: str,
-        invocation_id: str,
-        text: str,
-        *,
-        presentation: ProvisionalPresentation | None = None,
-    ) -> None:
-        self._view.add_sub_agent_message(
-            agent_name,
-            invocation_id,
-            text,
-            presentation=presentation,
-        )
-
-    def accept_sub_agent_presentation(
-        self,
-        invocation_id: str,
-        attempt_id: str,
-        segment_ids: tuple[str, ...],
-    ) -> None:
-        self._view.accept_sub_agent_presentation(invocation_id, attempt_id, segment_ids)
-
-    def reject_sub_agent_presentation(self, invocation_id: str, attempt_id: str) -> None:
-        self._view.reject_sub_agent_presentation(invocation_id, attempt_id)
+    def add_sub_agent_answer(self, agent_name: str, invocation_id: str, segment_id: str, text: str) -> None:
+        self._view.add_sub_agent_answer(agent_name, invocation_id, segment_id, text)
 
     async def add_sub_agent_tool_start(self, *args: Any, **kwargs: Any) -> None:
         await self._view.add_sub_agent_tool_start(*args, **kwargs)
@@ -291,6 +288,9 @@ class MainScreenPresenter:
 
     def sub_agent_resumed_after_pause(self, invocation_id: str) -> None:
         self._view.sub_agent_resumed_after_pause(invocation_id)
+
+    def sub_agent_answer_withdrawn(self, invocation_id: str, segment_ids: tuple[str, ...]) -> None:
+        self._view.sub_agent_answer_withdrawn(invocation_id, segment_ids)
 
     def sub_agent_cascade_aborted(self, invocation_id: str) -> None:
         self._view.sub_agent_cascade_aborted(invocation_id)

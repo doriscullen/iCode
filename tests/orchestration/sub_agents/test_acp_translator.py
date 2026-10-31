@@ -8,6 +8,7 @@ import asyncio
 import base64
 import dataclasses
 import json
+import threading
 
 import pytest
 from acp.schema import (
@@ -26,19 +27,23 @@ from acp.schema import (
 
 from chrys.foundation.events.bus import EventBus
 from chrys.foundation.events.types import (
-    InvocationMessage,
+    InvocationContentDelta,
+    InvocationContentFinished,
     InvocationProgress,
     InvocationToolCallResult,
     InvocationToolCallStart,
 )
 from chrys.foundation.models.invocations import InvocationOrigin
-from chrys.foundation.text.images import MAX_IMAGE_BYTES
+from chrys.foundation.text.images import MAX_IMAGE_BYTES, compress_image_data
 from chrys.foundation.tool_result_metadata import TOOL_FAILED_METADATA_KEY, TOOL_INTERRUPTED_METADATA_KEY
+from chrys.orchestration.invoker import acp_protocol as acp_protocol_module
 from chrys.orchestration.invoker.acp_protocol import AcpUpdateTranslator, preview_text
 from chrys.service.acp_client import client as acp_client_module
 from chrys.service.acp_client.errors import AcpTransportError
 from tests.orchestration.sub_agents._acp_fakes import session_notification
 from tests.support.event_capture import capture_events
+from tests.support.images import noisy_image_bytes
+from tests.support.waiting import wait_for
 
 
 async def test_translator_synthesizes_progress_before_start_and_prefixes_attempt() -> None:
@@ -332,7 +337,12 @@ async def test_translator_extracts_every_tool_content_variant_and_flushes_interr
     assert results[1].provider_status == "interrupted"
 
 
-async def test_translator_accepts_maximum_supported_image_size() -> None:
+# No decoder reads this many repeated bytes, so the translator keeps them as they
+# came: 4 MiB in base64, past the 5 MiB budget when charged twice.
+_LARGE_UNDECODABLE_IMAGE_BYTES = 3 * 1024 * 1024
+
+
+async def test_translator_accepts_a_large_image_through_the_observer_buffer() -> None:
     bus = EventBus()
     results = await capture_events(bus, InvocationToolCallResult)
     translator = AcpUpdateTranslator(
@@ -343,7 +353,7 @@ async def test_translator_accepts_maximum_supported_image_size() -> None:
         attempt=1,
         origin=InvocationOrigin("sub_agent", "", "inv", None),
     )
-    encoded = base64.b64encode(b"x" * MAX_IMAGE_BYTES).decode("ascii")
+    encoded = base64.b64encode(b"x" * _LARGE_UNDECODABLE_IMAGE_BYTES).decode("ascii")
 
     notification = session_notification(
         ToolCallProgress(
@@ -381,7 +391,7 @@ async def test_translator_charges_repeated_image_snapshot_once() -> None:
         attempt=1,
         origin=InvocationOrigin("sub_agent", "", "inv", None),
     )
-    encoded = base64.b64encode(b"x" * MAX_IMAGE_BYTES).decode("ascii")
+    encoded = base64.b64encode(b"x" * _LARGE_UNDECODABLE_IMAGE_BYTES).decode("ascii")
 
     for seq, status in enumerate(("in_progress", "completed"), start=1):
         await translator.put(
@@ -416,7 +426,7 @@ async def test_translator_replaces_partial_image_charge_with_final_snapshot() ->
     )
     snapshots = (
         (base64.b64encode(b"p" * (1024 * 1024)).decode("ascii"), "in_progress"),
-        (base64.b64encode(b"f" * MAX_IMAGE_BYTES).decode("ascii"), "completed"),
+        (base64.b64encode(b"f" * _LARGE_UNDECODABLE_IMAGE_BYTES).decode("ascii"), "completed"),
     )
 
     for seq, (encoded, status) in enumerate(snapshots, start=1):
@@ -452,7 +462,7 @@ async def test_translator_charges_images_retained_by_separate_calls() -> None:
     )
 
     for seq, byte in enumerate((b"a", b"b"), start=1):
-        encoded = base64.b64encode(byte * MAX_IMAGE_BYTES).decode("ascii")
+        encoded = base64.b64encode(byte * _LARGE_UNDECODABLE_IMAGE_BYTES).decode("ascii")
         notification = session_notification(
             ToolCallProgress(
                 sessionUpdate="tool_call_update",
@@ -472,6 +482,82 @@ async def test_translator_charges_images_retained_by_separate_calls() -> None:
         else:
             with pytest.raises(AcpTransportError, match="translated update budget"):
                 await translator.put(seq, notification)
+
+
+def _image_update(call_id: str, data: bytes) -> SessionNotification:
+    return session_notification(
+        ToolCallProgress(
+            sessionUpdate="tool_call_update",
+            toolCallId=call_id,
+            title="Image",
+            content=[
+                ContentToolCallContent(
+                    type="content",
+                    content=ImageContentBlock(
+                        type="image", data=base64.b64encode(data).decode("ascii"), mimeType="image/png"
+                    ),
+                )
+            ],
+            status="completed",
+        )
+    )
+
+
+def _image_translator(bus: EventBus) -> AcpUpdateTranslator:
+    return AcpUpdateTranslator(
+        event_bus=bus,
+        session_id=None,
+        agent_name="External",
+        invocation_id="inv",
+        attempt=1,
+        origin=InvocationOrigin("sub_agent", "", "inv", None),
+    )
+
+
+async def test_translator_keeps_an_image_over_the_send_limit_compressed() -> None:
+    bus = EventBus()
+    results = await capture_events(bus, InvocationToolCallResult)
+    source = noisy_image_bytes("PNG")
+    assert len(source) > MAX_IMAGE_BYTES
+
+    await _image_translator(bus).put(1, _image_update("image", source))
+
+    (image,) = results[0].image_contents
+    assert image.media_type == "image/jpeg"
+    data = base64.b64decode((image.uri or "").split(",", 1)[1])
+    assert data.startswith(b"\xff\xd8\xff")
+    assert len(data) <= MAX_IMAGE_BYTES
+
+
+async def test_translator_keeps_an_image_it_cannot_decode_as_it_came() -> None:
+    bus = EventBus()
+    results = await capture_events(bus, InvocationToolCallResult)
+    source = b"\x89PNG\r\n\x1a\n" + b"x" * MAX_IMAGE_BYTES
+
+    await _image_translator(bus).put(1, _image_update("image", source))
+
+    (image,) = results[0].image_contents
+    assert image.media_type == "image/png"
+    assert base64.b64decode((image.uri or "").split(",", 1)[1]) == source
+
+
+async def test_translator_compresses_images_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop_thread = threading.get_ident()
+    compressing_threads: list[int] = []
+
+    def recording_compress(data: bytes) -> bytes:
+        compressing_threads.append(threading.get_ident())
+        return compress_image_data(data)
+
+    monkeypatch.setattr(acp_protocol_module, "compress_image_data", recording_compress)
+    bus = EventBus()
+    results = await capture_events(bus, InvocationToolCallResult)
+
+    await _image_translator(bus).put(1, _image_update("image", noisy_image_bytes("PNG")))
+
+    assert len(compressing_threads) == 1
+    assert compressing_threads[0] != loop_thread
+    assert results[0].image_contents[0].media_type == "image/jpeg"
 
 
 def _wide_patch(call_id: str, status: str) -> SessionNotification:
@@ -616,15 +702,17 @@ async def test_terminal_publish_is_single_delivery_under_concurrent_flush() -> N
     )
 
     async def slow_dup_start(event: InvocationToolCallStart) -> None:
-        # Yield inside the terminal's ensure-start so a second terminalizer can
-        # reach the guard while the first is mid-publish — the exact race window.
+        # Yield inside a start publish so a second terminalizer can reach the
+        # guard while the first is mid-publish — the exact race window.
         if event.call_id.endswith("dup"):
             await asyncio.sleep(0)
 
     await bus.subscribe(InvocationToolCallStart, slow_dup_start)
 
     # The consumer processing a completed update and the cancel-path flush race
-    # to terminalize the same record.
+    # to terminalize the same record. The update renames the call, so it first
+    # suspends publishing the changed start; the flush then reaches the guard
+    # and its own start.
     await asyncio.gather(
         translator.put(
             2,
@@ -632,7 +720,7 @@ async def test_terminal_publish_is_single_delivery_under_concurrent_flush() -> N
                 ToolCallProgress(
                     sessionUpdate="tool_call_update",
                     toolCallId="dup",
-                    title="Dup",
+                    title="Dup done",
                     status="completed",
                 )
             ),
@@ -684,7 +772,8 @@ async def test_progress_updates_do_not_split_streaming_message_segments() -> Non
     assert translator.result_text() == "prefix suffix"
 
     bus = EventBus()
-    messages = await capture_events(bus, InvocationMessage)
+    deltas = await capture_events(bus, InvocationContentDelta)
+    finished = await capture_events(bus, InvocationContentFinished)
     sealing = AcpUpdateTranslator(
         event_bus=bus,
         session_id=None,
@@ -727,14 +816,20 @@ async def test_progress_updates_do_not_split_streaming_message_segments() -> Non
     )
     assert sealing.result_text() == "after tool"
     assert sealing.unpublished_final_text() == "after tool"
-    assert [(message.origin.invocation_id, message.text) for message in messages] == [("inv", "before tool")]
+    assert [(delta.origin.invocation_id, delta.channel, delta.text) for delta in deltas] == [
+        ("inv", "answer", "before tool"),
+        ("inv", "answer", "after tool"),
+    ]
+    # The ToolCallStart ended the first segment; the text after it opened another.
+    assert [(event.segment_id, event.status) for event in finished] == [(deltas[0].segment_id, "completed")]
+    assert deltas[1].segment_id != deltas[0].segment_id
 
 
 async def test_transcript_mode_reports_no_unpublished_final_after_terminal_tool() -> None:
     from acp.schema import ToolCallStart
 
     bus = EventBus()
-    messages = await capture_events(bus, InvocationMessage)
+    deltas = await capture_events(bus, InvocationContentDelta)
     translator = AcpUpdateTranslator(
         event_bus=bus,
         session_id=None,
@@ -769,4 +864,102 @@ async def test_transcript_mode_reports_no_unpublished_final_after_terminal_tool(
 
     assert translator.result_text() == "already published"
     assert translator.unpublished_final_text() == ""
-    assert [message.text for message in messages] == ["already published"]
+    assert [delta.text for delta in deltas] == ["already published"]
+
+
+async def _start_and_result_log(bus: EventBus) -> list[tuple[str, str, str]]:
+    """Log each start and result in order: its kind, its call's name, and the provider status it shows."""
+    log: list[tuple[str, str, str]] = []
+
+    async def on_start(event: InvocationToolCallStart) -> None:
+        log.append(("start", event.tool_name, event.provider_status))
+
+    async def on_result(event: InvocationToolCallResult) -> None:
+        log.append(("result", event.tool_name, event.provider_status))
+
+    await bus.subscribe(InvocationToolCallStart, on_start)
+    await bus.subscribe(InvocationToolCallResult, on_result)
+    return log
+
+
+def _call_translator(bus: EventBus) -> AcpUpdateTranslator:
+    return AcpUpdateTranslator(
+        event_bus=bus,
+        session_id="parent",
+        agent_name="External",
+        invocation_id="inv",
+        attempt=1,
+        origin=InvocationOrigin("sub_agent", "parent", "inv", None),
+    )
+
+
+def _read_update(*, status: str, title: str = "Read", provider_status: str | None = None) -> SessionNotification:
+    meta = None
+    if provider_status is not None:
+        meta = {"chrys": {"provider_hosted": True, "hosted_family": "search", "provider_status": provider_status}}
+    return session_notification(
+        ToolCallProgress(
+            sessionUpdate="tool_call_update",
+            toolCallId="call",
+            title=title,
+            kind="read",
+            rawInput={"path": "a"},
+            status=status,
+            _meta=meta,
+        )
+    )
+
+
+async def test_a_call_starts_again_only_when_what_its_start_shows_changes() -> None:
+    bus = EventBus()
+    log = await _start_and_result_log(bus)
+    translator = _call_translator(bus)
+
+    await translator.put(1, _read_update(status="in_progress"))
+    await translator.put(2, _read_update(status="in_progress"))
+    await translator.put(3, _read_update(status="in_progress", title="Read a"))
+    await translator.put(4, _read_update(status="completed", title="Read a"))
+
+    assert log == [("start", "Read", ""), ("start", "Read a", ""), ("result", "Read a", "")]
+
+
+async def test_a_hosted_call_starts_again_when_it_turns_out_hosted_and_its_status_rides_the_result() -> None:
+    bus = EventBus()
+    log = await _start_and_result_log(bus)
+    translator = _call_translator(bus)
+
+    await translator.put(1, _read_update(status="in_progress"))
+    await translator.put(2, _read_update(status="in_progress", provider_status="searching"))
+    await translator.put(3, _read_update(status="in_progress", provider_status="reading"))
+    await translator.put(4, _read_update(status="completed", provider_status="completed"))
+
+    assert log == [
+        ("start", "Read", ""),
+        ("start", "Read", "searching"),
+        ("result", "Read", "completed"),
+    ]
+
+
+async def test_a_start_a_cancel_cut_off_is_delivered_again_before_the_interrupted_result() -> None:
+    bus = EventBus()
+    held = asyncio.Event()
+
+    async def hold_the_first_start(_event: InvocationToolCallStart) -> None:
+        if not held.is_set():
+            held.set()
+            await asyncio.Event().wait()
+
+    await bus.subscribe(InvocationToolCallStart, hold_the_first_start)
+    # Subscribed after the holder: it misses the start the cancel cuts off.
+    log = await _start_and_result_log(bus)
+    translator = _call_translator(bus)
+
+    consumer = asyncio.create_task(translator.put(1, _read_update(status="in_progress")))
+    await wait_for(lambda: held.is_set() or consumer.done(), description="the start's delivery")
+    assert not consumer.done()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await translator.flush_interrupted()
+
+    assert log == [("start", "Read", ""), ("result", "Read", "interrupted")]

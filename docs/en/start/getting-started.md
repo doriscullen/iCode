@@ -46,6 +46,8 @@ $env:ICODE_SOURCE = "gitcode"; irm https://raw.gitcode.com/openJiuwen/iCode/raw/
 
 To install a particular version, end the command with `| sh -s -- --version 0.29.1` instead of `| sh`. On Windows, run `$env:ICODE_VERSION = "0.29.1"` first. A setting made with `$env:` lasts until you close that PowerShell window.
 
+On macOS and Linux, passing an empty value to `--version` or `--source` (for example, `--version ""` or `--source=`) stops installation with an error. If you pass a shell variable to either option, make sure it contains a value.
+
 To install by hand instead, download the package for your platform and follow the steps below. In the commands, `<version>` and `<architecture>` are placeholders. Replace them with the actual values in the downloaded filename.
 
 #### macOS
@@ -117,6 +119,8 @@ icode
 
 Replace `<project-directory>` with the actual path to your project. To switch directories after startup, see [Working directory](../guides/daily-use/workspaces.md).
 
+iCode first prints `Starting iCode...` and shows a loading screen while it gets ready. When the main screen appears, it keeps showing that it is loading until the agent is ready.
+
 ## 3. Configure a model
 
 1. Press **F4** or click `f4 Models` at the bottom of the screen to open the **Model Configuration** dialog.
@@ -143,6 +147,8 @@ iCode should reply with a greeting. If the model service returns an error, check
 
 While an agent runs, the status bar above the input shows elapsed time and tool calls. Long runs include hours and days, for example `1d 4h 20m 50s`. Tool cards, background tasks, CLI progress, and the F12 timing dashboard also support days; compact displays keep only the largest time units.
 
+Once the agent answers, the answer's header shows how long the whole turn took, for example `Code Agent - 2:04 AM (6m 5s)`: from when you sent your message, or clicked **Continue** or **Retry**, to the answer, including the time the agent waited for your approval or reply. A message you send while the agent works doesn't restart it. It shows the same when you reopen the session.
+
 ## 4. Use agents
 
 ### Select an agent
@@ -163,7 +169,7 @@ The following examples assume the current project is a to-do app and illustrate 
 Analyze the task list implementation and propose a plan for adding a "Clear completed tasks" feature. Explain which files need to change and the implementation steps.
 ```
 
-Q&A Agent may search for files, read their contents, or run read-only commands. Tool calls appear as cards. After completing its analysis, the agent presents an implementation plan.
+Q&A Agent may search for files, read their contents, or run read-only commands. Tool calls appear as cards, grouped under one header while the agent works through them. While they run, the header shows what the agent is doing; once they are done, it says what the calls did, by kind, for example `▸ Read 3 files · searched for 2 patterns · ran 1 command`, and ends with how many failed or were interrupted, if any, which stay in view when the window is too narrow for the whole line. When the agent made a single call there and it succeeded, the header says what that call did instead, for example `▸ Read src/app.py` or `▸ Ran zsh command: Run the tests`; a path inside the folder you work in is shown relative to it. While the agent waits with `sleep`, the header shows why and counts down the time left, for example `Sleeping: Waiting for CI · 29s left`; to stop waiting, open the cards and click **Skip**. Once done, it says how long the agent slept and why, for example `▸ Slept 23s: Waiting for CI`. Click the header to show or hide the cards. After completing its analysis, the agent presents an implementation plan.
 
 ### Use Code Agent
 
@@ -210,6 +216,8 @@ Single-line math is written with `$...$` or `\(...\)`. Display formulas in `math
 For example, `$x^{n+1}$` displays as xⁿ⁺¹ and `$90^\circ$` as 90°.
 
 Mermaid code blocks appear as diagrams; choose **Open full diagram** to view and scroll the full result. Some diagrams are simplified with a notice; unsupported diagrams stay as source.
+
+When the model service returns the model's thinking as readable text, it appears in grey on one line above the reply: **Thinking:** followed by the newest words as the model writes them, then **Thought:** followed by how the thinking begins once it is complete, cut off where the line ends. Click it at any time, even while the model is still writing, to unfold it and read it in full, or to fold it again (`/fold` folds or unfolds all complete thinking, tool groups and text between tool calls at once). Once the model moves on to a tool call or its reply, the thinking folds, as tool groups do; so does text the model writes before a tool call, to one line showing how it begins. Thinking has no **copy** button, and copying replies leaves it out. To see thinking unfolded while the model writes it, turn on **Expand thinking by default** in the Settings dialog (**General** → **Display preferences**).
 
 Mouse selection copies what is displayed, without adding newlines for screen wrapping. Use **copy** beside the message header to copy the original Markdown and LaTeX. Reopening an older conversation uses the current rendering.
 

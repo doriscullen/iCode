@@ -53,6 +53,13 @@ def with_background_count(trail: StatusTrail, running: int) -> StatusTrail:
     )
 
 
+def enabled_hook_count(details: AgentRuntimeDetails | None) -> int:
+    """The hooks *details* names that are enabled: what the status trail and the Hooks tab count."""
+    if details is None:
+        return 0
+    return sum(hook.enabled for source in details.hook_sources for hook in source.hooks)
+
+
 class RegistryRuntimeInfoProvider:
     """Format runtime info and profile descriptions from configured registries."""
 
@@ -69,15 +76,13 @@ class RegistryRuntimeInfoProvider:
     ) -> StatusTrail:
         """Build trail text for tool/skill/hook/file counts."""
         parts: list[StatusMessage] = []
-        if tool_names:
-            parts.append(_RUNTIME_TOOLS.bind(count=len(tool_names)))
+        # The Tools tab lists the context management tools too: the count takes them in.
+        tools = dict.fromkeys([*tool_names, *(runtime_details.context_tools if runtime_details else ())])
+        if tools:
+            parts.append(_RUNTIME_TOOLS.bind(count=len(tools)))
         if skill_names:
             parts.append(_RUNTIME_SKILLS.bind(count=len(skill_names)))
-        hook_count = (
-            sum(hook.enabled for source in runtime_details.hook_sources for hook in source.hooks)
-            if runtime_details is not None
-            else 0
-        )
+        hook_count = enabled_hook_count(runtime_details)
         if hook_count:
             parts.append(_RUNTIME_HOOKS.bind(count=hook_count))
         if memory_files:

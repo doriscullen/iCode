@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
@@ -17,7 +18,9 @@ from textual.scrollbar import ScrollTo
 from textual.widget import Widget
 
 from chrys.app.tui.i18n import render_str, widget_localizer
+from chrys.app.tui.util.bottom_follow import BottomFollow
 from chrys.app.tui.util.removal import remove_shielded
+from chrys.app.tui.widgets.chat.fold_gap import show_fold_gaps
 from chrys.app.tui.widgets.chat.messages import (
     AgentMessage,
     ErrorMessage,
@@ -25,16 +28,20 @@ from chrys.app.tui.widgets.chat.messages import (
     RetryMessage,
     SystemMessage,
     UserMessage,
+    remove_withdrawn_answer,
 )
 from chrys.app.tui.widgets.chat.scroll_controller import ManualScrollGcGuard
 from chrys.app.tui.widgets.chat.toc_model import TurnTocModel
 from chrys.app.tui.widgets.chat.tool_call import ToolGroup
 from chrys.foundation.errors.display import DISPLAY_WITH_HINT
-from chrys.foundation.events.types import ProvisionalPresentation
+from chrys.foundation.events.types import InvocationContentDelta
 from chrys.foundation.i18n import MessageRef
 from chrys.foundation.patches.textual_precompose import precompose_tree
 
 if TYPE_CHECKING:
+    from textual.layout import Layout
+
+    from chrys.foundation.events.types import InvocationContentFinished
     from chrys.service.session.sub_agent_transcript import PersistedSubAgentTranscript
 
 
@@ -52,26 +59,13 @@ class TranscriptUserOp:
 
 @dataclass(frozen=True, slots=True)
 class TranscriptAssistantOp:
-    """One assistant presentation boundary."""
+    """Assistant text: one whole answer segment (:class:`AnswerSegments`), or the invocation's final text."""
 
     text: str
     final: bool = False
-    presentation: ProvisionalPresentation | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptPresentationAcceptedOp:
-    """Commit provisional assistant segments."""
-
-    attempt_id: str
-    segment_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptPresentationRejectedOp:
-    """Retract provisional assistant segments."""
-
-    attempt_id: str
+    segment_id: str = ""
+    streamed: bool = True
+    """Whether a final text is the answer its segments showed; one that is not shows as its own message."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +82,9 @@ class TranscriptToolStartOp:
     provider_item_type: str = ""
     provider_status: str = ""
     provider_call_id: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+    """When the call started, as ``time.monotonic()`` read as the start was recorded: a view built later counts a
+    running sleep's time left from it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +103,9 @@ class TranscriptToolStatusOp:
     status: str
     provider_status: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    stopped_at: float = field(default_factory=time.monotonic)
+    """When it was recorded, as ``time.monotonic()``: a status that ends a running call ends it then, and a view built
+    later counts how long the call ran up to it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +158,9 @@ class TranscriptInterruptedOp:
     """Close an invocation's transcript and settle its unfinished activity."""
 
     reason: MessageRef
+    stopped_at: float = field(default_factory=time.monotonic)
+    """When it stopped the calls still running, as ``time.monotonic()`` read as it was recorded: a view built later
+    counts how long they ran up to it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,11 +168,30 @@ class TranscriptErrorOp:
     """Settle failed activity and show the shared chat error card."""
 
     reason: str | MessageRef
+    stopped_at: float = field(default_factory=time.monotonic)
+    """When it stopped the calls still running, as ``time.monotonic()`` read as it was recorded: a view built later
+    counts how long they ran up to it."""
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptPausedOp:
+    """A failed attempt paused for Retry or Abort: the answer it was writing stops streaming."""
 
 
 @dataclass(frozen=True, slots=True)
 class TranscriptResumedOp:
     """Clear a failed attempt's status before accepting the next attempt."""
+
+    stopped_at: float = field(default_factory=time.monotonic)
+    """When it stopped the calls still running, as ``time.monotonic()`` read as it was recorded: a view built later
+    counts how long they ran up to it."""
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptAnswerWithdrawnOp:
+    """A retry dropped the answer these segments showed from history, to ask for it again: it goes."""
+
+    segment_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,8 +217,6 @@ class TranscriptWarningOp:
 type AgentTranscriptOp = (
     TranscriptUserOp
     | TranscriptAssistantOp
-    | TranscriptPresentationAcceptedOp
-    | TranscriptPresentationRejectedOp
     | TranscriptToolStartOp
     | TranscriptToolArgsOp
     | TranscriptToolStatusOp
@@ -206,10 +226,51 @@ type AgentTranscriptOp = (
     | TranscriptCompactionFinishedOp
     | TranscriptInterruptedOp
     | TranscriptErrorOp
+    | TranscriptPausedOp
     | TranscriptResumedOp
+    | TranscriptAnswerWithdrawnOp
     | TranscriptRetryOp
     | TranscriptWarningOp
 )
+
+
+@dataclass(slots=True)
+class _OpenAnswer:
+    segment_id: str
+    parts: list[str] = field(default_factory=list)
+
+
+class AnswerSegments:
+    """Streamed answer text, held until its segment ends.
+
+    A nested transcript shows each answer segment whole, as a run that does not
+    stream does: a view few people watch live takes no work per delta. A tool
+    call's card starts after the text before it ended its segment, so that text
+    shows above the card. A segment cut off by a failure or an interrupt shows
+    nothing; a retry asks for that answer again.
+    """
+
+    def __init__(self) -> None:
+        # The open answer segment of each invocation attempt: it has one at a time.
+        self._open: dict[tuple[str, int], _OpenAnswer] = {}
+
+    def take(self, event: InvocationContentDelta | InvocationContentFinished) -> TranscriptAssistantOp | None:
+        """Hold an answer delta; return the answer segment *event* completes, if it is not blank."""
+        key = (event.origin.invocation_id, event.origin.attempt)
+        answer = self._open.get(key)
+        if isinstance(event, InvocationContentDelta):
+            if event.channel == "answer":
+                if answer is None or answer.segment_id != event.segment_id:
+                    answer = self._open[key] = _OpenAnswer(event.segment_id)
+                answer.parts.append(event.text)
+            return None
+        if answer is None or answer.segment_id != event.segment_id:
+            return None
+        del self._open[key]
+        text = "".join(answer.parts)
+        if event.status != "completed" or not text.strip():
+            return None
+        return TranscriptAssistantOp(text, segment_id=answer.segment_id)
 
 
 class AgentTranscriptJournal:
@@ -238,7 +299,10 @@ class AgentTranscriptJournal:
             self._failed = False
         elif self._failed and not isinstance(operation, TranscriptInterruptedOp):
             return
-        if isinstance(operation, TranscriptToolProgressOp) and operation.call_id in self._progress_positions:
+        if isinstance(operation, TranscriptAnswerWithdrawnOp):
+            # Retained no longer, so a view opened later never shows it; open views remove it.
+            self._withdraw(frozenset(operation.segment_ids))
+        elif isinstance(operation, TranscriptToolProgressOp) and operation.call_id in self._progress_positions:
             self._operations[self._progress_positions[operation.call_id]] = operation
         else:
             self._operations.append(operation)
@@ -259,13 +323,26 @@ class AgentTranscriptJournal:
         for subscriber in tuple(self._subscribers):
             subscriber.enqueue(operation)
 
+    def _withdraw(self, segment_ids: frozenset[str]) -> None:
+        self._operations = [
+            operation
+            for operation in self._operations
+            if not (isinstance(operation, TranscriptAssistantOp) and operation.segment_id in segment_ids)
+        ]
+        self._progress_positions = {
+            operation.call_id: position
+            for position, operation in enumerate(self._operations)
+            if isinstance(operation, TranscriptToolProgressOp) and operation.call_id in self._progress_positions
+        }
+
     def continue_from(self, earlier: AgentTranscriptJournal) -> None:
         """Take *earlier*'s retained transcript as this one's beginning: an attempt resuming another.
 
         Called on an empty journal before its first operation; live subscribers receive the carried
-        operations in order.
+        operations in order. The answer the resumed attempt asks for again is withdrawn after the
+        resume (:class:`TranscriptAnswerWithdrawnOp`).
         """
-        operations = earlier.operations
+        operations = list(earlier.operations)
         self._operations.extend(operations)
         self._progress_positions = {
             call_id: position + len(self._operations) - len(operations)
@@ -428,7 +505,11 @@ class _TranscriptLocalization:
 
 
 class AgentTranscriptSurface(VerticalScroll, can_focus=True):
-    """A nested transcript using the main live renderer and tool registry."""
+    """A nested transcript using the main live renderer and tool registry.
+
+    It opens at its newest content and, as the chat does, keeps up with what
+    lands below while the user leaves it at the bottom.
+    """
 
     DEFAULT_CSS = """
     AgentTranscriptSurface {
@@ -458,6 +539,7 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
 
         super().__init__(**kwargs)
         self._scroll_gc_guard = ManualScrollGcGuard(self)
+        self._bottom_follow = BottomFollow(self)
         self._journal = journal
         self._profile_name = profile_name
         self._opening_prompt = opening_prompt
@@ -473,7 +555,7 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
             self,
             self,
             self,
-            finalize_agent_message=self._finalize_current_agent_message,
+            finalize_agent_message=self._settle_answer_before_tools,
             tool_groups_expanded=lambda: False,
         )
         localization = _TranscriptLocalization(self._render_message)
@@ -576,11 +658,37 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
     def _on_scrollbar_grabbed_changed(self, grabbed: object) -> None:
         self._scroll_gc_guard.set_scrollbar_grabbed(grabbed is not None)
 
+    def scroll_to(self, x: float | None = None, y: float | None = None, **kwargs: Any) -> None:
+        """Let the bottom follow wait for a scroll Textual runs after the next refresh.
+
+        A key's or the scrollbar's scroll heads for a row worked out from where
+        the view is now: were the follow to take the view to new content first,
+        Down at the bottom would scroll back up.
+        """
+        deferred = y is not None and not kwargs.get("immediate", False)
+        if deferred:
+            self._bottom_follow.defer()
+        super().scroll_to(x, y, **kwargs)
+        # Posted after Textual's own deferred scroll, so it runs once that has.
+        if deferred and not self.call_after_refresh(self._bottom_follow.deferred_ran):
+            self._bottom_follow.deferred_ran()
+
+    def _scroll_to(self, x: float | None = None, y: float | None = None, **kwargs: Any) -> bool:
+        with self._bottom_follow.scroll(y):
+            return super()._scroll_to(x, y, **kwargs)
+
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
-        """Keep cyclic GC out of manual and animated scroll frames."""
+        """Keep cyclic GC out of manual and animated scroll frames, but for the moves that follow the bottom."""
         super().watch_scroll_y(old_value, new_value)
-        if round(old_value) != round(new_value):
+        self._bottom_follow.scrolled(old_value, new_value)
+        if round(old_value) != round(new_value) and not self._bottom_follow.pinning:
             self._scroll_gc_guard.pause()
+
+    def watch_virtual_size(self) -> None:
+        self._bottom_follow.resized()
+
+    def on_resize(self) -> None:
+        self._bottom_follow.resized()
 
     def _on_mouse_scroll_up(self, event: textual_events.MouseScrollUp) -> None:
         """Pause GC before Textual starts the wheel scroll."""
@@ -638,16 +746,10 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
         if isinstance(operation, TranscriptUserOp):
             await self._live.add_user_message(operation.text)
         elif isinstance(operation, TranscriptAssistantOp):
-            await self._live.add_agent_message(
-                operation.text,
-                is_final=operation.final,
-                is_intermediate=not operation.final,
-                presentation=operation.presentation,
-            )
-        elif isinstance(operation, TranscriptPresentationAcceptedOp):
-            await self._live.accept_presentation_attempt(operation.attempt_id, operation.segment_ids)
-        elif isinstance(operation, TranscriptPresentationRejectedOp):
-            await self._live.reject_presentation_attempt(operation.attempt_id)
+            if operation.final:
+                await self._live.add_agent_message(operation.text, streamed=operation.streamed)
+            else:
+                await self._live.add_answer_delta(operation.segment_id, operation.text)
         elif isinstance(operation, TranscriptToolStartOp):
             await self.remove_trailing_status()
             await self._tools.add_tool_start(
@@ -662,6 +764,10 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
                 provider_item_type=operation.provider_item_type,
                 provider_status=operation.provider_status,
                 provider_call_id=operation.provider_call_id,
+                started_at=operation.started_at,
+                # A running call's start can come again (ACP: when what it shows changes), after later output
+                # ended its group: it updates the card where it is and never opens another.
+                running_in_place=True,
             )
         elif isinstance(operation, TranscriptToolArgsOp):
             self._tools.update_tool_args(operation.call_id, dict(operation.args))
@@ -671,6 +777,7 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
                 operation.status,
                 provider_status=operation.provider_status,
                 metadata=dict(operation.metadata),
+                stopped_at=operation.stopped_at,
             )
         elif isinstance(operation, TranscriptToolProgressOp):
             self._tools.update_tool_progress(
@@ -704,14 +811,26 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
                 failure_reason=operation.failure_reason,
             )
         elif isinstance(operation, TranscriptInterruptedOp):
-            self._finalize_current_agent_message()
-            await self._live.add_interrupted(self._render_message(operation.reason), source="system", show_action=False)
+            await self._live.add_interrupted(
+                self._render_message(operation.reason),
+                source="system",
+                show_action=False,
+                stopped_at=operation.stopped_at,
+            )
         elif isinstance(operation, TranscriptErrorOp):
-            self._finalize_current_agent_message()
-            await self._live.add_error(self._render_message(operation.reason), action_label=None)
+            await self._live.add_error(
+                self._render_message(operation.reason), action_label=None, stopped_at=operation.stopped_at
+            )
+        elif isinstance(operation, TranscriptPausedOp):
+            # As the main chat's error card does; Retry then removes the text, Abort keeps it.
+            self._live.stop_answer()
         elif isinstance(operation, TranscriptResumedOp):
-            await self._live.prepare_retry()
+            # Released as intermediate text: the answer the resumed attempt asks for again is withdrawn next.
+            self._live.settle_answer_before_tools()
+            await self._live.prepare_retry(stopped_at=operation.stopped_at)
             await self.remove_trailing_status()
+        elif isinstance(operation, TranscriptAnswerWithdrawnOp):
+            await remove_withdrawn_answer(self, operation.segment_ids)
         elif isinstance(operation, TranscriptRetryOp):
             message = self._render_message(operation.message)
             if operation.hint is not None:
@@ -732,8 +851,9 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
     def _render_message(self, message: str | MessageRef) -> str:
         return message if isinstance(message, str) else render_str(widget_localizer(self), message)
 
-    def _finalize_current_agent_message(self) -> None:
-        self._live._finalize_current_agent_message()
+    def _settle_answer_before_tools(self) -> None:
+        # Nested transcripts fold nothing as tools start.
+        self._live.settle_answer_before_tools()
 
     async def mount_transcript_widget(self, widget: Widget) -> bool:
         if not self._accepts_transcript_updates():
@@ -742,7 +862,11 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
         await self.mount(widget)
         return widget.is_attached and not widget._closing and not widget._pruning and self._accepts_transcript_updates()
 
-    async def mount_transcript_widgets(self, widgets: list[Widget]) -> None:
+    async def mount_transcript_widgets(
+        self, widgets: list[Widget], *, process_failures_after: tuple[Widget, ...] = ()
+    ) -> None:
+        # Nested transcripts do not fold completed turns.
+        _ = process_failures_after
         if not self._accepts_transcript_updates():
             return
         precompose_tree(widgets)
@@ -782,6 +906,9 @@ class AgentTranscriptSurface(VerticalScroll, can_focus=True):
 
     def after_replay_history_mounted(self) -> None:
         self.schedule_anchor_sync()
+
+    def pre_layout(self, layout: Layout) -> None:
+        show_fold_gaps(self.displayed_children)
 
     async def remove_trailing_status(self) -> None:
         status = self.failed_turn_status()

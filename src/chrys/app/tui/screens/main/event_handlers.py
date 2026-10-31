@@ -19,6 +19,7 @@ from chrys.app.tui.screens.main.dialog_controllers import (
     ApprovalDialogHandle,
     ApprovalQueueController,
     ApprovalResponseWorker,
+    HookConfirmationQueueController,
     ImageCompressionDialogController,
     QuestionDialogHandle,
     QuestionQueueController,
@@ -33,7 +34,7 @@ from chrys.app.tui.screens.main.ports import (
     StatusMessage,
     StatusTrail,
 )
-from chrys.app.tui.screens.main.runtime_info import RegistryRuntimeInfoProvider
+from chrys.app.tui.screens.main.runtime_info import RegistryRuntimeInfoProvider, enabled_hook_count
 from chrys.app.tui.screens.main.session_title import QUESTION_MARK, RETRY_MARK, AttentionMark
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState
 from chrys.app.tui.support.gc_freeze import (
@@ -45,6 +46,7 @@ from chrys.app.tui.support.gc_freeze import (
 from chrys.app.tui.support.workspace_mru import schedule_workspace_mru_touches
 from chrys.app.tui.util.context_pressure import context_pressure_message
 from chrys.app.tui.widgets import PromptDraft
+from chrys.app.tui.widgets.chat.agent_transcript_surface import AnswerSegments
 from chrys.app.tui.widgets.chat.file_snapshot import FileSnapshotPayload, FileSnapshotRef, should_externalize_snapshot
 from chrys.app.tui.widgets.chrome.app_header import APPROVAL_MODE_MESSAGES
 from chrys.app.tui.widgets.chrome.input_bar import INPUT_RETRY
@@ -75,18 +77,24 @@ from chrys.foundation.events.types import (
     CompactionStarted,
     ContextCompressed,
     Error,
+    HookConfirmationRequest,
+    HookConfirmationWithdrawn,
+    HookExecutionsChanged,
+    HookRunsChanged,
     ImageAttachmentCompressionFinished,
     ImageAttachmentCompressionStarted,
     InvocationAborted,
+    InvocationAnswerWithdrawn,
     InvocationCascadeAborted,
     InvocationCompactionCommitted,
     InvocationCompactionFinished,
     InvocationCompactionStarted,
+    InvocationContentAbandoned,
+    InvocationContentDelta,
+    InvocationContentFinished,
     InvocationContextPressure,
     InvocationMessage,
     InvocationPaused,
-    InvocationPresentationAttemptAccepted,
-    InvocationPresentationAttemptRejected,
     InvocationProgress,
     InvocationResumed,
     InvocationRetryAttempt,
@@ -110,6 +118,7 @@ from chrys.foundation.i18n import DisplayBlock, MessageRef, msg
 from chrys.foundation.i18n.formatting import format_message
 from chrys.foundation.models.approval_reuse import ReuseChoice
 from chrys.foundation.models.ask_user import AskUserAnswer
+from chrys.foundation.models.hook_confirmations import HookConfirmationAnswer
 from chrys.foundation.tool_result_metadata import canonical_tool_result_status
 from chrys.orchestration.engine.run.attachments import replace_image_mentions_with_paths
 from chrys.service.approval.policy import ApprovalMode
@@ -130,13 +139,24 @@ _IMAGE_WARNING_CODES = {
 }
 _SUBMIT_BLOCKING_WARNING_CODES = _IMAGE_WARNING_CODES | {"sub_agent_paused"}
 _WORKING_DIR_MISSING_CODE = "working_dir_missing"
+_SHORTCUT_UNAVAILABLE_CODE = "prompt_shortcut_unavailable"
 _SUBMIT_BLOCKING_ERROR_CODES = _IMAGE_ERROR_CODES | {
     "hook_blocked",
     "not_ready",
     "prompt_admission_conflict",
     "retry_missing_user_anchor",
     _WORKING_DIR_MISSING_CODE,
+    # A prompt shortcut's message: its commands failed, its shortcut is gone from this
+    # working folder, or a turn started meanwhile; or the switch it asked for named
+    # an agent or model that is gone.
+    "prompt_shortcut_command_failed",
+    _SHORTCUT_UNAVAILABLE_CODE,
+    "prompt_shortcut_busy",
+    "profile_not_found",
+    "model_profile_not_found",
 }
+_REBUILD_REFUSED_PREFIX = "runtime_mutation_"
+"""The engine's refusals of a rebuild it may not make now; inside a submit, only its switch makes one."""
 _STALE_RUN_FILTERED_ERROR_CODES = {"executor_error", "retry_missing_user_anchor"}
 
 
@@ -209,6 +229,7 @@ class BackendEventCallbacks:
         [str, bool, str, dict[str, object] | None, ReuseChoice], ApprovalResponseWorker | None
     ]
     handle_ask_user_response: Callable[[str, tuple[AskUserAnswer, ...]], object]
+    publish_hook_confirmation_answer: Callable[[str | None, str, HookConfirmationAnswer], object]
     question_inline_preferred: Callable[[], bool]
     approval_defer_while_judging: Callable[[], bool]
     approval_timeout_seconds: Callable[[], float]
@@ -296,6 +317,7 @@ class BackendEventHandler:
                 handle_approval_response=callbacks.handle_approval_response,
                 publish_auto_fulfill_blocked=self._publish_auto_fulfill_blocked,
                 handle_ask_user_response=callbacks.handle_ask_user_response,
+                publish_hook_confirmation_answer=callbacks.publish_hook_confirmation_answer,
                 question_inline_preferred=callbacks.question_inline_preferred,
                 approval_defer_while_judging=callbacks.approval_defer_while_judging,
                 set_agent_loading=self.set_agent_loading,
@@ -307,6 +329,7 @@ class BackendEventHandler:
             timeout_seconds=callbacks.approval_timeout_seconds,
         )
         self._question_controller = QuestionQueueController(self._dialog_gateway)
+        self._hook_confirmations = HookConfirmationQueueController(self._dialog_gateway)
         self._agent_load_controller = AgentLoadDialogController(self._dialog_gateway)
         self._image_compression_controller = ImageCompressionDialogController(self._dialog_gateway)
         self._presenter = MainScreenPresenter(view, state)
@@ -315,6 +338,7 @@ class BackendEventHandler:
         self._seen_warnings: set[_WarningDedupeKey] = set()
         # Chat sub-agents paused for the user's Retry/Abort decision.
         self._paused_sub_agents: set[str] = set()
+        self._sub_agent_answers = AnswerSegments()
 
     def attention_mark(self) -> AttentionMark:
         """Why the live run waits for the user: ``!`` a paused sub-agent, ``?`` an approval or question."""
@@ -322,7 +346,11 @@ class BackendEventHandler:
         # past its chat run, a pause no longer waits.
         if self._paused_sub_agents and self.agent_running:
             return RETRY_MARK
-        if self._approval_controller.awaiting_user or self._question_controller.awaiting_user:
+        if (
+            self._approval_controller.awaiting_user
+            or self._question_controller.awaiting_user
+            or self._hook_confirmations.awaiting_user
+        ):
             return QUESTION_MARK
         return ""
 
@@ -368,7 +396,14 @@ class BackendEventHandler:
     def _image_compression(self) -> ImageCompressionDialogController:
         return self._image_compression_controller
 
-    def _predates_active_run(self, event: InvocationMessage | Error) -> bool:
+    def _predates_active_run(
+        self,
+        event: InvocationMessage
+        | InvocationContentDelta
+        | InvocationContentFinished
+        | InvocationContentAbandoned
+        | Error,
+    ) -> bool:
         """Return whether *event* was sourced before the current UI run."""
         started_at = self._state.run.started_at
         return self._state.run.agent_running and started_at is not None and event.timestamp < started_at
@@ -416,7 +451,11 @@ class BackendEventHandler:
 
     @runtime_metadata.setter
     def runtime_metadata(self, value: AgentRuntimeDetails) -> None:
+        configured = enabled_hook_count(self._state.runtime.details)
         self._state.runtime.details = value
+        # The Hooks tab's empty state says whether any hook is configured.
+        if enabled_hook_count(value) != configured:
+            self._ui().hook_runs_changed()
 
     @property
     def approval_mode(self) -> ApprovalMode:
@@ -498,11 +537,21 @@ class BackendEventHandler:
     def pending_user_submit_text(self) -> str:
         return self._state.submit.text
 
-    @property
-    def pending_user_message_render_active(self) -> bool:
-        return self._state.render_gate.active
+    def defers_turn_event(
+        self,
+        event: InvocationMessage
+        | InvocationContentDelta
+        | InvocationContentFinished
+        | InvocationContentAbandoned
+        | Error,
+    ) -> bool:
+        """Whether *event* waits for the user bubble: it mounts, or earlier events are still replaying."""
+        return self._state.render_gate.defers(event)
 
-    def defer_agent_message(self, event: InvocationMessage) -> None:
+    def defer_agent_message(
+        self,
+        event: InvocationMessage | InvocationContentDelta | InvocationContentFinished | InvocationContentAbandoned,
+    ) -> None:
         self._state.render_gate.defer(event)
 
     def defer_error(self, event: Error) -> None:
@@ -857,7 +906,13 @@ class BackendEventHandler:
             self._state.runtime.background_tasks = None
         s.main_usage_source_id = event.session_id or ""
         self._show_background_tasks()
+        # The previous session's hook runs ended with its manager; a snapshot
+        # this session sent before it became current shows now.
+        if self._state.runtime.hook_snapshots:
+            self._state.runtime.keep_hook_snapshot_of(s.main_usage_source_id)
+            self.refresh_hook_indicator()
         s.profile = event.display_name or event.agent_profile
+        self._state.runtime.profile_name = event.agent_profile
         s.runtime_metadata = event.runtime_details
         self._state.runtime.details_confirmed = True
         if event.runtime_details.model.selection_source == "active":
@@ -1006,81 +1061,80 @@ class BackendEventHandler:
         self._ui().show_status(STATUS_THINKING.bind())
         s.debug("AgentThinking")
 
-    async def on_agent_message(self, event: InvocationMessage) -> None:
-        if event.origin.kind == "sub_agent":
-            await self.on_sub_agent_message(event)
+    def _admits_turn_render(
+        self,
+        event: InvocationMessage | InvocationContentDelta | InvocationContentFinished | InvocationContentAbandoned,
+        name: str,
+    ) -> bool:
+        """Whether a main-turn output event renders now; one that arrives while the user bubble mounts is deferred."""
+        if self._predates_active_run(event):
+            self.debug(name, "ignored stale prior-run event")
+            return False
+        if self.defers_turn_event(event):
+            self.defer_agent_message(event)
+            return False
+        return self.agent_running
+
+    async def on_agent_content(
+        self, event: InvocationContentDelta | InvocationContentFinished | InvocationContentAbandoned
+    ) -> None:
+        """Stream the turn's answer and thinking text; thinking whose response a retry gave up goes from view."""
+        if isinstance(event, InvocationContentAbandoned):
+            if event.origin.kind == "turn" and self._admits_turn_render(event, "InvocationContentAbandoned"):
+                await self._ui().abandon_thinking(event.segment_ids)
             return
-        if event.origin.kind != "turn":
+        if event.origin.kind == "sub_agent":
+            await self.on_sub_agent_content(event)
+            return
+        if event.origin.kind != "turn" or not self._admits_turn_render(event, type(event).__name__):
+            return
+        ui = self._ui()
+        if isinstance(event, InvocationContentFinished):
+            if event.channel == "answer":
+                ui.finish_answer_segment(event.segment_id, completed=event.status == "completed")
+            else:
+                ui.finish_thinking_segment(event.segment_id)
+        elif event.channel == "answer":
+            ui.show_status(STATUS_STREAMING.bind())
+            await ui.add_answer_delta(event.segment_id, event.text)
+        else:
+            ui.show_status(STATUS_THINKING.bind())
+            await ui.add_thinking_delta(event.segment_id, event.channel, event.text)
+
+    async def on_agent_message(self, event: InvocationMessage) -> None:
+        """Complete the turn: its answer already streamed, so this only finalizes it."""
+        if event.origin.kind != "turn" or not event.is_final:
             return
         s = self
-        if self._predates_active_run(event):
-            s.debug("InvocationMessage", "ignored stale prior-run event")
-            return
-        if s.pending_user_message_render_active:
-            s.defer_agent_message(event)
-            return
-        if not s.agent_running:
+        if not self._admits_turn_render(event, "InvocationMessage"):
             return
 
         ui = self._ui()
-
-        if event.is_intermediate:
+        was_live = s.agent_running
+        terminal_generation = self._state.run.generation
+        terminal_request = GcAbsorbRequested(GcAbsorbReason.TURN_TERMINAL, terminal_boundary=True)
+        terminal_owned = False
+        try:
+            ui.flash_turn_complete()
             await ui.add_agent_message(
                 event.text,
-                is_final=True,
-                is_intermediate=True,
-                presentation=event.presentation,
+                structured_output_completed=event.structured_output_completed,
                 created_at=event.timestamp,
+                # Sent, Continue or Retry: the backend keeps this instant on the turn, for replay to time it alike.
+                turn_started_at=self._state.run.started_at,
             )
-            s.debug("InvocationMessage", f"(intermediate, {len(event.text)} chars)")
-        elif event.is_final:
-            was_live = s.agent_running
-            terminal_generation = self._state.run.generation
-            terminal_request = GcAbsorbRequested(GcAbsorbReason.TURN_TERMINAL, terminal_boundary=True)
-            terminal_owned = False
-            try:
-                ui.flash_turn_complete()
-                await ui.add_agent_message(
-                    event.text,
-                    is_final=True,
-                    structured_output_completed=event.structured_output_completed,
-                    created_at=event.timestamp,
-                )
-            finally:
-                if self._state.run.generation == terminal_generation and s.agent_running:
-                    ui.mark_terminal_title_completed()
-                    s.set_agent_running(False)
-                    terminal_owned = True
-            if not terminal_owned:
-                s.debug("InvocationMessage", "ignored stale terminal completion")
-                return
-            self._callbacks.post_gc_message(terminal_request)
-            if was_live:
-                self._notify(NotificationEvent.TURN_COMPLETE)
-            s.debug("InvocationMessage", f"({len(event.text)} chars)")
-        else:
-            ui.show_status(STATUS_STREAMING.bind())
-            await ui.add_agent_message(event.text, is_final=False, created_at=event.timestamp)
-
-    async def on_presentation_attempt_accepted(self, event: InvocationPresentationAttemptAccepted) -> None:
-        """Commit canonical provisional text and remove rejected siblings."""
-        if event.origin.kind == "sub_agent":
-            await self.on_sub_agent_presentation_accepted(event)
+        finally:
+            if self._state.run.generation == terminal_generation and s.agent_running:
+                ui.mark_terminal_title_completed()
+                s.set_agent_running(False)
+                terminal_owned = True
+        if not terminal_owned:
+            s.debug("InvocationMessage", "ignored stale terminal completion")
             return
-        if event.origin.kind != "turn":
-            return
-        self._state.render_gate.accept_presentation_attempt(event.attempt_id, event.segment_ids)
-        await self._ui().accept_presentation_attempt(event.attempt_id, event.segment_ids)
-
-    async def on_presentation_attempt_rejected(self, event: InvocationPresentationAttemptRejected) -> None:
-        """Retract provisional text from a rejected response attempt."""
-        if event.origin.kind == "sub_agent":
-            await self.on_sub_agent_presentation_rejected(event)
-            return
-        if event.origin.kind != "turn":
-            return
-        self._state.render_gate.reject_presentation_attempt(event.attempt_id)
-        await self._ui().reject_presentation_attempt(event.attempt_id)
+        self._callbacks.post_gc_message(terminal_request)
+        if was_live:
+            self._notify(NotificationEvent.TURN_COMPLETE)
+        s.debug("InvocationMessage", f"({len(event.text)} chars)")
 
     async def on_injection_outcome(self, event: UserInjectResult) -> None:
         s = self
@@ -1255,38 +1309,16 @@ class BackendEventHandler:
             tool_name=event.tool_name,
         )
 
-    async def on_sub_agent_message(self, event: InvocationMessage) -> None:
-        """Append invocation-scoped assistant prose to the nested transcript."""
+    async def on_sub_agent_content(self, event: InvocationContentDelta | InvocationContentFinished) -> None:
+        """Show a sub-agent's answer in its nested transcript, each segment whole once it ends."""
         if not _chat_sub_agent(event.origin):
             return
-        if not self.agent_running:
-            return
-        self._ui().add_sub_agent_message(
-            event.agent_name,
-            event.origin.invocation_id,
-            event.text,
-            presentation=event.presentation,
-        )
-
-    async def on_sub_agent_presentation_accepted(self, event: InvocationPresentationAttemptAccepted) -> None:
-        """Commit provisional nested assistant segments."""
-        if not _chat_sub_agent(event.origin):
-            return
-        if not self.agent_running:
-            return
-        self._ui().accept_sub_agent_presentation(
-            event.origin.invocation_id,
-            event.attempt_id,
-            event.segment_ids,
-        )
-
-    async def on_sub_agent_presentation_rejected(self, event: InvocationPresentationAttemptRejected) -> None:
-        """Retract provisional nested assistant segments."""
-        if not _chat_sub_agent(event.origin):
-            return
-        if not self.agent_running:
-            return
-        self._ui().reject_sub_agent_presentation(event.origin.invocation_id, event.attempt_id)
+        # Taken even once the run stopped: a cancelled child still ends its segment, which releases its text.
+        answer = self._sub_agent_answers.take(event)
+        if answer is not None and self.agent_running:
+            self._ui().add_sub_agent_answer(
+                event.agent_name, event.origin.invocation_id, answer.segment_id, answer.text
+            )
 
     async def on_sub_agent_tool_start(self, event: InvocationToolCallStart) -> None:
         if not _chat_sub_agent(event.origin):
@@ -1498,6 +1530,13 @@ class BackendEventHandler:
             ),
         )
 
+    async def on_answer_withdrawn(self, event: InvocationAnswerWithdrawn) -> None:
+        """A bare Continue or Retry dropped this answer from history to ask for it again: it goes from view."""
+        if event.origin.kind == "turn":
+            await self._ui().withdraw_answer(event.segment_ids)
+        elif _chat_sub_agent(event.origin):
+            self._ui().sub_agent_answer_withdrawn(event.origin.invocation_id, event.segment_ids)
+
     async def on_sub_agent_resumed_after_pause(self, event: InvocationResumed) -> None:
         """Clear the paused state — the controller is running again."""
         if not _chat_sub_agent(event.origin):
@@ -1626,6 +1665,14 @@ class BackendEventHandler:
             s.notify(_APPROVAL_MODE_CHANGED.bind(mode=mode_label), title=_APPROVAL_TITLE.bind(), timeout=2)
         s.debug("ApprovalMode", label)
 
+    async def on_hook_confirmation_request(self, event: HookConfirmationRequest) -> None:
+        """Claim a hook's question and show it (or queue it behind the one open); never wait for the answer."""
+        self._hook_confirmations.on_request(event)
+
+    async def on_hook_confirmation_withdrawn(self, event: HookConfirmationWithdrawn) -> None:
+        """A shown or queued hook question ended without the user: drop it, answering nothing."""
+        self._hook_confirmations.on_withdrawn(event)
+
     async def on_question_to_user(self, event: QuestionToUser) -> None:
         await self._questions().on_question(event)
 
@@ -1707,6 +1754,38 @@ class BackendEventHandler:
         """Show the current session's last background command list, or none."""
         last = self._state.runtime.background_tasks
         self._ui().set_background_tasks(last.tasks if last is not None else ())
+
+    async def on_hook_executions_changed(self, event: HookExecutionsChanged) -> None:
+        # Kept per session: a session not current yet (its build, before its
+        # SessionReady) shows once it is; a closing one's never displaces the
+        # current one's. Stored before any await, so each session's stored
+        # snapshot is its latest published one: the manager publishes right
+        # after each change, and this handler must never await before storing.
+        self._state.runtime.hook_snapshots[event.session_id or ""] = event
+        if event.session_id == self.main_usage_source_id:
+            self.refresh_hook_indicator()
+
+    async def on_hook_runs_changed(self, _event: HookRunsChanged) -> None:
+        # Every session's runs show, so no session filter. Only marks the panel
+        # stale: it rereads the run log on its own pump, once per pump at most,
+        # and only while it shows.
+        self._ui().hook_runs_changed()
+
+    def refresh_hook_indicator(self) -> None:
+        """Queue one render of the last hook snapshot; snapshots arriving before it runs share it."""
+        runtime = self._state.runtime
+        if runtime.hook_render_pending:
+            return
+        runtime.hook_render_pending = True
+        # On the screen's own pump: the manager publishes from hook tasks.
+        if not self._view.call_later(self._show_hook_indicator):
+            runtime.hook_render_pending = False
+
+    def _show_hook_indicator(self) -> None:
+        """Hand the current session's last hook snapshot to the hook indicator."""
+        self._state.runtime.hook_render_pending = False
+        last = self._state.runtime.hook_snapshots.get(self.main_usage_source_id)
+        self._ui().set_hook_executions(last.executions if last is not None else ())
 
     async def on_todo_list_updated(self, event: TodoListUpdated) -> None:
         s = self
@@ -1817,6 +1896,15 @@ class BackendEventHandler:
             f"side_calls={event.side_call_tokens:,}/{event.side_call_token_budget:,}",
         )
 
+    def notify_held_error(self, event: Error) -> None:
+        """Show an error held back while a submit that opened no turn was in flight: a notice, never a failed turn.
+
+        It came from something else (the submit's own refusal is handled as it
+        arrives), and no turn ran, so the transcript and retry mode stay as they are.
+        """
+        message = event.message if event.display_message is None else self._render_display(event.display_message)
+        self.notify(message, title=_WARNING_TITLE.bind(), severity="warning", timeout=8)
+
     async def on_warning(self, event: Warning) -> None:
         s = self
         submit_rejected = event.code in _SUBMIT_BLOCKING_WARNING_CODES and s.in_pending_submit_publish
@@ -1924,7 +2012,9 @@ class BackendEventHandler:
             s.push_screen(dialog)
             s.debug("Error", f"[{event.code}] {full_msg[:60]}")
             return
-        if s.in_pending_submit_publish and event.code in _SUBMIT_BLOCKING_ERROR_CODES:
+        if s.in_pending_submit_publish and (
+            event.code in _SUBMIT_BLOCKING_ERROR_CODES or event.code.startswith(_REBUILD_REFUSED_PREFIX)
+        ):
             # The backend refusing the submit in flight: the message, never a
             # run (see ``SubmitKind``).
             s.block_pending_user_submit()
@@ -1938,9 +2028,15 @@ class BackendEventHandler:
                 self._callbacks.prompt_missing_working_dir("submit" if restored else "turn_end")
                 s.debug("Error", f"[{event.code}] {full_msg[:60]}")
                 return
-            await self._show_pending_submit_error(event.code, display_full, raw_message=full_msg)
+            await self._show_pending_submit_error(
+                event.code,
+                display_full,
+                raw_message=full_msg,
+                # Gone from this working folder: the draft comes back as plain text, sent as typed next time.
+                drop_owner=event.code == _SHORTCUT_UNAVAILABLE_CODE,
+            )
             return
-        if s.pending_user_message_render_active:
+        if s.defers_turn_event(event):
             s.defer_error(event)
             return
         # A classified failure shows what went wrong, then the service's own
@@ -1982,10 +2078,19 @@ class BackendEventHandler:
             self._notify(NotificationEvent.TURN_ERROR)
         s.debug("Error", f"[{event.code}] {full_msg[:60]}")
 
-    def _restore_pending_submit_text(self) -> InputRestore | None:
-        """Restore the prompt text that the input widget cleared on submit."""
-        s = self
-        return self._ui().restore_input_text(s.pending_user_submit_text)
+    def _restore_pending_submit_text(self, *, drop_owner: bool = False) -> InputRestore | None:
+        """Restore the draft the input widget cleared on submit, whole (fields, prompt-shortcut owner), once.
+
+        None when nothing was written: the composer holds the user's own draft,
+        or the submit's draft went back already. *drop_owner* hands it back as
+        plain text (its shortcut is no longer one here).
+        """
+        draft = self._state.submit.take_draft_for(
+            lambda: (self._services.session_generation(), self._state.workspace.current_cwd), drop_owner=drop_owner
+        )
+        if draft is None:
+            return None
+        return self._ui().restore_input_text(draft)
 
     def _show_image_rejection_dialog(self, code: str, message: str) -> None:
         """Show the image rejection modal for a backend-validated prompt."""
@@ -2017,7 +2122,9 @@ class BackendEventHandler:
 
         self.push_screen(dialog, callback=on_dismiss)
 
-    async def _show_pending_submit_error(self, code: str, message: str, *, raw_message: str | None = None) -> None:
+    async def _show_pending_submit_error(
+        self, code: str, message: str, *, raw_message: str | None = None, drop_owner: bool = False
+    ) -> None:
         """Surface a synchronous submit rejection without switching into retry mode.
 
         ``message`` may be localized display text; the debug stream keeps
@@ -2026,7 +2133,7 @@ class BackendEventHandler:
         s = self
         ui = self._ui()
 
-        self._restore_pending_submit_text()
+        self._restore_pending_submit_text(drop_owner=drop_owner)
         short_msg = message
         if "- {" in short_msg:
             short_msg = short_msg[: short_msg.index("- {")].strip()

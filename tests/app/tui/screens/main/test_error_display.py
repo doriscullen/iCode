@@ -28,7 +28,7 @@ from chrys.foundation.events.types import (
 )
 from chrys.foundation.i18n import Localizer, MessageRef
 from tests.support.provider_errors import anthropic_status
-from tests.support.tui_helpers import make_backend_handler
+from tests.support.tui_helpers import fake_session_title, make_backend_handler
 
 _RAW = "Connection error."
 _DNS = _DNS_FAILED.bind(host="api.example.com")
@@ -107,6 +107,7 @@ def _handler(
         _state=MainScreenState(run=RunState(agent_running=running, agent_loading=loading)),
         query_one=lambda cls: widgets[cls.__name__],
         _debug=lambda key, message: surfaces.debug.append((key, message)),
+        _session_title=fake_session_title(),
     )
     handler = make_backend_handler(screen, locale_controller=locale_controller)
     handler._agent_load_dialog = None

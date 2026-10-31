@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from chrys.foundation.config.settings import Settings
-from chrys.foundation.config.settings_store import LoadedSettings, SettingsHandle
+from chrys.foundation.config.settings_store import LoadedSettings, PreparedSettings, SettingsHandle
 from chrys.foundation.events.bus import EventBus
 from chrys.foundation.events.types import AgentRuntimeDetails, ApprovalAutoFulfillBlocked
 from chrys.foundation.models.workspace import Workspace
@@ -141,7 +141,7 @@ class _LoaderFixture:
     def __init__(self, bus: EventBus, executor: _FakeExecutor) -> None:
         self.current = SimpleNamespace(loaded=SimpleNamespace(), manifest=make_manifest())
         self.permits = _Permits()
-        self.session = _BuildSession(session_dir=None, background_tasks=None)
+        self.session = _BuildSession(session_dir=None, background_tasks=None, surface=None)
         self.session.agent_profile = AgentProfile(name="Code")
         self.session.workspace = None
         self.session.session_id = "session-1"
@@ -232,12 +232,17 @@ class _LoaderFixture:
         )
 
 
+def _prepared(loaded: LoadedSettings) -> PreparedSettings:
+    """*loaded* staged as it stands: no session layer, no live choices."""
+    return PreparedSettings(base=loaded, effective=loaded)
+
+
 def _stage(engine: _LoaderFixture) -> agent_lifecycle.StagedBuild:
     """Stage the engine's own live state, as start/soft_restart do for a rebuild."""
     return agent_lifecycle.stage_build(
         session=engine.session,
         persistence=engine.persistence,
-        loaded=engine.loaded_settings,
+        prepared=engine.settings_handle.prepare(engine.settings_handle.base),
         agent_profile=AgentProfile(name="Code"),
         workspace=engine.session.workspace,
         hook_manager=engine.session.hook_manager,
@@ -532,7 +537,7 @@ async def test_a_failed_build_leaves_the_live_state_untouched_and_drains_the_can
 
     staged_coordinator = MagicMock()
     staged = agent_lifecycle.StagedBuild(
-        loaded=LoadedSettings(settings=Settings(default_approval_mode="auto"), provenance={}),
+        prepared=_prepared(LoadedSettings(settings=Settings(default_approval_mode="auto"), provenance={})),
         agent_profile=AgentProfile(name="Code"),
         workspace=Workspace.from_cwd(str(tmp_path / "new")),
         hook_manager=MagicMock(),
@@ -570,7 +575,7 @@ async def test_the_build_commit_installs_the_staged_state_together(tmp_path: Pat
     engine.session.mutation_coordinator = old_coordinator
 
     staged = agent_lifecycle.StagedBuild(
-        loaded=LoadedSettings(settings=Settings(default_approval_mode="auto"), provenance={}),
+        prepared=_prepared(LoadedSettings(settings=Settings(default_approval_mode="auto"), provenance={})),
         agent_profile=AgentProfile(name="Code"),
         workspace=Workspace.from_cwd(str(tmp_path / "new")),
         hook_manager=MagicMock(),
@@ -629,7 +634,7 @@ async def test_a_cancelled_post_commit_cleanup_still_leaves_the_committed_profil
 
     engine.current.loaded.prepared.own(_record_replaced_cleanup)
     staged = agent_lifecycle.StagedBuild(
-        loaded=LoadedSettings(settings=Settings(), provenance={}),
+        prepared=_prepared(LoadedSettings(settings=Settings(), provenance={})),
         agent_profile=AgentProfile(name="Explore"),
         workspace=None,
         hook_manager=None,
@@ -669,7 +674,7 @@ async def test_a_cancelled_post_commit_cleanup_still_carries_the_preserved_histo
     old_executor = _CancelledOnClose(old_approval)
     engine = _LoaderFixture(bus, old_executor)
     staged = agent_lifecycle.StagedBuild(
-        loaded=LoadedSettings(settings=Settings(), provenance={}),
+        prepared=_prepared(LoadedSettings(settings=Settings(), provenance={})),
         agent_profile=AgentProfile(name="Explore"),
         workspace=None,
         hook_manager=None,
@@ -767,47 +772,42 @@ async def _build_with_captured_callbacks() -> tuple[_LoaderFixture, dict]:
 
 
 @pytest.mark.asyncio
-async def test_intermediate_capture_async_records_batch_id_at_capture_time() -> None:
-    """The async callback maps the POST-increment batch id — the same id the
+async def test_intermediate_capture_records_batch_id_at_capture_time() -> None:
+    """The callback maps the POST-increment batch id — the same id the
     batch's subsequent tool records are stamped with — to the captured text.
     An empty-text boundary advances the counter but writes no mapping entry.
     """
     engine, captured = await _build_with_captured_callbacks()
-    on_async = captured["on_intermediate_async"]
-    buffer = captured["intermediate_buffer"]
+    on_intermediate = captured["on_intermediate"]
+    counter = captured["batch_counter"]
 
-    await on_async("")  # tool-only boundary
-    assert buffer.batch_id == 1
+    on_intermediate("")  # tool-only boundary
+    assert counter.batch_id == 1
     assert engine.current.loaded.intermediate_texts == {}
 
-    await on_async("first text")
-    assert buffer.batch_id == 2
+    on_intermediate("first text")
+    assert counter.batch_id == 2
     assert engine.current.loaded.intermediate_texts == {2: "first text"}
 
-    await on_async("")  # another boundary — mapping unchanged
-    assert buffer.batch_id == 3
+    on_intermediate("")  # another boundary — mapping unchanged
+    assert counter.batch_id == 3
     assert engine.current.loaded.intermediate_texts == {2: "first text"}
 
 
 @pytest.mark.asyncio
-async def test_intermediate_capture_sync_and_async_paths_yield_identical_mappings() -> None:
-    """The same event sequence — including a second pass continuing the counter
-    (``reset_batch_id=False`` retry semantics: nothing resets the buffer) —
-    produces the same ``batch_id → text`` mapping on both paths.
-    """
-    engine_a, captured_a = await _build_with_captured_callbacks()
-    engine_s, captured_s = await _build_with_captured_callbacks()
-    on_async = captured_a["on_intermediate_async"]
-    on_sync = captured_s["on_intermediate_sync"]
+async def test_intermediate_capture_continues_numbering_across_passes() -> None:
+    """A second pass continues the counter (retry semantics: nothing resets it)."""
+    engine, captured = await _build_with_captured_callbacks()
+    on_intermediate = captured["on_intermediate"]
 
     sequence = ["", "first text", "", "second text", ""]
-    for text in sequence:  # pass 1 + retry continuation, uninterrupted counter
-        await on_async(text)
-    for text in sequence:
-        on_sync(text)
+    for text in [*sequence, *sequence]:  # pass 1 + retry continuation, uninterrupted counter
+        on_intermediate(text)
 
-    expected = {2: "first text", 4: "second text"}
-    assert engine_a.current.loaded.intermediate_texts == expected
-    assert engine_s.current.loaded.intermediate_texts == expected
-    assert captured_a["intermediate_buffer"].batch_id == len(sequence)
-    assert captured_s["intermediate_buffer"].batch_id == len(sequence)
+    assert engine.current.loaded.intermediate_texts == {
+        2: "first text",
+        4: "second text",
+        7: "first text",
+        9: "second text",
+    }
+    assert captured["batch_counter"].batch_id == 2 * len(sequence)

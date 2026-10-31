@@ -9,6 +9,7 @@ ERROR_MESSAGE_IDS = frozenset(
         "error.display.with_hint",
         "error.hint.maybe_offline",
         "error.kind.auth_failed",
+        "error.kind.blank_response",
         "error.kind.connect_timeout",
         "error.kind.connection_failed",
         "error.kind.connection_lost",
@@ -34,6 +35,7 @@ ERROR_MESSAGE_IDS = frozenset(
         "error.kind.tls_failed",
         "error.kind.via_proxy_failed",
         "error.kind.write_timeout",
+        "retry.blank_response",
         "retry.context_overflow",
         "retry.stream_stalled",
     }

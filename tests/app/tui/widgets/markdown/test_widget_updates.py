@@ -5,12 +5,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 
+import pytest
 from textual.app import App
 from textual.await_complete import AwaitComplete
+from textual.content import Content
 from textual.pilot import Pilot
 
+from chrys.app.tui.widgets.markdown import parser as parser_module
+from chrys.app.tui.widgets.markdown import widget as widget_module
 from chrys.app.tui.widgets.markdown.blocks import MarkdownBlock
 from chrys.app.tui.widgets.markdown.widget import VirtualizedMarkdown
 from tests.support.waiting import wait_for
@@ -60,6 +65,25 @@ async def _mounted(app: App[None], pilot: Pilot[None]) -> _RecordingMarkdown:
 
 def _installed_text(widget: VirtualizedMarkdown) -> str:
     return "\n".join(block.content.plain for block in widget._blocks)
+
+
+async def test_an_update_before_mount_is_the_text_mount_installs() -> None:
+    app = App()
+    async with app.run_test():
+        widget = VirtualizedMarkdown("Built with this.")
+        widget.update("Updated before mount.")
+        await app.mount(widget)
+        assert (widget.source, widget.shown_source) == ("Updated before mount.", "Updated before mount.")
+
+
+async def test_an_append_before_mount_adds_to_the_text_the_widget_was_built_with() -> None:
+    app = App()
+    async with app.run_test():
+        widget = VirtualizedMarkdown("Built with this.")
+        widget.append(" Appended before mount.")
+        await app.mount(widget)
+        shown = "Built with this. Appended before mount."
+        assert (widget.source, widget.shown_source) == (shown, shown)
 
 
 async def test_overlapping_updates_resolve_anchors_in_the_newest_document() -> None:
@@ -145,6 +169,123 @@ async def test_every_awaitable_resolves_after_its_own_text_or_newer_is_installed
         assert seen["one"] in {"one", "three"}
         assert seen["two"] == "three"
         assert seen["three"] == "three"
+
+
+async def test_a_parse_that_runs_long_logs_every_threads_stack_once_and_then_how_long_it_took(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def reports(text: str) -> list[str]:
+        return [record.getMessage() for record in caplog.records if text in record.getMessage()]
+
+    app = App()
+    async with app.run_test() as pilot:
+        widget = await _mounted(app, pilot)
+        parse_watch = widget_module._ParseWatch
+        due: list[widget_module._ParseWatch] = []
+
+        class _ReportWhenRunning(parse_watch):
+            """Keeps the timer's report: a loaded runner may start the parse's thread after the shortened timer."""
+
+            __slots__ = ()
+
+            def report(self) -> None:
+                due.append(self)
+
+        # Only now: the mount's own parse keeps the real timer.
+        monkeypatch.setattr(widget_module, "_PARSE_STALL_REPORT_SECONDS", 0.05)
+        monkeypatch.setattr(widget_module, "_ParseWatch", _ReportWhenRunning)
+        widget.hold_first_parse = True
+        with caplog.at_level(logging.WARNING, logger=widget_module.__name__):
+            try:
+                update = widget.update("held\n")
+                await wait_for(
+                    lambda: due and widget.first_parse_started.is_set(),
+                    pilot=pilot,
+                    description="held parse due its report",
+                )
+                # On the loop, as the timer runs it.
+                parse_watch.report(due[0])
+                assert reports("Markdown parse is running on thread")
+                assert not reports("Markdown parse ended")
+            finally:
+                widget.release_first_parse.set()
+            await update
+
+        [report] = reports("Markdown parse is running on thread")
+        # The parse's own frame is in it, where the test double holds it.
+        [parse_stack] = [stack for stack in report.split("\n--- ") if "(the parse)" in stack]
+        assert "in _build_blocks" in parse_stack
+        assert len(reports("Markdown parse ended after")) == 1
+        assert _installed_text(widget) == "held"
+
+
+def test_a_parse_report_says_only_what_the_parse_did(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger=widget_module.__name__):
+        # A loop that resumes late runs the report after the parse ended: nothing to report.
+        ended = widget_module._ParseWatch()
+        ended.run(lambda markdown: [], "done\n")
+        ended.report()
+        ended.ended()
+        assert caplog.records == []
+
+        # Quitting gives up waiting for a parse that never ended.
+        stuck = widget_module._ParseWatch()
+        stuck.report()
+        stuck.ended()
+    assert [record.getMessage().split(" after ")[0] for record in caplog.records] == [
+        "Markdown parse has not started: no executor thread took it",
+        "Markdown parse was given up unfinished",
+    ]
+
+
+async def test_a_table_keeps_painting_while_a_newer_update_parses() -> None:
+    """The old document paints until the new one is installed; streaming must not blank its table."""
+    app = App()
+    async with app.run_test() as pilot:
+        widget = await _mounted(app, pilot)
+        await widget.update("| a | b |\n|---|---|\n| one | two |\n")
+        rows = [widget.render_line(y).text for y in range(widget._total_lines)]
+        assert "one" in "".join(rows)
+
+        widget.hold_first_parse = True
+        try:
+            update = widget.update("| a | b |\n|---|---|\n| one | two |\n| three | four |\n")
+            await wait_for(widget.first_parse_started.is_set, pilot=pilot, description="newer parse started")
+            assert [widget.render_line(y).text for y in range(len(rows))] == rows
+        finally:
+            widget.release_first_parse.set()
+        await update
+
+        assert "three" in "".join(widget.render_line(y).text for y in range(widget._total_lines))
+
+
+def test_streamed_reparses_highlight_a_closed_fence_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    highlighted: list[str] = []
+    real_highlight = parser_module.highlight_code
+
+    def recording_highlight(code: str, language: str) -> Content:
+        highlighted.append(code)
+        return real_highlight(code, language)
+
+    monkeypatch.setattr(parser_module, "highlight_code", recording_highlight)
+    monkeypatch.setattr(widget_module, "highlight_code", recording_highlight)
+    widget = VirtualizedMarkdown()
+    # A long answer: more closed fences than a small fixed-size cache would hold.
+    closed_codes = [f"x = {index}" for index in range(40)]
+    closed = "".join(f"```python\n{code}\n```\n\n" for code in closed_codes)
+
+    reparses = [
+        widget._build_blocks(closed + "Tail"),
+        widget._build_blocks(closed + "Tail grows\n\n```python\ny = 2\n"),
+        widget._build_blocks(closed + "Tail grows\n\n```python\ny = 2\nz = 3\n"),
+    ]
+
+    first = [block.content for block in reparses[0] if block.block_type == "fence"]
+    for blocks in reparses[1:]:
+        fences = [block.content for block in blocks if block.block_type == "fence"]
+        assert all(fence is kept for fence, kept in zip(fences[: len(first)], first, strict=True))
+    # The open fence is still being written: each reparse highlights its newest code.
+    assert highlighted == [*closed_codes, "y = 2", "y = 2\nz = 3"]
 
 
 async def test_cancelling_one_awaiter_leaves_the_shared_parse_to_the_others() -> None:

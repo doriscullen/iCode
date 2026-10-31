@@ -27,6 +27,8 @@ from textual.widgets.option_list import Option, OptionDoesNotExist
 from chrys.app.tui.binding_display import CANCEL_BINDING, localized_binding
 from chrys.app.tui.i18n import render_str, widget_locale_controller, widget_localizer
 from chrys.app.tui.screens.dialogs.base import BaseDialog
+from chrys.app.tui.util.formatting import with_count_hint
+from chrys.app.tui.util.static_update import update_static_in_place
 from chrys.app.tui.widgets import Checkbox, ConfigAddButton, Select
 from chrys.app.tui.widgets import EnhancedInput as Input
 from chrys.foundation.branding import APP_DISPLAY_NAME
@@ -730,9 +732,10 @@ class ModelConfigScreen(BaseDialog[str]):
     is running: profile navigation stays available, but mutating controls
     are hidden/disabled and Close/Escape always dismisses with ``""``.
 
-    Dismisses with ``"switched"`` when deleting the runtime-effective
-    profile requires a backend reload, ``"updated"`` after a Save, or
-    ``""`` on Close / Escape when the runtime can remain unchanged.
+    Dismisses with ``"deleted"`` when a profile was deleted (a backend
+    reload drops whatever the session used that is gone — the process
+    pointer's, the session's own, an agent's), ``"updated"`` after a Save,
+    or ``""`` on Close / Escape when the runtime can remain unchanged.
     """
 
     CSS_PATH = "screen.tcss"
@@ -822,8 +825,9 @@ class ModelConfigScreen(BaseDialog[str]):
 
                         # Max context tokens
                         yield Label(
-                            f"[red]*[/red] {escape(render_str(localizer, _MAX_CONTEXT_WINDOW.bind()))}",
+                            self._max_context_label(str(DEFAULT_MAX_CONTEXT_TOKENS)),
                             classes="mc-label",
+                            id="mc-max-tokens-label",
                         )
                         yield Input(
                             value=str(DEFAULT_MAX_CONTEXT_TOKENS),
@@ -1362,16 +1366,24 @@ class ModelConfigScreen(BaseDialog[str]):
         self._refresh_max_output_label(provider, str(api_style_select.value))
 
     def _refresh_max_output_label(self, provider: str, api_style: str) -> None:
-        self.query_one("#mc-max-output-label", Label).update(self._max_output_label(provider, api_style))
+        raw = self.query_one("#mc-max-output-tokens", Input).value
+        # Updated per keystroke: lay out only when the hint changes the wrapped line count.
+        update_static_in_place(
+            self.query_one("#mc-max-output-label", Label), self._max_output_label(provider, api_style, raw)
+        )
 
-    def _max_output_label(self, provider: str, api_style: str) -> Text:
+    def _max_output_label(self, provider: str, api_style: str, raw: str = "") -> Text:
         param = _token_limit_param_name(provider, api_style)
         rendered = self._render_toast(_MAX_OUTPUT_TOKENS.bind(param=param))
         label = Text(rendered)
         start = rendered.find(param)
         if start >= 0:
             label.stylize("dim", start, start + len(param))
-        return label
+        return with_count_hint(label, raw)
+
+    def _max_context_label(self, raw: str) -> Text:
+        label = Text.assemble(("*", "red"), " ", self._render_toast(_MAX_CONTEXT_WINDOW.bind()))
+        return with_count_hint(label, raw)
 
     # ── Events ───────────────────────────────────────────────────────
 
@@ -1381,6 +1393,17 @@ class ModelConfigScreen(BaseDialog[str]):
 
     @on(Select.Changed, "#mc-api-style")
     def _on_api_style_changed(self, _event: Select.Changed) -> None:
+        self._refresh_max_output_label(
+            str(self.query_one("#mc-provider", Select).value),
+            str(self.query_one("#mc-api-style", Select).value),
+        )
+
+    @on(Input.Changed, "#mc-max-tokens")
+    def _on_max_context_changed(self, event: Input.Changed) -> None:
+        update_static_in_place(self.query_one("#mc-max-tokens-label", Label), self._max_context_label(event.value))
+
+    @on(Input.Changed, "#mc-max-output-tokens")
+    def _on_max_output_changed(self, _event: Input.Changed) -> None:
         self._refresh_max_output_label(
             str(self.query_one("#mc-provider", Select).value),
             str(self.query_one("#mc-api-style", Select).value),
@@ -1571,11 +1594,12 @@ class ModelConfigScreen(BaseDialog[str]):
         """Actually delete the profile after confirmation.
 
         Deleting the global default promotes, in the user settings document,
-        the first remaining profile as the sidebar lists them. Deleting the runtime-effective profile also
-        resynchronizes the process pointer to a selectable profile — the
-        file default when it resolves, else the first selectable one —
-        and requests a backend reload. If no profiles remain, a fresh
-        editable profile is created before either pointer is reconciled.
+        the first remaining profile as the sidebar lists them. Deleting the process pointer's profile also
+        resynchronizes the pointer to a selectable profile — the file
+        default when it resolves, else the first selectable one. Any
+        deletion requests a backend reload, which drops whatever the session
+        used that is gone. If no profiles remain, a fresh editable profile
+        is created before either pointer is reconciled.
         """
         if self._read_only:
             return
@@ -1629,7 +1653,9 @@ class ModelConfigScreen(BaseDialog[str]):
                 set_model_pointer(replacement.id, origin=SettingOrigin(layer=Source.PROCESS_RUNTIME))
             else:
                 set_model_pointer(None, origin=SettingOrigin(layer=Source.PROCESS_RUNTIME))
-            self._requires_runtime_reload = True
+        # Whichever of the session's models it was — the pointer's, the session's own, an
+        # agent's — the reload finds out; telling them apart here would be a second definition.
+        self._requires_runtime_reload = True
 
         if seeded_default:
             return
@@ -1757,17 +1783,16 @@ class ModelConfigScreen(BaseDialog[str]):
     def _cancel_result(self) -> str:
         """Return the dismiss result from explicit reload requirements.
 
-        * ``"switched"`` — deleting the runtime-effective profile set
-          the reload latch after reconciling the process pointer.
+        * ``"deleted"`` — a profile was deleted (after reconciling the
+          process pointer): the reload drops whatever is gone.
         * ``"updated"`` — at least one Save reached disk + registry;
           the engine must rebuild so profile edits take effect.
-        * ``""`` — no runtime reload is required; a global-default-only
-          deletion applies to future processes.
+        * ``""`` — no runtime reload is required.
         """
         if self._read_only:
             return ""
         if self._requires_runtime_reload:
-            return "switched"
+            return "deleted"
         if self._saved_anything:
             return "updated"
         return ""

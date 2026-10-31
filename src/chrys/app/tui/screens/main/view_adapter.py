@@ -12,7 +12,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from textual.css.query import NoMatches
-from textual.widgets import Footer
 
 from chrys.app.tui.buddy_messages import BUDDY_TITLE
 from chrys.app.tui.clipboard import copy_text_to_clipboards
@@ -40,13 +39,16 @@ from chrys.app.tui.screens.main.ports import (
 from chrys.app.tui.screens.main.runtime_info import with_background_count
 from chrys.app.tui.terminal.panel import ShellPanel
 from chrys.app.tui.terminal.widget import Terminal
+from chrys.app.tui.util.liveness import composed_live
 from chrys.app.tui.widgets import PromptDraft
 from chrys.app.tui.widgets.chat.file_snapshot import FileSnapshotPayload
 from chrys.app.tui.widgets.chat.panel import ChatPanel
 from chrys.app.tui.widgets.chat.session_json import SessionJsonPanel
 from chrys.app.tui.widgets.chrome.app_header import AppHeader
+from chrys.app.tui.widgets.chrome.hook_indicator import HookIndicator
 from chrys.app.tui.widgets.chrome.image_paste import clipboard_image_dir_for_session
-from chrys.app.tui.widgets.chrome.input_bar import InputBar
+from chrys.app.tui.widgets.chrome.input_bar import ChatDraft, InputBar
+from chrys.app.tui.widgets.chrome.prompt_card import PromptCard
 from chrys.app.tui.widgets.chrome.status_bar import (
     STATUS_AGENT_LOAD_FAILED,
     STATUS_INTERACTIVE_MODE,
@@ -66,6 +68,7 @@ from chrys.foundation.events.types import (
     AgentRuntimeDetails,
     ApprovalRequest,
     ApprovalReviewed,
+    HookConfirmationRequest,
     QuestionToUser,
 )
 from chrys.foundation.i18n.formatting import format_message
@@ -86,8 +89,9 @@ if TYPE_CHECKING:
     from chrys.app.tui.screens.main.state import MainScreenState
     from chrys.app.tui.util.diff_entries import DiffFileEntry, DiffLoadResult
     from chrys.app.tui.widgets.chrome.commands import ManPageSpec
-    from chrys.foundation.events.types import ProvisionalPresentation
     from chrys.foundation.models.background_tasks import BackgroundTaskView
+    from chrys.foundation.models.hook_executions import HookExecutionView
+    from chrys.foundation.models.invocations import ContentChannel
     from chrys.foundation.models.session_surface import SessionSurface
     from chrys.foundation.models.todos import TodoItem
     from chrys.service.approval.judge import JudgeVerdict
@@ -228,10 +232,17 @@ class MainScreenViewAdapter:
             )
         )
 
-    def open_runtime_details(self, details: AgentRuntimeDetails) -> None:
+    def open_runtime_details(self, details: AgentRuntimeDetails, *, initial_tab: str | None = None) -> None:
         from chrys.app.tui.screens.dialogs.runtime_details import RuntimeDetailsDialog
 
-        self._screen.app.push_screen(RuntimeDetailsDialog(details))
+        self._screen.app.push_screen(
+            RuntimeDetailsDialog(
+                details,
+                initial_tab=initial_tab,
+                load_shortcuts=self._screen.prompt_shortcut_sources_loader(),
+                shortcut_model=self._screen.shortcut_model_text,
+            )
+        )
 
     def run_worker(self, awaitable: Awaitable[Any], *, group: str) -> None:
         self._screen.run_worker(awaitable, exclusive=False, group=group)
@@ -242,8 +253,8 @@ class MainScreenViewAdapter:
     def call_after_refresh(self, callback: Callable[[], None]) -> None:
         self._screen.call_after_refresh(callback)
 
-    def call_later(self, callback: Callable[[], None]) -> None:
-        self._screen.call_later(callback)
+    def call_later(self, callback: Callable[[], None]) -> bool:
+        return self._screen.call_later(callback)
 
     def stop_shell(self) -> None:
         self._screen.query_one(ShellPanel).stop()
@@ -303,6 +314,9 @@ class MainScreenViewAdapter:
 
     def hide_trailing_status_action(self) -> None:
         self._screen.query_one(ChatPanel).hide_trailing_status_action()
+
+    async def withdraw_answer(self, segment_ids: tuple[str, ...]) -> None:
+        await self._screen.query_one(ChatPanel).withdraw_answer(segment_ids)
 
     def set_retry_pending(self, pending: bool) -> None:
         self._screen.query_one(InputBar).retry_pending = pending
@@ -431,6 +445,12 @@ class MainScreenViewAdapter:
     def clear_todos(self) -> None:
         self._screen.todo_state = TodoListState()
 
+    def set_hook_executions(self, executions: tuple[HookExecutionView, ...]) -> None:
+        self._screen.query_one(HookIndicator).set_executions(executions)
+
+    def hook_runs_changed(self) -> None:
+        self._screen.query_one(SidebarPanel).hooks_panel.runs_changed()
+
     def set_background_tasks(self, tasks: tuple[BackgroundTaskView, ...]) -> None:
         self._screen.background_tasks_state = tasks
         running = sum(task.running for task in tasks)
@@ -462,11 +482,11 @@ class MainScreenViewAdapter:
         if input_bar.locked or input_bar.value.strip() == text:
             input_bar.unlock_and_clear()
 
-    def restore_input_draft(self, text: str) -> bool:
-        """Hand *text* back to an empty composer; a draft already there wins."""
-        return self._screen.query_one(InputBar).restore_draft(text)
+    def restore_input_draft(self, draft: str | ChatDraft) -> bool:
+        """Hand *draft* back to an empty composer, whole (fields, owner); a draft already there wins."""
+        return self._screen.query_one(InputBar).restore_draft(draft)
 
-    def restore_input_text(self, text: str) -> InputRestore | None:
+    def restore_input_text(self, draft: str | ChatDraft) -> InputRestore | None:
         """Hand a consumed prompt back to an empty composer, or a queued one's.
 
         Returns proof of that restore for a caller that has to rewrite the same
@@ -475,19 +495,22 @@ class MainScreenViewAdapter:
 
         Every attempt consumes a generation, declined ones included, so an
         outstanding credential dies the moment anything else tries to restore.
+        *draft* goes back whole when it is one (a prompt shortcut's fields and
+        owner included).
         """
         self._input_restore_generation += 1
+        whole = draft if isinstance(draft, ChatDraft) else ChatDraft(draft)
         input_bar = self._screen.query_one(InputBar)
         if input_bar.locked:
             input_bar.unlock_and_keep()
             # A queued message's composer stays read-only from its Enter, which
             # sends the text stripped: holding *text*, it still holds that
             # message, and unlocking it hands the message back.
-            if input_bar.value.strip() == text:
+            if input_bar.value.strip() == whole.text.strip():
                 return InputRestore(generation=self._input_restore_generation, text=input_bar.value)
-        if not input_bar.restore_draft(text):
+        if not input_bar.restore_draft(whole):
             return None
-        return InputRestore(generation=self._input_restore_generation, text=text)
+        return InputRestore(generation=self._input_restore_generation, text=whole.text)
 
     def rewrite_restored_input(self, restore: InputRestore | None, text: str) -> bool:
         """Rewrite the text *restore* put there, while that restore still stands.
@@ -509,7 +532,9 @@ class MainScreenViewAdapter:
         # Rewriting identical text would still reset the cursor and break an
         # in-progress IME composition, so leave the composer alone.
         if text != restore.text:
-            input_bar.value = text
+            # The restore's own draft, rewritten: the prompt shortcut it came back
+            # with stays its owner (its commands follow the new text).
+            input_bar.set_draft(ChatDraft(text, owner=input_bar.draft_owner))
         return True
 
     async def change_shell_directory(self, cwd: str) -> None:
@@ -628,7 +653,13 @@ class MainScreenViewAdapter:
         self._screen.query_one(ChatPanel).display = chat
         self._screen.query_one(StatusBar).display = shell or chat
         self._screen.query_one(InputBar).display = chat
-        self._screen.query_one(Footer).display = not shell
+        # The card belongs to the input: it never stays on a surface that hides it.
+        self._screen.query_one(PromptCard).display = chat
+        # The footer row: the Footer and the hook indicator hide together.
+        self._screen.query_one("#footer-row").display = not shell
+        # It shows the chat session's hook runs only: a workflow's hooks run on
+        # the workflow's own manager, which reports nothing.
+        self._screen.query_one(HookIndicator).display = not workflow
         self._screen._sync_workflow_timer()
 
     def open_confirm_dialog(
@@ -783,38 +814,45 @@ class MainScreenViewAdapter:
         initial_profile: str,
         file_snapshots: dict[str, list[FileSnapshotPayload]] | None,
         compressed_blocks: dict[str, CompressedBlock] | None,
+        recovered_from_sidecar: bool = False,
     ) -> None:
         await self._screen.query_one(ChatPanel).replay_history(
             messages,
             initial_profile=initial_profile,
             file_snapshots=file_snapshots,
             compressed_blocks=compressed_blocks,
+            recovered_from_sidecar=recovered_from_sidecar,
         )
+
+    async def add_answer_delta(self, segment_id: str, text: str) -> None:
+        await self._screen.query_one(ChatPanel).add_answer_delta(segment_id, text)
+
+    def finish_answer_segment(self, segment_id: str, *, completed: bool) -> None:
+        self._screen.query_one(ChatPanel).finish_answer_segment(segment_id, completed=completed)
+
+    async def add_thinking_delta(self, segment_id: str, channel: ContentChannel, text: str) -> None:
+        await self._screen.query_one(ChatPanel).add_thinking_delta(segment_id, channel, text)
+
+    def finish_thinking_segment(self, segment_id: str) -> None:
+        self._screen.query_one(ChatPanel).finish_thinking_segment(segment_id)
+
+    async def abandon_thinking(self, segment_ids: tuple[str, ...]) -> None:
+        await self._screen.query_one(ChatPanel).abandon_thinking(segment_ids)
 
     async def add_agent_message(
         self,
         text: str,
         *,
-        is_final: bool,
-        is_intermediate: bool = False,
         structured_output_completed: bool = False,
-        presentation: ProvisionalPresentation | None = None,
         created_at: datetime | None = None,
+        turn_started_at: datetime | None = None,
     ) -> None:
         await self._screen.query_one(ChatPanel).add_agent_message(
             text,
-            is_final=is_final,
-            is_intermediate=is_intermediate,
             structured_output_completed=structured_output_completed,
-            presentation=presentation,
             created_at=created_at,
+            turn_started_at=turn_started_at,
         )
-
-    async def accept_presentation_attempt(self, attempt_id: str, segment_ids: tuple[str, ...]) -> None:
-        await self._screen.query_one(ChatPanel).accept_presentation_attempt(attempt_id, segment_ids)
-
-    async def reject_presentation_attempt(self, attempt_id: str) -> None:
-        await self._screen.query_one(ChatPanel).reject_presentation_attempt(attempt_id)
 
     async def add_user_injection(self, text: str, *, created_at: datetime) -> None:
         await self._screen.query_one(ChatPanel).add_user_message(text, is_injection=True, created_at=created_at)
@@ -984,35 +1022,8 @@ class MainScreenViewAdapter:
             tool_name=tool_name,
         )
 
-    def add_sub_agent_message(
-        self,
-        agent_name: str,
-        invocation_id: str,
-        text: str,
-        *,
-        presentation: ProvisionalPresentation | None = None,
-    ) -> None:
-        self._screen.query_one(ChatPanel).add_sub_agent_message(
-            agent_name,
-            invocation_id,
-            text,
-            presentation=presentation,
-        )
-
-    def accept_sub_agent_presentation(
-        self,
-        invocation_id: str,
-        attempt_id: str,
-        segment_ids: tuple[str, ...],
-    ) -> None:
-        self._screen.query_one(ChatPanel).accept_sub_agent_presentation(
-            invocation_id,
-            attempt_id,
-            segment_ids,
-        )
-
-    def reject_sub_agent_presentation(self, invocation_id: str, attempt_id: str) -> None:
-        self._screen.query_one(ChatPanel).reject_sub_agent_presentation(invocation_id, attempt_id)
+    def add_sub_agent_answer(self, agent_name: str, invocation_id: str, segment_id: str, text: str) -> None:
+        self._screen.query_one(ChatPanel).add_sub_agent_answer(agent_name, invocation_id, segment_id, text)
 
     async def add_sub_agent_tool_start(
         self,
@@ -1194,6 +1205,9 @@ class MainScreenViewAdapter:
     def sub_agent_resumed_after_pause(self, invocation_id: str) -> None:
         self._screen.query_one(ChatPanel).sub_agent_resumed_after_pause(invocation_id)
 
+    def sub_agent_answer_withdrawn(self, invocation_id: str, segment_ids: tuple[str, ...]) -> None:
+        self._screen.query_one(ChatPanel).sub_agent_answer_withdrawn(invocation_id, segment_ids)
+
     def sub_agent_cascade_aborted(self, invocation_id: str) -> None:
         self._screen.query_one(ChatPanel).sub_agent_cascade_aborted(invocation_id)
 
@@ -1280,6 +1294,22 @@ class MainScreenViewAdapter:
 
         if isinstance(dialog, ApprovalDialog):
             dialog.dismiss_due_to_cancellation()
+
+    def show_hook_confirmation(
+        self, event: HookConfirmationRequest, on_result: Callable[[bool | None], None]
+    ) -> object:
+        from chrys.app.tui.screens.main.hook_confirmation_dialog import hook_confirmation_dialog
+
+        dialog = hook_confirmation_dialog(event, locale_controller=self._locale_controller)
+        self._screen.app.push_screen(dialog, on_result)
+        return dialog
+
+    def dismiss_hook_confirmation(self, dialog: object) -> None:
+        """Close a withdrawn confirmation without an answer; a covered one closes once uncovered."""
+        from chrys.app.tui.screens.dialogs.confirm import ConfirmDialog
+
+        if isinstance(dialog, ConfirmDialog):
+            dialog.dismiss_when_topmost(None)
 
     def approval_dialog_tool_name(self, dialog: ApprovalDialogHandle) -> str:
         from chrys.app.tui.screens.dialogs.approval import ApprovalDialog
@@ -1379,7 +1409,8 @@ class MainScreenViewAdapter:
 
     @property
     def is_attached(self) -> bool:
-        return self._screen.is_attached
+        # Not only attached: removal and shutdown prune the screen's widgets while it still is.
+        return composed_live(self._screen)
 
     @property
     def suggestions_active(self) -> bool:
@@ -1418,11 +1449,21 @@ class MainScreenViewAdapter:
         *,
         disabled: set[str] | None = None,
         title: str | None = None,
+        empty_text: str | None = None,
+        keep_selection: bool = False,
+        initial: str | None = None,
     ) -> None:
         from chrys.app.tui.widgets.chrome.suggestion_list import SuggestionList
 
         with contextlib.suppress(NoMatches):
-            self._screen.query_one(SuggestionList).update(list(items), disabled=disabled, title=title)
+            self._screen.query_one(SuggestionList).update(
+                list(items),
+                disabled=disabled,
+                initial=initial,
+                title=title,
+                empty_text=empty_text,
+                keep_selection=keep_selection,
+            )
 
     def hide_suggestions(self) -> None:
         from chrys.app.tui.widgets.chrome.suggestion_list import SuggestionList
@@ -1437,7 +1478,10 @@ class MainScreenViewAdapter:
         """Load cross-session prompt history without blocking the TUI loop."""
         return await self._screen.query_one(InputBar).load_prompt_history(max_entries=max_entries)
 
-    def run_file_suggestion_worker(self, awaitable: Awaitable[None], *, name: str, group: str) -> Worker[None]:
+    def prompt_history_enabled(self) -> bool:
+        return self._screen.query_one(InputBar).prompt_history_enabled()
+
+    def run_suggestion_worker(self, awaitable: Awaitable[None], *, name: str, group: str) -> Worker[None]:
         return self._screen.run_worker(awaitable, name=name, group=group)
 
     def move_suggestion_cursor(self, direction: str) -> None:
@@ -1446,8 +1490,20 @@ class MainScreenViewAdapter:
         suggestions = self._screen.query_one(SuggestionList)
         if direction == "up":
             suggestions.move_cursor_up()
-            return
-        suggestions.move_cursor_down()
+        elif direction == "pageup":
+            suggestions.move_cursor_page(-1)
+        elif direction == "pagedown":
+            suggestions.move_cursor_page(1)
+        else:
+            suggestions.move_cursor_down()
+
+    def suggestion_row_cells(self) -> int:
+        from chrys.app.tui.widgets.chrome.suggestion_list import SuggestionList
+
+        try:
+            return self._screen.query_one(SuggestionList).row_width
+        except NoMatches:
+            return 0
 
     def select_highlighted_suggestion(self, *, execute: bool) -> bool:
         from chrys.app.tui.widgets.chrome.suggestion_list import SuggestionList
@@ -1472,6 +1528,12 @@ class MainScreenViewAdapter:
 
     def replace_input_trigger_text(self, trigger: str, replacement: str) -> None:
         self._screen.query_one(InputBar).replace_trigger_text(trigger, replacement)
+
+    def expand_prompt_in_input(self, draft: ChatDraft) -> None:
+        self._screen.query_one(InputBar).expand_prompt(draft)
+
+    def submit_input(self) -> None:
+        self._screen.query_one(InputBar).submit_input()
 
     # -------------------------------------------------------------- #
     # Shell mode, focus, and paste
@@ -1522,7 +1584,7 @@ class MainScreenViewAdapter:
 
     def set_alternate_screen_active(self, active: bool) -> None:
         status = self._screen.query_one(StatusBar)
-        footer = self._screen.query_one(Footer)
+        footer = self._screen.query_one("#footer-row")
         sidebar = self._screen.query_one(SidebarPanel)
         sidebar.suppress_visibility("alternate-screen", active)
         if active:

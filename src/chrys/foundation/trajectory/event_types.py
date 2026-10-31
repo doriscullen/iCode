@@ -199,9 +199,7 @@ class ValidationReason:
     HOSTED_EVIDENCE_ONLY = "hosted_evidence_only"
     CONTENT_FILTERED = "content_filtered"
     WHITESPACE_ONLY = "whitespace_only"
-    LEAKED_TOOL_CALL = "leaked_tool_call"
     UNNAMED_TOOL_CALL = "unnamed_tool_call"
-    RULE_VIOLATION = "rule_violation"
     UNKNOWN = "unknown"
 
 
@@ -237,6 +235,10 @@ class WaitCategory:
     RATE_LIMIT = "rate_limit"
     INPUT_ADMISSION = "input_admission"
     TOOL_ADMISSION = "tool_admission"
+    HOOK_CONFIRMATION = "hook_confirmation"
+    """A hook's ``ask`` waiting for the user (codes only; the hook's reason stays out)."""
+    PROMPT_COMMANDS = "prompt_commands"
+    """A message's prompt-shortcut ``!`command``` placeholders running before its turn (outcome only)."""
 
 
 class ProfileKind:

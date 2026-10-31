@@ -65,6 +65,7 @@ async def build_recipe_engine(
     main: list[MockResponse | BaseException],
     child: list[MockResponse | BaseException],
     stream: bool = False,
+    allow_user_interaction: bool = True,
 ) -> tuple[AgentEngine, CountedClient, CountedClient]:
     """Keep model selection, tools, approvals, context and runtime factories real."""
     (tmp_path / "ROOT.md").write_text("ROOT-MEMORY-SENTINEL", encoding="utf-8")
@@ -99,8 +100,8 @@ async def build_recipe_engine(
 
     def client_for(profile: ModelProfile, **kwargs: object) -> CountedClient:
         client = main_client if profile.id == "root-model" else child_client
-        client._on_intermediate_text_async = kwargs["on_intermediate_text_async"]
-        client._on_intermediate_text_sync = kwargs["on_intermediate_text_sync"]
+        # Only the main client numbers tool batches; a sub-agent's is built without the callbacks.
+        client._on_intermediate_text = kwargs.get("on_intermediate_text")
         return client
 
     monkeypatch.setattr(builder, "create_client", create_autospec(builder.create_client, side_effect=client_for))
@@ -118,6 +119,7 @@ async def build_recipe_engine(
         model_registry=models,
         agent_registry=profiles,
         state_store=JsonFileStateStore(tmp_path / "sessions"),
+        allow_user_interaction=allow_user_interaction,
     )
     await engine.start(root, workspace=Workspace.from_cwd(str(tmp_path)))
     return engine, main_client, child_client

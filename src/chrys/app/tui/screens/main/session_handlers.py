@@ -25,7 +25,7 @@ from chrys.app.tui.screens.main.ports import (
     StatusMessage,
     StatusTrail,
 )
-from chrys.app.tui.screens.main.runtime_info import RegistryRuntimeInfoProvider
+from chrys.app.tui.screens.main.runtime_info import RegistryRuntimeInfoProvider, enabled_hook_count
 from chrys.app.tui.screens.main.state import MainScreenServices, MainScreenState
 from chrys.app.tui.screens.sessions import WorkflowSessionPick
 from chrys.app.tui.support.gc_freeze import (
@@ -296,7 +296,11 @@ class SessionHandler:
 
     @runtime_metadata.setter
     def runtime_metadata(self, value: AgentRuntimeDetails) -> None:
+        configured = enabled_hook_count(self._state.runtime.details)
         self._state.runtime.details = value
+        # The Hooks tab's empty state says whether any hook is configured.
+        if enabled_hook_count(value) != configured:
+            self._ui().hook_runs_changed()
 
     @property
     def main_usage_source_id(self) -> str:
@@ -743,6 +747,13 @@ class SessionHandler:
         ui.set_input_paste_cwd(cwd)
         ui.set_input_clipboard_dir(event.session_id)
         display = event.display_name or event.agent_profile
+        # The previous session's hook runs ended with its manager. The restored
+        # session's own may already be stored: its SessionReady, and the runs
+        # its build started, usually come before this event.
+        if self._state.runtime.hook_snapshots:
+            self._state.runtime.keep_hook_snapshot_of(event.session_id)
+            restored_hooks = self._state.runtime.hook_snapshots.get(event.session_id)
+            ui.set_hook_executions(restored_hooks.executions if restored_hooks is not None else ())
         s.main_usage_source_id = event.session_id
         await ui.clear_chat()
         ui.set_chat_workspace_cwd(cwd)
@@ -796,6 +807,7 @@ class SessionHandler:
                     initial_profile=event.initial_agent_profile or display,
                     file_snapshots=file_snapshots or None,
                     compressed_blocks=compressed_blocks_map or None,
+                    recovered_from_sidecar=event.recovered_from_sidecar,
                 )
                 s.update_toc()
 
@@ -987,6 +999,7 @@ class SessionHandler:
 
         to_label = event.to_display_name or event.to_profile
         from_label = event.from_display_name or event.from_profile
+        self._state.runtime.profile_name = event.to_profile
         s.runtime_metadata = event.runtime_details
         self._state.runtime.details_confirmed = True
         if event.runtime_details.model.selection_source == "active":

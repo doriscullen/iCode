@@ -1,9 +1,11 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""RuntimeDetailsDialog — modal with active model, tool, skill, hook, and file details."""
+"""RuntimeDetailsDialog — modal with active model, tool, prompt shortcut, skill, hook, and file details."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import TYPE_CHECKING, ClassVar
 
 from rich.cells import cell_len
@@ -14,15 +16,23 @@ from textual.widgets import Static, TabbedContent, TabPane
 from chrys.app.tui.binding_display import CLOSE_BINDING, localized_binding
 from chrys.app.tui.i18n import render_str, widget_localizer
 from chrys.app.tui.screens.dialogs.base import BaseDialog
+from chrys.app.tui.util.removal import remove_children_shielded
 from chrys.foundation.events.types import AgentRuntimeDetails, RuntimeModelDetails
 from chrys.foundation.i18n import MessageDef, MessageRef, msg
-from chrys.foundation.i18n.formatting import format_message
+from chrys.foundation.i18n.formatting import format_message, sanitize_legacy_scalar
 from chrys.foundation.platform.files import surrogate_safe_text
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+    from pathlib import Path
 
     from textual.app import ComposeResult
+
+    from chrys.service.prompt_shortcuts import PromptShortcut
+
+    ShortcutSources = list[tuple[Path, list[PromptShortcut]]]
+
+logger = logging.getLogger(__name__)
 
 
 _INLINE_SKILLS_SOURCE = msg("tui.runtime_details.inline_skills_source", fallback="Inline profile skills")
@@ -47,7 +57,15 @@ _MODEL = msg("tui.runtime_details.model", fallback="Model")
 _TOOLS = msg("tui.runtime_details.tools", fallback="Tools")
 _MCP = msg("tui.runtime_details.mcp", fallback="MCP")
 _SKILLS = msg("tui.runtime_details.skills", fallback="Skills")
+_SHORTCUTS = msg("tui.runtime_details.shortcuts", fallback="Shortcuts")
+_LOADING_SHORTCUTS = msg("tui.runtime_details.loading.shortcuts", fallback="Reading prompt shortcuts…")
+_NO_SHORTCUTS = msg(
+    "tui.runtime_details.empty.shortcuts",
+    fallback="No prompt shortcuts loaded.",
+)
 _HOOKS = msg("tui.runtime_details.hooks", fallback="Hooks")
+RUNTIME_DETAILS_HOOKS_TAB = "runtime-hooks"
+"""The Hooks tab's id, for opening the dialog on it."""
 _FILES = msg("tui.runtime_details.files", fallback="Files")
 _PROFILE_ID = msg("tui.runtime_details.label.profile_id", fallback="Profile ID")
 _NAME = msg("tui.runtime_details.label.name", fallback="Name")
@@ -63,6 +81,7 @@ _NO_MODEL_PROFILE = msg(
     "tui.runtime_details.empty.model_profile",
     fallback="No active model profile details are available.",
 )
+_CONTEXT_TOOLS = msg("tui.runtime_details.section.context_tools", fallback="Context management tools")
 _SUB_AGENT_TOOLS = msg("tui.runtime_details.section.sub_agent_tools", fallback="Sub-agent tools")
 _NO_TOOLS = msg(
     "tui.runtime_details.empty.tools",
@@ -184,15 +203,30 @@ class RuntimeDetailsDialog(BaseDialog[None]):
         localized_binding("q", "close", CLOSE_BINDING, show=False),
     ]
 
-    def __init__(self, details: AgentRuntimeDetails) -> None:
+    def __init__(
+        self,
+        details: AgentRuntimeDetails,
+        *,
+        initial_tab: str | None = None,
+        load_shortcuts: Callable[[], ShortcutSources] | None = None,
+        shortcut_model: Callable[[str], str] | None = None,
+    ) -> None:
+        """*shortcut_model* turns a shortcut's ``model`` into the text listed for it; as written without one."""
         self._details = details
+        self._initial_tab = initial_tab
+        self._load_shortcuts = load_shortcuts
+        self._shortcut_model_text = shortcut_model
         super().__init__()
+
+    def on_mount(self) -> None:
+        # Read as the / list reads them: off the event loop, every time the dialog opens.
+        self.run_worker(self._show_shortcuts(), group="runtime-shortcuts", exit_on_error=False)
 
     def compose(self) -> ComposeResult:
         localizer = widget_localizer(self)
         with VerticalGroup(id="runtime-details-container") as container:
             container.border_title = Text(render_str(localizer, _RUNTIME_DETAILS.bind()))
-            with TabbedContent(id="runtime-details-tabs"):
+            with TabbedContent(id="runtime-details-tabs", initial=self._initial_tab or ""):
                 with (
                     TabPane(render_str(localizer, _MODEL.bind()), id="runtime-model"),
                     ScrollableContainer(classes="runtime-detail-scroll"),
@@ -212,13 +246,18 @@ class RuntimeDetailsDialog(BaseDialog[None]):
                     for section in self._mcp_sections():
                         yield section
                 with (
+                    TabPane(render_str(localizer, _SHORTCUTS.bind()), id="runtime-shortcuts"),
+                    ScrollableContainer(classes="runtime-detail-scroll", id="runtime-shortcuts-scroll"),
+                ):
+                    yield self._section(_SHORTCUTS.bind(), [self._render_message(_LOADING_SHORTCUTS.bind())])
+                with (
                     TabPane(render_str(localizer, _SKILLS.bind()), id="runtime-skills"),
                     ScrollableContainer(classes="runtime-detail-scroll"),
                 ):
                     for section in self._skill_sections():
                         yield section
                 with (
-                    TabPane(render_str(localizer, _HOOKS.bind()), id="runtime-hooks"),
+                    TabPane(render_str(localizer, _HOOKS.bind()), id=RUNTIME_DETAILS_HOOKS_TAB),
                     ScrollableContainer(classes="runtime-detail-scroll"),
                 ):
                     for section in self._hook_sections():
@@ -266,6 +305,8 @@ class RuntimeDetailsDialog(BaseDialog[None]):
             sections.append(self._section(category, _unique(lines)))
         if web_providers and "web_search" not in self._details.builtin_tools:
             sections.append(self._section("web_search", web_providers))
+        if self._details.context_tools:
+            sections.append(self._section(_CONTEXT_TOOLS.bind(), _unique(self._details.context_tools)))
         if self._details.sub_agent_tools:
             sections.append(self._section(_SUB_AGENT_TOOLS.bind(), _unique(self._details.sub_agent_tools)))
         if not sections:
@@ -304,6 +345,48 @@ class RuntimeDetailsDialog(BaseDialog[None]):
         if not sections:
             sections.append(self._section(_SKILLS.bind(), [self._render_message(_NO_SKILLS.bind())]))
         return sections
+
+    async def _show_shortcuts(self) -> None:
+        sources: ShortcutSources = []
+        if self._load_shortcuts is not None:
+            try:
+                sources = await asyncio.to_thread(self._load_shortcuts)
+            except Exception:
+                logger.exception("Runtime details: reading prompt shortcuts failed")
+        # The dialog may have closed while the folders were read.
+        if not self._composed_live:
+            return
+        container = self.query_one("#runtime-shortcuts-scroll", ScrollableContainer)
+        sections = self._shortcut_sections(sources)
+        with self.app.batch_update():
+            await remove_children_shielded(container)
+            await container.mount(*sections)
+
+    def _shortcut_sections(self, sources: ShortcutSources) -> list[Static]:
+        """One section per folder, in the order the / list reads them, so the first of a name is the one used."""
+        sections: list[Static] = []
+        for folder, commands in sources:
+            names = [f"/{sanitize_legacy_scalar(command.name)}" for command in commands]
+            width = max((cell_len(name) for name in names), default=0)
+            lines = []
+            for name, command in zip(names, commands, strict=True):
+                agent = sanitize_legacy_scalar(command.agent).strip()
+                parts = [
+                    sanitize_legacy_scalar(command.description).strip(),
+                    " · ".join(value for value in (agent, self._shortcut_model(command.model)) if value),
+                ]
+                detail = "  ".join(part for part in parts if part)
+                lines.append(f"{name}{' ' * (width - cell_len(name))}  {detail}".rstrip())
+            sections.append(self._section(sanitize_legacy_scalar(surrogate_safe_text(str(folder))), lines))
+        if not sections:
+            sections.append(self._section(_SHORTCUTS.bind(), [self._render_message(_NO_SHORTCUTS.bind())]))
+        return sections
+
+    def _shortcut_model(self, spec: str) -> str:
+        model = spec.strip()
+        if model and self._shortcut_model_text is not None:
+            model = self._shortcut_model_text(model)
+        return sanitize_legacy_scalar(model).strip()
 
     def _hook_sections(self) -> list[Static]:
         sections: list[Static] = []

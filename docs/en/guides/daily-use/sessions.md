@@ -39,6 +39,8 @@ The terminal tab shows your latest message, or the session title once iCode upda
 
 A task you stop shows no mark, and the mark clears when you start the next task. Some terminals do not show tab titles.
 
+When you stop a task or it fails, the part of the reply that already appeared stays in the conversation and in the saved session, and the agent reads it when you send your next message. If you click **Retry** or **Continue** without typing anything instead, the agent writes the reply again: when it starts, the text it writes again is removed, and tool calls stay.
+
 ## Resume an existing session
 
 When the agent is idle, enter `/resume` in the input field to resume the most recent chat session.
@@ -51,7 +53,15 @@ To find and resume another session, press **F1**, click `f1 Sessions`, or enter 
 - **Search sessions**: Enter a session ID, title, directory, or a prompt you previously entered in the search field at the bottom. The search covers only the current page.
 - **Resume a session**: Select a session and click "Resume". You can also double-click it, or select it with the up and down arrow keys and press Enter. iCode closes the current conversation view, loads the selected session, and switches the working directory to the session's saved primary working directory; the current session remains saved in the list. Before resuming, check the working directory that will be restored in the list's "Directory" column. If that directory no longer exists, iCode asks you to choose another folder; see [If the working directory is deleted or moved](workspaces.md#if-the-working-directory-is-deleted-or-moved).
 
+A resumed session continues on the agent and model it was saved with. That doesn't change the agent and model a new session (`/new`) starts on: the agent you last chose with `#` (or started with) and your default model.
+
 When you resume a long conversation, iCode shows its most recent part first so you can continue right away; earlier messages keep loading above it for a few seconds.
+
+A resumed conversation shows the model's saved thinking folded to one line above the reply it led to: **Thought:**, followed by how the thinking begins; click it to unfold it. If a reply was interrupted or failed, the thinking shown for the request that was cut off is not saved, so it does not appear.
+
+Successful turns also fold their intermediate activity by default. Each mid-turn user addition, and each compaction card from compacting during the turn, stays visible and starts a separate activity section. Its header counts the section's tool calls and what they were, for example `12 tool calls · 8 reads · 4 commands`, ending with how many failed or were interrupted, if any; a section without tool calls, or in compressed history, reads **Activity**. Click the header to inspect that section while keeping its inner details in their current state. A section holding only a thinking block, or only text between tool calls, folds to that block's own row instead. For keyboard access, `/fold` toggles activity sections, tool groups, thinking and text between tool calls together: it collapses them if any are open, and expands them otherwise. Thinking that is still being written and controls waiting for your input are left as they are. Copy commands still include intermediate replies and keep their original message counts. Turn off **Automatically fold completed turns** in [Settings](../configuration/settings.md#display-preferences) to keep future completed turns and subsequently opened sessions expanded. The last turn recovered from a crash stays open.
+
+Clicking an activity header keeps focus in the input field. A restored turn waiting for sub-agents stays open. Compressed history shows only some tool details, so these sections are all labeled **Activity**.
 
 If a resumed conversation continues on a different model service than before, some earlier reasoning may be left out; see [Switch the current model profile](../configuration/models.md#switch-the-current-model-profile).
 
@@ -61,7 +71,7 @@ Open the "Chat Sessions" window and first check the session ID, directory, and l
 
 Once you confirm deletion, the session's conversation history, rollback snapshots, diagnostic data, and other session contents are permanently deleted and cannot be recovered. Deleting a session does not undo changes the agent has already made to working directory files.
 
-Deleting the current session also starts a new session, like `/clear`. A session open in another iCode instance cannot be deleted; close that instance first.
+Deleting the current session also starts a new session, like `/clear`. A session open in another iCode instance cannot be deleted; close that instance first. If iCode cannot remove all of a session's files, it shows an error; close any program that may have those files open, then try again.
 
 ## Find the session ID and storage location
 
@@ -103,6 +113,8 @@ Migration keeps the original data in the source directory; it is not deleted aut
 ## Inspect session timing
 
 Press **F12** to open the trajectory dashboard. **Overview** summarizes time and usage; **Timeline** shows individual turns and operations; **Insights** helps explain delays; **Session data** shows the saved session. Long sessions are analyzed in the background while a loading indicator is visible. The timing analysis preserves overlapping operations, so parallel work is not counted twice on a critical path.
+
+If iCode can't record a session's trajectory, it shows a warning that trajectory recording is off for the session. You can keep working as usual; only the dashboard and the export get nothing new from that session. Workflow runs don't show this warning. Common causes are an earlier recording of the session that hasn't stopped yet (closing the iCode windows that had the session open ends it), files in the session's `trajectory` folder that other users can read or that belong to another user, a `trajectory` folder that is a link, a trajectory key (`trajectory-hmac.key` in the iCode configuration directory) that iCode can't read, and a trajectory that iCode can't safely add to, such as one written by a newer iCode version.
 
 If a shell command's file content comparison cannot be completed because a file is unreadable, the file-change overview marks detection as incomplete. The recorded change list may omit changes; check the affected files or your Git diff before relying on it for rollback. Files deliberately excluded from content comparison by the size or binary-file limits do not by themselves trigger this warning.
 

@@ -18,12 +18,13 @@ from chrys.app.tui.screens.dialogs import background_task
 from chrys.app.tui.screens.dialogs.background_task import (
     ROLLBACK_NOTE,
     BackgroundTaskModal,
-    _LogTail,
+    LogTail,
     confirm_stopping,
 )
 from chrys.app.tui.screens.dialogs.confirm import ConfirmDialog
 from chrys.app.tui.widgets.task_summary import TaskSummary
 from chrys.foundation.models.background_tasks import BackgroundTaskView
+from tests.support.pilot_barrier import screen_is_settled
 from tests.support.tui_helpers import click_when_settled, rich_plain
 from tests.support.waiting import wait_for
 
@@ -47,7 +48,7 @@ def _task(log_path: Path, **fields: object) -> BackgroundTaskView:
 def test_log_tail_reads_only_what_was_added(tmp_path: Path) -> None:
     log = tmp_path / "x.log"
     log.write_bytes(b"one\ntwo\n")
-    tail = _LogTail(str(log))
+    tail = LogTail(str(log))
     assert tail.read() == ("one\ntwo\n", False)
     assert tail.read() == ("", False)
     with log.open("ab") as file:
@@ -58,7 +59,7 @@ def test_log_tail_reads_only_what_was_added(tmp_path: Path) -> None:
 def test_log_tail_starts_over_when_the_log_shrinks(tmp_path: Path) -> None:
     log = tmp_path / "x.log"
     log.write_bytes(b"one\ntwo\n")
-    tail = _LogTail(str(log))
+    tail = LogTail(str(log))
     tail.read()
     log.write_bytes(b"new\n")
     assert tail.read() == ("new\n", True)
@@ -67,7 +68,7 @@ def test_log_tail_starts_over_when_the_log_shrinks(tmp_path: Path) -> None:
 def test_log_tail_starts_over_when_the_log_rotated_to_the_same_size(tmp_path: Path) -> None:
     log = tmp_path / "x.log"
     log.write_bytes(b"old\n")
-    tail = _LogTail(str(log))
+    tail = LogTail(str(log))
     tail.read()
     # Between two reads the log rotated and its new file grew as large as the old one.
     rotated = tmp_path / "new.log"
@@ -80,7 +81,7 @@ def test_log_tail_skips_ahead_from_a_whole_line(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(background_task, "_TAIL_BYTES", 12)
     log = tmp_path / "x.log"
     log.write_bytes(b"first line\nsecond\nthird\n")
-    tail = _LogTail(str(log))
+    tail = LogTail(str(log))
     # The last 12 bytes start inside "second": that partial line is dropped.
     assert tail.read() == ("third\n", True)
     with log.open("ab") as file:
@@ -88,9 +89,39 @@ def test_log_tail_skips_ahead_from_a_whole_line(tmp_path: Path, monkeypatch: pyt
     assert tail.read() == ("fourth\n", False)
 
 
+def test_log_tail_skips_ahead_from_a_line_a_carriage_return_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(background_task, "_TAIL_BYTES", 10)
+    log = tmp_path / "x.log"
+    # Progress a hook rewrites in place, as a detached hook's log keeps it.
+    log.write_bytes(b"10%\r20%\r30%\r40%\r50%\r")
+    tail = LogTail(str(log))
+    # The last 10 bytes start inside "30%": the rest is kept as written, but for the CR
+    # it ends on, which waits for the LF that may follow it.
+    assert tail.read_raw() == ("40%\r50%", True)
+
+
+def test_log_tail_joins_a_crlf_split_between_reads(tmp_path: Path) -> None:
+    log = tmp_path / "x.log"
+    log.write_bytes(b"first\r")
+    tail = LogTail(str(log))
+    assert tail.read_raw() == ("first", False)
+    with log.open("ab") as file:
+        file.write(b"\nsecond\r\n")
+    assert tail.read_raw() == ("\r\nsecond\r\n", False)
+    # A lone CR still ends its line once more is read.
+    with log.open("ab") as file:
+        file.write(b"50%\r")
+    assert tail.read() == ("50%", False)
+    with log.open("ab") as file:
+        file.write(b"60%")
+    assert tail.read() == ("\n60%", False)
+
+
 def test_log_tail_joins_a_character_split_between_reads(tmp_path: Path) -> None:
     log = tmp_path / "x.log"
-    tail = _LogTail(str(log))
+    tail = LogTail(str(log))
     chunks = [b"done ", "中文".encode()[:4], "中文".encode()[4:] + b"\n"]
     log.write_bytes(b"")
     read = ""
@@ -123,8 +154,13 @@ async def test_confirm_stopping_scrolls_a_long_list_right_above_its_buttons() ->
     tasks = [dataclasses.replace(task, id=f"t{n}") for n in range(7)]
     async with App().run_test(size=(100, 30)) as pilot:
         await pilot.app.push_screen(confirm_stopping(tasks, Static()))
-        buttons = pilot.app.screen.query_one("#confirm-buttons")
-        await wait_for(lambda: buttons.region.height > 0, pilot=pilot, description="buttons laid out")
+        dialog = pilot.app.screen
+        buttons = dialog.query_one("#confirm-buttons")
+        await wait_for(
+            lambda: dialog.is_mounted and screen_is_settled(pilot.app, dialog),
+            pilot=pilot,
+            description="confirmation sizing and layout completed",
+        )
 
         scroll = pilot.app.screen.query_one("#notice-scroll")
         await wait_for(lambda: scroll.max_scroll_y > 0, pilot=pilot, description="task list scrolls")
@@ -159,7 +195,19 @@ def _log_text(modal: BackgroundTaskModal) -> str:
 
 
 @pytest.mark.asyncio
-async def test_modal_follows_the_log_and_stops_after_a_confirmation(tmp_path: Path) -> None:
+async def test_modal_follows_the_log_and_stops_after_a_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hold_refresh_callbacks = True
+    # Hold post-refresh callbacks to prove previews and actions are ready
+    # without a second layout pass.
+    invoke_callbacks = ConfirmDialog._invoke_and_clear_callbacks
+
+    async def invoke_when_released(dialog: ConfirmDialog) -> None:
+        if not hold_refresh_callbacks:
+            await invoke_callbacks(dialog)
+
+    monkeypatch.setattr(ConfirmDialog, "_invoke_and_clear_callbacks", invoke_when_released)
     log = tmp_path / "x.log"
     log.write_bytes(b"listening on :3000\n")
     app = _ModalApp(_task(log))
@@ -171,9 +219,26 @@ async def test_modal_follows_the_log_and_stops_after_a_confirmation(tmp_path: Pa
         await wait_for(lambda: "GET / 200" in _log_text(modal), pilot=pilot, description="the new line shown")
 
         await click_when_settled(pilot, "#background-task-stop")
-        await wait_for(lambda: isinstance(app.screen, ConfirmDialog), pilot=pilot, description="the confirmation")
-        message = app.screen.query_one(".task-command", Static)
-        assert "npm run dev" in str(message.render())
+        await wait_for(
+            lambda: isinstance(app.screen, ConfirmDialog) and app.screen.is_mounted,
+            pilot=pilot,
+            description="the confirmation mounted before post-refresh callbacks",
+        )
+        dialog = app.screen
+        try:
+            message = dialog.query_one(".task-command", Static)
+            assert "npm run dev" in str(message.content)
+            await wait_for(lambda: dialog.query_one("#confirm-yes").region.width > 0, pilot=pilot)
+            initial_buttons = tuple(button.region for button in dialog.query(Button))
+            assert not screen_is_settled(app, dialog)
+        finally:
+            hold_refresh_callbacks = False
+            dialog.check_idle()
+        await wait_for(
+            lambda: screen_is_settled(app, dialog), pilot=pilot, description="the confirmation previews laid out"
+        )
+        assert "npm run dev" in str(message.content)
+        assert tuple(button.region for button in dialog.query(Button)) == initial_buttons
         await click_when_settled(pilot, "#confirm-yes")
         await wait_for(lambda: app.stopped == ["t1"], pilot=pilot, description="the stop requested")
         assert app.screen is modal

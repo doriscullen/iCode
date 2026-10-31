@@ -118,7 +118,7 @@ tools:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `builtins` | List of strings | `[]` | Built-in tool kinds to enable. For available values, see the rows marked "Yes" in the "Built-in" column of the [kinds and names overview](./tool-kinds-and-names.md#overview-of-kinds-and-names). No built-in agent includes `web_search` or `web_fetch`. |
+| `builtins` | List of strings | `[]` | Built-in tool kinds to enable. For available values, see the rows marked "Yes" in the "Built-in" column of the [kinds and names overview](./tool-kinds-and-names.md#overview-of-kinds-and-names). No built-in agent includes `web_search` or `web_fetch`. Every agent has `sleep` without listing it. |
 | `mcp` | List of objects | `[]` | Model Context Protocol (MCP) server configurations. See [tools.mcp](#toolsmcp). |
 | `shell_filter` | String or object | Not set (no shell filtering) | Restricts the commands that shell tools can execute. See [tools.shell_filter](#toolsshell_filter). |
 | `web_search` | Object | Not set (uses user settings) | Mode and search providers for the `web_search` tool. See [tools.web_search](#toolsweb_search). |
@@ -284,6 +284,8 @@ Each entry in `providers` supports these fields:
 | `response` | `custom_http` | JSON Pointers into the response: `results_pointer` and `url_pointer` (required unless a preset provides them), plus optional `title_pointer` and `snippet_pointer`. |
 
 `exa_mcp`, `bing_html`, and `duckduckgo_html` accept only `type`.
+
+A complete `custom_http` example for the DeepSeek Search API is in [Configure web tools](../guides/configuration/web-tools.md#deepseek-search-api). See DeepSeek's documentation for the models and billing that support its server-side `web_search`.
 
 ### tools.web_fetch
 

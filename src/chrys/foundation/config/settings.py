@@ -152,6 +152,15 @@ DEFAULT_TOOL_RESULT_CEILING_TOKENS = 64_000
 TOOL_RESULT_CEILING_FLOOR = 2_000
 """Minimum positive ``CHRYS_TOOL_RESULT_CEILING_TOKENS`` value."""
 
+DEFAULT_IMAGE_SEND_LIMIT_KB = 256
+"""Default most KiB an image is sent to a model with (``foundation.text.images.MAX_IMAGE_BYTES``)."""
+
+MIN_IMAGE_SEND_LIMIT_KB = 32
+"""Lowest image send limit: below it most photos shrink to thumbnails."""
+
+MAX_IMAGE_SEND_LIMIT_KB = 3072
+"""Highest image send limit, the size images were sent at before compression got a setting."""
+
 DEFAULT_WORKSPACE_MRU_MAX_ENTRIES = 20
 """Default number of recently used workspace directories kept in the MRU index."""
 
@@ -676,12 +685,18 @@ _LABEL_TOOLS_RESULT_CEILING_TOKENS = msg(
     "settings.tools.result.ceiling_tokens.label", fallback="Tool result ceiling (tokens)"
 )
 _LABEL_SEARCH_RESPECT_GITIGNORE = msg("settings.tools.search.respect_gitignore.label", fallback="Respect .gitignore")
+_LABEL_TOOLS_IMAGE_SEND_LIMIT_KB = msg("settings.tools.image.send_limit_kb.label", fallback="Image size limit (KB)")
 _LABEL_UI_THEME = msg("settings.ui.theme.label", fallback="Theme")
 _LABEL_UI_LOCALE = msg("settings.ui.locale.label", fallback="UI Language")
 _LABEL_UI_CHAT_TOOL_GROUPS_EXPANDED = msg(
     "settings.ui.chat.tool_groups_expanded.label",
     fallback="Expand tool details by default",
 )
+_LABEL_UI_CHAT_THINKING_EXPANDED = msg("settings.ui.chat.show_thinking.label", fallback="Expand thinking by default")
+_LABEL_UI_CHAT_FOLD_FINISHED_TURNS = msg(
+    "settings.ui.chat.fold_finished_turns.label", fallback="Automatically fold completed turns"
+)
+_LABEL_UI_CHAT_IMAGE_GRAPHICS = msg("settings.ui.chat.image_graphics.label", fallback="Full-color images")
 _LABEL_UI_EDITOR_KEYMAP = msg("settings.ui.editor.keymap.label", fallback="Editor keymap")
 _LABEL_WORKSPACE_MRU_MAX_ENTRIES = msg("settings.workspace.mru_max_entries.label", fallback="Recent workspaces to keep")
 _LABEL_APPROVAL_TIMEOUT_SECONDS = msg(
@@ -1020,6 +1035,23 @@ class Settings:
             apply=Apply.RELOAD,
             group="tools",
             kind=Kind.BOOL,
+        ),
+    )
+
+    # The most an image attached, viewed or sent by an ACP client takes in a
+    # request; a larger one is compressed to fit. Each turn and retry also
+    # shrinks the session's earlier images to it, so lowering it fixes a
+    # request a gateway refused as too large.
+    image_send_limit_kb: int = field(
+        default=DEFAULT_IMAGE_SEND_LIMIT_KB,
+        metadata=spec(
+            key="tools.image.send_limit_kb",
+            label=_LABEL_TOOLS_IMAGE_SEND_LIMIT_KB,
+            env="CHRYS_IMAGE_SEND_LIMIT_KB",
+            coerce=int_coercer(minimum=MIN_IMAGE_SEND_LIMIT_KB, maximum=MAX_IMAGE_SEND_LIMIT_KB),
+            apply=Apply.RELOAD,
+            group="tools",
+            kind=Kind.INT,
         ),
     )
 
@@ -1481,6 +1513,51 @@ class Settings:
             label=_LABEL_UI_CHAT_TOOL_GROUPS_EXPANDED,
             coerce=bool_coercer(),
             apply=Apply.LIVE,
+            group="ui",
+            kind=Kind.BOOL,
+            project_merge=ProjectMerge.DENY,
+        ),
+    )
+
+    # TUI presentation only: whether the model's readable thinking opens in the
+    # main chat as it arrives, or stays folded to its one-line row. The key keeps
+    # the name it shipped under, when turning it off left thinking out.
+    chat_thinking_expanded: bool = field(
+        default=False,
+        metadata=spec(
+            key="ui.chat.show_thinking",
+            label=_LABEL_UI_CHAT_THINKING_EXPANDED,
+            coerce=bool_coercer(),
+            apply=Apply.LIVE,
+            group="ui",
+            kind=Kind.BOOL,
+            project_merge=ProjectMerge.DENY,
+        ),
+    )
+
+    chat_fold_finished_turns: bool = field(
+        default=True,
+        metadata=spec(
+            key="ui.chat.fold_finished_turns",
+            label=_LABEL_UI_CHAT_FOLD_FINISHED_TURNS,
+            coerce=bool_coercer(),
+            apply=Apply.LIVE,
+            group="ui",
+            kind=Kind.BOOL,
+            project_merge=ProjectMerge.DENY,
+        ),
+    )
+
+    # Whether chat images use the terminal's own graphics (kitty protocol, Sixel) where the terminal
+    # is known to have them; off, every terminal shows the half-block approximation. Read once, when
+    # the TUI starts: what the terminal already holds is not redrawn.
+    chat_image_graphics: bool = field(
+        default=True,
+        metadata=spec(
+            key="ui.chat.image_graphics",
+            label=_LABEL_UI_CHAT_IMAGE_GRAPHICS,
+            coerce=bool_coercer(),
+            apply=Apply.RESTART,
             group="ui",
             kind=Kind.BOOL,
             project_merge=ProjectMerge.DENY,
@@ -1959,6 +2036,10 @@ class Settings:
         if self.max_transient_retries is not None:
             return self.max_transient_retries
         return self.frontend_default_max_transient_retries
+
+    def image_send_limit_bytes(self) -> int:
+        """Return the most bytes an image is sent to a model with."""
+        return self.image_send_limit_kb * 1024
 
 
 def _persist_one(key: str, value: Any, *, log_value: bool = True) -> None:

@@ -90,7 +90,7 @@ def test_document_image_storage_limits_align_with_session_and_model_boundaries()
     assert MAX_SESSION_IMAGE_FILES == 8192
     assert MAX_STORED_IMAGE_BYTES == MAX_IMAGE_SOURCE_BYTES == 50 * 1024 * 1024
     assert MAX_TOTAL_IMAGE_BYTES == MAX_SESSION_IMAGE_BYTES == 512 * 1024 * 1024
-    assert MAX_MODEL_IMAGE_BYTES == 3 * 1024 * 1024
+    assert MAX_MODEL_IMAGE_BYTES == 256 * 1024
 
 
 def test_normalize_document_text_repairs_pairs_and_replaces_lone_surrogates() -> None:
@@ -470,7 +470,7 @@ async def test_large_document_toc_numbers_lines_as_read_file_does(
     assert "1|- Part 1" in result
     assert f"{heading_line}|- Part 2" in result
     saved_path = os.fspath(_saved_markdown_absolute_path(result))
-    assert read_file(saved_path, line_range=[heading_line, heading_line]).endswith(f"{heading_line}|# Part 2\n")
+    assert f"{heading_line}|# Part 2\n" in read_file(saved_path, offset=heading_line, limit=1)
 
 
 async def test_concurrent_same_name_large_conversions_keep_different_markdown(tmp_path: Path) -> None:

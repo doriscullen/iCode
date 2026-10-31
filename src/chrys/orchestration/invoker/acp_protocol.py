@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from acp.exceptions import RequestError
 from acp.schema import (
     AgentMessageChunk,
+    AgentThoughtChunk,
     AudioContentBlock,
     ContentToolCallContent,
     EmbeddedResourceContentBlock,
@@ -43,7 +44,6 @@ from chrys.foundation.events.types import (
     ApprovalResponse,
     AskUserResponse,
     AskUserTimedOut,
-    InvocationMessage,
     InvocationProgress,
     InvocationToolCallResult,
     InvocationToolCallStart,
@@ -57,7 +57,13 @@ from chrys.foundation.models.ask_user import (
 )
 from chrys.foundation.models.invocations import InvocationOrigin
 from chrys.foundation.platform.files import surrogate_safe_text
-from chrys.foundation.text.images import MAX_IMAGE_BYTES
+from chrys.foundation.text.images import (
+    COMPRESSED_IMAGE_MEDIA_TYPE,
+    MAX_ACP_IMAGE_BYTES,
+    MAX_IMAGE_BYTES,
+    ImageProcessingError,
+    compress_image_data,
+)
 from chrys.foundation.tool_result_metadata import TOOL_FAILED_METADATA_KEY, TOOL_INTERRUPTED_METADATA_KEY
 from chrys.foundation.trajectory.context import TrajectoryContext
 from chrys.foundation.trajectory.event_types import WaitCategory
@@ -69,11 +75,16 @@ from chrys.service.acp_client.spec import PermissionDecision
 from chrys.service.approval.arbitration import ApprovalDecisionArbiter, ApprovalJudgeInput
 from chrys.service.approval.correlation import OneShotCorrelation
 from chrys.service.approval.policy import ApprovalMode
+from chrys.service.session.sub_agent_logs import ACP_ANSWER_WITHDRAWN_UPDATE
 from chrys.service.trajectory.approvals import ApprovalDecider, ApprovalTrace
 from chrys.service.trajectory.waits import WaitOutcome, WaitTrace
 
+from .content_projection import ContentProjector
+from .origin import BoundEmitter
+
 if TYPE_CHECKING:
     from chrys.foundation.events.bus import EventBus
+    from chrys.foundation.models.invocations import ContentStatus
     from chrys.service.approval.judge import ApprovalJudge, JudgeVerdict
     from chrys.service.approval.turn_context import TurnContextReader
 
@@ -87,10 +98,10 @@ _AUDIT_RING_ITEMS = 500
 _AUDIT_RING_BYTES = 256 * 1024
 _ALLOW_KINDS = ("allow_once", "allow_always")
 _REJECT_KINDS = ("reject_once", "reject_always")
-_MAX_BASE64_IMAGE_CHARS = ((MAX_IMAGE_BYTES + 2) // 3) * 4
-# A maximum-size accepted image expands to 4 MiB in base64. Keep one
-# additional MiB for its data-URI prefix and the surrounding bounded record.
-_MAX_ASSEMBLED_BYTES = _MAX_BASE64_IMAGE_CHARS + 1024 * 1024
+_MAX_BASE64_IMAGE_CHARS = ((MAX_ACP_IMAGE_BYTES + 2) // 3) * 4
+# What the records of one attempt keep in all, their images counted as the data
+# URIs they keep: a compressed image takes about a third of a MiB.
+_MAX_ASSEMBLED_BYTES = 5 * 1024 * 1024
 
 
 def display_tool_kind(kind: str | None) -> str:
@@ -184,8 +195,21 @@ def _content_block_text(block: Any) -> str:
     return preview_text(block)
 
 
-def _structured_tool_content(content: Sequence[Any]) -> tuple[list[Content], list[dict[str, Any]]]:
-    """Extract images and resource descriptors before bounded text projection."""
+def _compressed_tool_image(data: bytes) -> bytes | None:
+    """The JPEG a tool image over :data:`MAX_IMAGE_BYTES` is kept as, or None when it can't be decoded."""
+    try:
+        return compress_image_data(data)
+    except ImageProcessingError:
+        return None
+
+
+async def _structured_tool_content(content: Sequence[Any]) -> tuple[list[Content], list[dict[str, Any]]]:
+    """Extract images and resource descriptors before bounded text projection.
+
+    An image over :data:`MAX_IMAGE_BYTES` is kept compressed, which can take a
+    while: off the event loop. One that can't be decoded is kept as it came,
+    as a smaller one is, and the attempt's byte budget bounds what it keeps.
+    """
     image_contents: list[Content] = []
     artifacts: list[dict[str, Any]] = []
     for item in content:
@@ -203,8 +227,12 @@ def _structured_tool_content(content: Sequence[Any]) -> tuple[list[Content], lis
                     raise AcpTransportError("The ACP agent returned invalid base64 image content.") from exc
                 if not data:
                     raise AcpTransportError("The ACP agent returned empty image content.")
-                if len(data) > MAX_IMAGE_BYTES:
+                if len(data) > MAX_ACP_IMAGE_BYTES:
                     raise AcpTransportError("The ACP agent returned an image that exceeds the supported size limit.")
+                if len(data) > MAX_IMAGE_BYTES:
+                    compressed = await asyncio.to_thread(_compressed_tool_image, data)
+                    if compressed is not None:
+                        data, media_type = compressed, COMPRESSED_IMAGE_MEDIA_TYPE
                 image_contents.append(Content.from_data(data=data, media_type=media_type))
             elif block.uri:
                 image_contents.append(Content.from_uri(uri=block.uri, media_type=media_type))
@@ -258,7 +286,7 @@ class _CallRecord:
     started_at: float = field(default_factory=time.monotonic)
     start_published: bool = False
     terminal_published: bool = False
-    last_start_signature: str = ""
+    delivered_start_signature: str = ""
     provider_hosted: bool = False
     hosted_family: str = ""
     provider: str = ""
@@ -333,6 +361,10 @@ class AcpUpdateTranslator:
         self.latest_context_size: int | None = None
         self._segments: list[str] = []
         self._open_segment = ""
+        # Shown since the last tool card opened: a retry in a new session asks for this answer again.
+        self._final_answer_segments: list[str] = []
+        # Streams the remote's message and thought chunks as they arrive.
+        self._content = ContentProjector(BoundEmitter(event_bus, origin), agent_name=agent_name)
         self._text_finalized = False
         self._unpublished_final_text = ""
         self._message_id: str | None = None
@@ -364,10 +396,13 @@ class AcpUpdateTranslator:
             # keeps streaming around a running call — last_segment would
             # otherwise return just the suffix.
             if isinstance(update, ToolCallStart):
-                await self._seal_segment(publish=True)
+                await self._seal_segment()
             await self._merge_tool(update)
         elif isinstance(update, AgentMessageChunk):
             await self._consume_message(update)
+        elif isinstance(update, AgentThoughtChunk):
+            if isinstance(update.content, TextContentBlock) and update.content.text:
+                await self._content.publish_text("reasoning", update.content.text)
         elif isinstance(update, UsageUpdate):
             # PR-1 validates raw exact-int usage before SDK coercion. Keep this
             # defensive check for direct translator tests and custom sinks.
@@ -462,6 +497,10 @@ class AcpUpdateTranslator:
         self._retained_bytes_by_call[call_id] = call_bytes
 
     async def _merge_tool(self, update: ToolCallStart | ToolCallProgress) -> None:
+        content = getattr(update, "content", None)
+        # Before anything changes: the record never shows a half-merged update
+        # while an image compresses.
+        structured = await _structured_tool_content(content) if content is not None else None
         remote_id = update.tool_call_id
         local_id = self._current_call_ids.get(remote_id, "")
         record = self.calls.get(local_id)
@@ -490,7 +529,6 @@ class AcpUpdateTranslator:
         kind = getattr(update, "kind", None)
         raw_input = getattr(update, "raw_input", None)
         raw_output = getattr(update, "raw_output", None)
-        content = getattr(update, "content", None)
         locations = getattr(update, "locations", None)
         if title is not None:
             record.title = preview_text(title) or "tool"
@@ -500,8 +538,8 @@ class AcpUpdateTranslator:
             record.raw_input = canonical_raw_input(raw_input)
         if raw_output is not None:
             record.raw_output = _bounded_value(raw_output)
-        if content is not None:
-            record.image_contents, record.artifacts = _structured_tool_content(content)
+        if structured is not None:
+            record.image_contents, record.artifacts = structured
             record.content = list(_bounded_value(content) or [])
         if locations is not None:
             record.locations = list(_bounded_value(locations) or [])
@@ -539,18 +577,40 @@ class AcpUpdateTranslator:
             await self._publish_terminal(record)
 
     async def _publish_start(self, record: _CallRecord, *, ensure: bool = False) -> None:
-        # The record keeps a digest of what it published: a finished call's
-        # input can be replaced by a smaller one, and the record must then keep
-        # no more than its latest update is charged for.
+        # A start is published again whenever what it shows changes, and never
+        # otherwise; a hosted call's status rides its result. The record keeps
+        # a digest of what it published: a finished call's input can be
+        # replaced by a smaller one, and the record must then keep no more than
+        # its latest update is charged for.
         signature = hashlib.sha256(
-            json.dumps([record.title, record.kind, record.raw_input], sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                [
+                    record.title,
+                    record.kind,
+                    record.raw_input,
+                    record.provider_hosted,
+                    record.hosted_family,
+                    record.provider,
+                    record.provider_item_type,
+                    record.provider_call_id,
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
         ).hexdigest()
-        if not ensure and (
-            record.terminal_published or (record.start_published and signature == record.last_start_signature)
-        ):
+        if signature == record.delivered_start_signature:
             return
+        # Past its terminal, a call gets only the terminal's own start (*ensure*): its consumers lack it after a
+        # start that a cancel cut off mid-delivery, and for a call whose first update was already terminal.
+        if not ensure and record.terminal_published:
+            return
+        opens_card = not record.start_published
         record.start_published = True
-        record.last_start_signature = signature
+        if opens_card:
+            # A new card, from a start or an update for a call not seen yet, ends the shown segment: the
+            # answer before it shows, and stays, before it. The text a result returns is sealed apart.
+            self._final_answer_segments.clear()
+            await self._content.end_segment()
         if self._bus is not None:
             await self._bus.publish(
                 InvocationToolCallStart(
@@ -569,6 +629,7 @@ class AcpUpdateTranslator:
                     session_id=self._session_id,
                 )
             )
+        record.delivered_start_signature = signature
 
     async def _publish_terminal(self, record: _CallRecord, *, interrupted: bool = False) -> None:
         if record.terminal_published:
@@ -579,7 +640,7 @@ class AcpUpdateTranslator:
         # _publish_start / bus.publish points), both could pass the guard and
         # double-deliver a InvocationToolCallResult (and double-count). Claiming
         # up front serializes them — the loser returns at the guard. The
-        # ensure=True start below intentionally bypasses this same flag.
+        # ensure=True start below bypasses this same flag, never a delivered one.
         record.terminal_published = True
         self._completed_here += 1
         try:
@@ -626,19 +687,28 @@ class AcpUpdateTranslator:
         await self.publish_progress()
 
     async def flush_interrupted(self) -> None:
+        # The cut-off answer ends first: a card a dangling call opens here would end it completed.
+        await self._content.finish("interrupted")
         for record in list(self.calls.values()):
             if not record.terminal_published:
                 await self._publish_terminal(record, interrupted=True)
 
+    async def finish_content(self, status: ContentStatus) -> None:
+        """End the streamed text's open segment with *status*."""
+        await self._content.finish(status)
+
     async def _consume_message(self, update: AgentMessageChunk) -> None:
         if update.message_id is not None and self._message_id is not None and update.message_id != self._message_id:
-            await self._seal_segment(publish=True)
+            await self._seal_segment()
         if update.message_id is not None:
             self._message_id = update.message_id
         text = _content_block_text(update.content)
         if text:
             self._charge(text)
             self._open_segment += text
+            segment_id = await self._content.publish_text("answer", text)
+            if segment_id is not None and segment_id not in self._final_answer_segments:
+                self._final_answer_segments.append(segment_id)
 
     def _take_open_segment(self) -> str:
         segment = self._open_segment
@@ -647,19 +717,9 @@ class AcpUpdateTranslator:
             self._segments.append(segment)
         return segment
 
-    async def _seal_segment(self, *, publish: bool) -> None:
-        segment = self._take_open_segment()
-        if publish and segment.strip() and self._bus is not None:
-            await self._bus.publish(
-                InvocationMessage(
-                    is_final=False,
-                    is_intermediate=True,
-                    origin=self.origin,
-                    agent_name=self.agent_name,
-                    text=segment,
-                    session_id=self._session_id,
-                )
-            )
+    async def _seal_segment(self) -> None:
+        self._take_open_segment()
+        await self._content.end_segment()
 
     def result_text(self) -> str:
         self._finalize_text()
@@ -670,8 +730,19 @@ class AcpUpdateTranslator:
             return "\n\n".join(segments)
         return segments[-1]
 
+    def withdraw_final_answer(self) -> tuple[str, ...]:
+        """Withdraw the answer segments shown after the last tool card opened, for a retry that asks for it again.
+
+        The audit ring records the withdrawal, so a replay of it drops that answer too.
+        """
+        withdrawn = tuple(self._final_answer_segments)
+        self._final_answer_segments.clear()
+        if withdrawn:
+            self._append_audit_item({"seq": None, "update": {"sessionUpdate": ACP_ANSWER_WITHDRAWN_UPDATE}})
+        return withdrawn
+
     def unpublished_final_text(self) -> str:
-        """Return the final segment that was not emitted as an intermediate event."""
+        """Return the final segment: the text after the last tool call start."""
         self._finalize_text()
         return self._unpublished_final_text
 

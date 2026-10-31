@@ -12,9 +12,11 @@ from typing import Any, TypeGuard
 
 from acp import schema as acp_schema
 from acp.helpers import (
+    image_block,
     start_tool_call,
     tool_content,
     update_tool_call,
+    update_user_message,
     update_user_message_text,
 )
 from acp.interfaces import Client
@@ -25,7 +27,7 @@ from chrys.foundation.hosted_tools import (
     HostedToolStatus,
     normalize_hosted_tool_status,
 )
-from chrys.foundation.models.history_markers import HistoryMarkerKind
+from chrys.foundation.models.history_markers import ANSWER_SEGMENT_KEY, HistoryMarkerKind
 from chrys.foundation.models.turns import turn_slices
 from chrys.foundation.tool_result_metadata import tool_result_metadata_failure_state
 from chrys.foundation.trajectory.metadata import ANALYTICS_ITEM_ID_KEY
@@ -46,6 +48,7 @@ from chrys.service.agent_middleware.events.hosted_tools import (
     adapt_hosted_tool,
     hosted_replay_status,
 )
+from chrys.service.llm.reasoning_display import readable_reasoning
 from chrys.service.session.message_metadata import (
     TOOL_RESULT_METADATA_KEY,
     is_compaction_tool_summary,
@@ -207,14 +210,19 @@ async def replay_session_history(
     *,
     prefer_recovery: bool = False,
     tool_kind_resolver: Callable[[str], str] | None = None,
-) -> None:
-    """Emit basic ACP replay updates for a restored session."""
+) -> dict[str, tuple[str, ...]]:
+    """Emit basic ACP replay updates for a restored session.
+
+    Returns the ``messageId``s each persisted answer segment replayed as:
+    what a bare retry that drops the segment from history withdraws from
+    the client.
+    """
     transcript = await state_store.load_session_transcript(session_id, prefer_recovery=prefer_recovery)
     if transcript is None:
-        return
+        return {}
     raw_messages = transcript.messages
     if not raw_messages:
-        return
+        return {}
     # Compaction tool summaries are the model's context, not the client's; as
     # in the TUI session transcript, neither a summary nor the messages it
     # replaced replay. Drop them before pairing so coordinates and replay ids
@@ -233,6 +241,7 @@ async def replay_session_history(
     call_start_updates: dict[tuple[int, int], Any] = {}
     started_calls: set[tuple[int, int]] = set()
     occurrence_index = 0
+    answer_message_ids: dict[str, list[str]] = {}
 
     # Allocate every call before publishing anything. Results can then find
     # their exchange-scoped card without forcing the normal replay path to
@@ -302,11 +311,10 @@ async def replay_session_history(
             # the update schema has no injection concept.
             if isinstance(additional, dict) and additional.get(HistoryMarkerKind.CONTINUATION_KEY):
                 continue
-            if text:
+            for update in _user_message_chunks(message, text):
                 # Only the message that OPENED the turn carries the id the
                 # client submitted; an injection or a retry note inside the
                 # turn is a different message and has no client-side id.
-                update = update_user_message_text(text)
                 update.message_id = opening_user_message.get(message_index)
                 if turn_meta:
                     update.field_meta = with_chrys_metadata(update.field_meta, turn_meta)
@@ -315,19 +323,46 @@ async def replay_session_history(
         if role not in ("assistant", "tool"):
             continue
         indexed_contents = _indexed_contents(message)
-        # Every content of one persisted message is one ACP message: ACP
-        # groups chunks by messageId, and the transcript separates them by
-        # paragraph, not by id.
+        # The text of one persisted message is one ACP message per answer
+        # segment: ACP groups chunks by messageId, and the transcript
+        # separates them by paragraph, not by id. Readable reasoning replays
+        # in its place as thoughts, which start the answer text after them as
+        # a new message, as the live segments did; opaque reasoning replays
+        # nothing.
         answer_message_id: str | None = None
+        answer_segment: str | None = None
         emitted_text = False
+        thought: tuple[str, str] | None = None
         for content_index, content in indexed_contents:
             content_type = content.get("type")
+            if role == "assistant" and content_type == "text_reasoning":
+                shown = readable_reasoning(Content.from_dict(content))
+                if shown is None:
+                    continue
+                channel, thought_text = shown
+                if thought is None or thought[0] != channel:
+                    thought = (channel, str(uuid.uuid4()))
+                update = acp_schema.AgentThoughtChunk(
+                    sessionUpdate="agent_thought_chunk",
+                    content=acp_schema.TextContentBlock(type="text", text=thought_text),
+                    messageId=thought[1],
+                )
+                update.field_meta = with_chrys_metadata(update.field_meta, {"channel": channel, **turn_meta})
+                await client.session_update(session_id=session_id, update=update)
+                answer_message_id = None
+                emitted_text = False
+                continue
+            thought = None
             if role == "assistant" and content_type == "text":
                 content_text = content.get("text", "")
                 if isinstance(content_text, str) and content_text:
+                    segment = _answer_segment(content)
+                    if answer_message_id is None or segment != answer_segment:
+                        answer_message_id, answer_segment, emitted_text = str(uuid.uuid4()), segment, False
+                        if segment is not None:
+                            answer_message_ids.setdefault(segment, []).append(answer_message_id)
                     if emitted_text:
                         content_text = f"\n\n{content_text}"
-                    answer_message_id = answer_message_id or str(uuid.uuid4())
                     update = acp_schema.AgentMessageChunk(
                         sessionUpdate="agent_message_chunk",
                         content=acp_schema.TextContentBlock(type="text", text=content_text),
@@ -436,6 +471,14 @@ async def replay_session_history(
         if meta:
             update.field_meta = with_chrys_metadata(update.field_meta, meta)
         await client.session_update(session_id=session_id, update=update)
+    return {segment: tuple(message_ids) for segment, message_ids in answer_message_ids.items()}
+
+
+def _answer_segment(content: dict[str, Any]) -> str | None:
+    """The live segment a persisted answer text was shown in, if history recorded it."""
+    properties = content.get("additional_properties")
+    segment = properties.get(ANSWER_SEGMENT_KEY) if isinstance(properties, dict) else None
+    return segment if isinstance(segment, str) and segment else None
 
 
 def _turn_labels(
@@ -526,6 +569,28 @@ def _message_text(message: dict[str, object]) -> str:
             if isinstance(text, str) and text:
                 parts.append(text)
     return "\n\n".join(parts)
+
+
+def _user_message_chunks(message: dict[str, object], text: str) -> list[acp_schema.UserMessageChunk]:
+    """A user message's *text*, then each image it was sent with.
+
+    Both an ACP prompt and the TUI save a message's images after its text, as
+    data contents holding the bytes.
+    """
+    chunks = [update_user_message_text(text)] if text else []
+    for content in _contents(message):
+        media_type = content.get("media_type")
+        uri = content.get("uri")
+        if (
+            content.get("type") == "data"
+            and isinstance(media_type, str)
+            and media_type.startswith("image/")
+            and isinstance(uri, str)
+            and uri.startswith("data:")
+            and ";base64," in uri
+        ):
+            chunks.append(update_user_message(image_block(uri.split(",", 1)[1], media_type)))
+    return chunks
 
 
 def _contents(message: dict[str, object]) -> list[dict[str, object]]:

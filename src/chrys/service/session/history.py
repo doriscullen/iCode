@@ -13,15 +13,18 @@ are visible to Agent's history provider immediately.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import logging
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from chrys.foundation.i18n.formatting import format_message
 from chrys.foundation.models.history_markers import (
+    ANSWER_SEGMENT_KEY,
     AWAITING_SUB_AGENTS_MESSAGE,
     EXECUTION_INTERRUPTED_MESSAGE,
     HistoryMarkerKind,
@@ -34,10 +37,11 @@ from chrys.foundation.models.turns import (
     user_text_matches,
 )
 from chrys.foundation.platform.files import surrogate_safe_text
+from chrys.foundation.text.images import LoadedImage, data_uri_payload_info
 from chrys.foundation.tool_invocation_order import read_tool_invocation_order
 from chrys.foundation.tool_kinds import KIND_SUB_AGENT
 from chrys.foundation.trajectory.metadata import ensure_analytics_item_id
-from chrys.kernel import Message
+from chrys.kernel import TOOL_CALL_CONTENT_TYPES, TOOL_RESULT_CONTENT_TYPES, Content, Message
 from chrys.kernel.exchanges import (
     PREVALIDATION_ERROR_KINDS,
     EmptyIdPolicy,
@@ -47,6 +51,7 @@ from chrys.kernel.exchanges import (
     iter_exchanges,
     pair_results,
 )
+from chrys.kernel.images import is_image_content
 from chrys.service.agent_middleware.events.tool_events import ToolBatchRecord
 from chrys.service.agent_middleware.injection import ConsumedInjection
 from chrys.service.session.message_metadata import (
@@ -54,12 +59,13 @@ from chrys.service.session.message_metadata import (
     normalize_created_at,
     persisted_tool_call_kind,
     stamp_message_created_at,
+    try_normalize_created_at,
 )
 from chrys.service.session.sub_agent_logs import SUB_AGENT_RESTORE_CONSUMED_KEY
 from chrys.service.trajectory.items import ensure_history_item_ids
+from chrys.service.vision import invalidate_image_token_count
 
 if TYPE_CHECKING:
-    from chrys.kernel import Content
     from chrys.kernel.exchanges import Exchange, ExchangePairing, Occurrence, PairingKey
 
 logger = logging.getLogger(__name__)
@@ -128,6 +134,29 @@ def _message_has_image_content(message: Message) -> bool:
 
 def _contents_have_image_content(contents: list[Any]) -> bool:
     return any(not isinstance(content, str) and _content_is_image(content) for content in contents)
+
+
+@dataclass(frozen=True)
+class OversizedImage:
+    """An inline image of the history over a send limit, with the payload it was read with."""
+
+    message: Message
+    content: Content
+    uri: str
+
+
+def _inline_image_over(content: Content, max_bytes: int) -> bool:
+    uri = content.uri
+    if content.type != "data" or not isinstance(uri, str) or not uri.startswith("data:"):
+        return False
+    if not is_image_content(content):
+        return False
+    # Base64 takes four characters for every three bytes: most images are
+    # told apart by the length of their URI alone.
+    if len(uri) * 3 // 4 <= max_bytes:
+        return False
+    size, _payload = data_uri_payload_info(uri)
+    return size is not None and size > max_bytes
 
 
 # Trim's pairing row: actionable local function calls only (hosted
@@ -229,7 +258,8 @@ def _trim_exchange_siblings(messages: list[Message], exchange: Exchange, pairing
     applied to a single message: all answered → keep; partially answered →
     drop only the unanswered call contents; nothing answered → pop the
     whole message, unless a hosted informational call shields it into the
-    surgical branch.
+    surgical branch. A popped sibling's answer text stays, as a message of
+    its own: the user saw it stream.
 
     Truthy ids are answered at KEY level: duplicate ids are shadowed by
     dispatch and one result answers every occurrence, so no duplicate of
@@ -272,6 +302,16 @@ def _trim_exchange_siblings(messages: list[Message], exchange: Exchange, pairing
             message.contents = [c for index, c in enumerate(message.contents) if index not in dropped]
             _sync_message_approval_from_contents(message)
             survived = True
+            continue
+        dropped = {occurrence.content_index for occurrence in unmatched}
+        if any(
+            c.type == "text" and (c.text or "").strip()
+            for index, c in enumerate(message.contents)
+            if index not in dropped
+        ):
+            # The kept text answers nothing, so the walk goes on as if the sibling was popped.
+            message.contents = [c for index, c in enumerate(message.contents) if index not in dropped]
+            _sync_message_approval_from_contents(message)
             continue
         messages.pop(sibling_index)
     return survived
@@ -358,15 +398,15 @@ class SessionHistoryManager:
     # Marker operations
     # ------------------------------------------------------------------
 
-    def insert_turn_marker(self) -> None:
-        """Insert a turn marker at the end of history."""
+    def insert_turn_marker(self, started_at: datetime | str | None = None) -> None:
+        """Insert a turn marker at the end of history, with when its pass began (*started_at*) if known."""
         state = self._state
         if state is None or not state.get("messages"):
             return
         from chrys.service.context.providers.history import CompressibleHistoryProvider
 
         turn_counter = state.get("turn_counter", 0) + 1
-        CompressibleHistoryProvider.insert_marker(state, turn_counter)
+        CompressibleHistoryProvider.insert_marker(state, turn_counter, started_at=try_normalize_created_at(started_at))
 
     def insert_interrupted_marker(
         self,
@@ -579,34 +619,77 @@ class SessionHistoryManager:
             if m.additional_properties.get(HistoryMarkerKind.KEY) not in HistoryMarkerKind.STATUS_MARKERS
         ]
 
-    def remove_trailing_agent_text(self) -> None:
-        """Remove trailing text-only assistant message on interrupt.
+    def keep_partial_answer(self, contents: Sequence[Content]) -> None:
+        """Append the answer a failed pass showed for a response history does not hold.
 
-        When the user interrupts during the LLM's final response (no tool
-        calls), the response may have already been stored by ``after_run``
-        before the interrupt flag is checked.  This detects and removes
-        that leaked response.
+        The user saw it, so the saved turn keeps it, and the model reads it
+        when the user goes on with a message. A response that landed as the
+        pass ended may already be in history: contents it holds are skipped.
+        Each segment it was shown in stays one text content with its stamp,
+        so a later bare Continue can name what it drops.
         """
         state = self._state
         if state is None:
             return
         messages = state.get("messages")
-        if not isinstance(messages, list) or not messages:
+        if not isinstance(messages, list):
             return
-
-        last = messages[-1]
-        if last.role != "assistant":
+        held = {id(content) for message in messages for content in message.contents}
+        segments: list[tuple[object, list[str]]] = []
+        for content in contents:
+            if id(content) in held or not content.text:
+                continue
+            segment = content.additional_properties.get(ANSWER_SEGMENT_KEY)
+            if not segments or segments[-1][0] != segment:
+                segments.append((segment, []))
+            segments[-1][1].append(content.text)
+        kept = [
+            Content.from_text(text, additional_properties={ANSWER_SEGMENT_KEY: segment} if segment else None)
+            for segment, parts in segments
+            if (text := "".join(parts)).strip()
+        ]
+        if not kept:
             return
+        message = Message("assistant", kept)
+        ensure_analytics_item_id(message.additional_properties)
+        messages.append(message)
 
-        if last.additional_properties.get(HistoryMarkerKind.KEY):
-            return
+    def remove_trailing_answer(self) -> tuple[str, ...]:
+        """Drop the answer a failed or interrupted pass left at the end of history; name its segments.
 
-        has_function_call = any(c.type == "function_call" for c in last.contents)
-        if has_function_call:
-            return
+        A Continue asks for that answer again, and its request must not end
+        with assistant text, which some providers read as a prefill to extend.
+        Tool exchange work is never dropped: of a message whose exchange
+        ends with an answer, only the contents after its last tool content
+        go. Returns the segment ids of the text dropped, which frontends
+        withdraw; text written before segments were stamped has none.
 
-        logger.debug("remove_trailing_agent_text: removing leaked final response")
-        messages.pop()
+        The request still ends with assistant text where its codec writes the
+        kept hosted exchange as a text summary (Chat Completions, foreign
+        hosted history, Responses image history under local storage).
+        """
+        state = self._state
+        if state is None:
+            return ()
+        messages = state.get("messages")
+        if not isinstance(messages, list):
+            return ()
+        dropped: list[Content] = []
+        while messages and _is_answer_message(messages[-1]):
+            dropped[:0] = messages.pop().contents
+        if messages and (split := _split_exchange_answer(messages[-1])):
+            # The landed wrapper may be held elsewhere (a retry snapshot): replace it, never trim it in place.
+            trimmed = copy.copy(messages[-1])
+            trimmed.contents, tail = split
+            trimmed.additional_properties = dict(messages[-1].additional_properties)
+            messages[-1] = trimmed
+            dropped[:0] = tail
+        segments = (
+            content.additional_properties.get(ANSWER_SEGMENT_KEY)
+            for content in dropped
+            if content.type == "text" and (content.text or "").strip()
+        )
+        return tuple(dict.fromkeys(segment for segment in segments if isinstance(segment, str) and segment))
 
     # ------------------------------------------------------------------
     # Message repair
@@ -1480,6 +1563,52 @@ class SessionHistoryManager:
                 count += 1
         return count
 
+    def images_over(self, max_bytes: int) -> list[OversizedImage]:
+        """Return the inline images over *max_bytes* that every request sends again.
+
+        Those are the images of user messages and of tool results. An image
+        in a reply belongs to the provider's record of that reply and stays
+        as it is.
+        """
+        oversized: list[OversizedImage] = []
+        for message in self.messages:
+            for content in message.contents:
+                if message.role == "user" and _inline_image_over(content, max_bytes):
+                    oversized.append(OversizedImage(message, content, content.uri))
+                elif content.type == "function_result":
+                    oversized.extend(
+                        OversizedImage(message, item, item.uri)
+                        for item in content.items or ()
+                        if _inline_image_over(item, max_bytes)
+                    )
+        return oversized
+
+    def shrink_images(self, shrunk: Sequence[tuple[OversizedImage, LoadedImage]]) -> int:
+        """Write each shrunk image over the image it was made from, and return how many were written.
+
+        The content object stays the same, as the anchors that match a
+        request's messages back to the history go by it; an image whose
+        content changed since it was read is left alone.
+        """
+        written = 0
+        for image, replacement in shrunk:
+            content = image.content
+            if content.uri is not image.uri:
+                continue
+            encoded = base64.b64encode(replacement.data).decode("ascii")
+            content.uri = f"data:{replacement.media_type};base64,{encoded}"
+            content.media_type = replacement.media_type
+            properties = content.additional_properties
+            properties["width"] = replacement.width
+            properties["height"] = replacement.height
+            for key, value in (("media_type", replacement.media_type), ("size", replacement.size)):
+                if key in properties:
+                    properties[key] = value
+            # The message's cached estimate counted the larger image.
+            invalidate_image_token_count(image.message)
+            written += 1
+        return written
+
     def persist_consumed_injections(self, injections: list[ConsumedInjection]) -> None:
         """Insert consumed injection messages into session history.
 
@@ -1614,3 +1743,27 @@ def _insert_consumed_injection_messages(messages: list[Message], injections: lis
     insertions.sort(key=lambda t: (t[0], t[1]), reverse=True)
     for idx, _order, msg in insertions:
         messages.insert(idx, msg)
+
+
+def _is_answer_message(message: Message) -> bool:
+    """An assistant message outside every tool exchange and marker: the answer text of a response."""
+    return (
+        message.role == "assistant"
+        and HistoryMarkerKind.KEY not in message.additional_properties
+        and not any(c.type in TOOL_CALL_CONTENT_TYPES or c.type in TOOL_RESULT_CONTENT_TYPES for c in message.contents)
+    )
+
+
+def _split_exchange_answer(message: Message) -> tuple[list[Content], list[Content]] | None:
+    """Split an assistant message in a tool exchange into its exchange work and the answer after its last tool content.
+
+    None unless that answer holds text: reasoning alone asks nothing again.
+    """
+    if message.role != "assistant" or HistoryMarkerKind.KEY in message.additional_properties:
+        return None
+    tool_types = TOOL_CALL_CONTENT_TYPES | TOOL_RESULT_CONTENT_TYPES
+    last_tool = max((index for index, content in enumerate(message.contents) if content.type in tool_types), default=-1)
+    if last_tool < 0:
+        return None
+    work, tail = list(message.contents[: last_tool + 1]), list(message.contents[last_tool + 1 :])
+    return (work, tail) if any(content.type == "text" and (content.text or "").strip() for content in tail) else None

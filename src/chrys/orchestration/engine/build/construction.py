@@ -13,12 +13,13 @@ from typing import TYPE_CHECKING
 from chrys.foundation.events.types import (
     UserInjectResult,
 )
+from chrys.foundation.models.session_surface import SessionSurface
 from chrys.foundation.models.workspace import Workspace
 from chrys.orchestration.engine.build.builder import AgentBuildResult
 from chrys.orchestration.engine.build.loaded import AgentManifest, CompletedBuild, LoadedAgent
 from chrys.orchestration.invoker.resources import rollback_resources
 from chrys.orchestration.invoker.runtime import restore_phase4_state
-from chrys.service.agent_middleware import IntermediateTextBuffer
+from chrys.service.agent_middleware import ResponseBatchCounter
 from chrys.service.agent_middleware.injection import InjectionMiddleware
 from chrys.service.mutations.coordination import ATTRIBUTION_DIR_NAME, MutationCoordinator
 from chrys.service.mutations.store import SnapshotPolicy, SnapshotStore
@@ -29,7 +30,7 @@ from chrys.service.todos.tracker import TodoTracker
 from chrys.service.trajectory.preparation import PreparationOutcome
 
 if TYPE_CHECKING:
-    from chrys.foundation.config.settings_store import LoadedSettings, SettingsHandle
+    from chrys.foundation.config.settings_store import LoadedSettings, PreparedSettings
     from chrys.foundation.events.bus import EventBus
     from chrys.orchestration.engine.run.turn_state import TurnRuntimeState
     from chrys.orchestration.engine.state.active_session import ActiveSession
@@ -65,13 +66,14 @@ class StagedBuild:
     executor they configured — so live state either describes the old build
     entirely or the new one entirely, never a mixture.
 
-    ``loaded`` carries settings and provenance as the one value they already
-    are; the agent profile, the workspace, the hook manager and the
-    mutation-coordinator target are the other four things a rebuild may
-    change. Six commitments, one commit point.
+    ``prepared`` carries settings and provenance as the one value they already
+    are — the load, the session's own choices over it and the effective value
+    the build reads (:attr:`loaded`); the agent profile, the workspace, the hook
+    manager and the mutation-coordinator target are the other four things a
+    rebuild may change. Six commitments, one commit point.
     """
 
-    loaded: LoadedSettings
+    prepared: PreparedSettings
     agent_profile: AgentProfile
     """The profile the build is configured from, recorded by the commit.
 
@@ -92,12 +94,17 @@ class StagedBuild:
     build closes the candidate instead (see :func:`build_agent`).
     """
 
+    @property
+    def loaded(self) -> LoadedSettings:
+        """The effective settings the build is configured from, the session's own choices included."""
+        return self.prepared.effective
+
 
 def stage_build(
     *,
     session: ActiveSession,
     persistence: SessionPersistence,
-    loaded: LoadedSettings,
+    prepared: PreparedSettings,
     agent_profile: AgentProfile,
     workspace: Workspace | None,
     hook_manager: HookManager | None,
@@ -112,7 +119,7 @@ def stage_build(
     build commits.
     """
     coordinator = session.mutation_coordinator
-    if not loaded.settings.mutation_coordination:
+    if not prepared.effective.settings.mutation_coordination:
         coordinator = None
     elif coordinator is None:
         session_dir = session.session_dir if persistence.state_store is not None else None
@@ -124,7 +131,7 @@ def stage_build(
                 session_id=session.session_id,
             )
     return StagedBuild(
-        loaded=loaded,
+        prepared=prepared,
         agent_profile=agent_profile,
         workspace=workspace,
         hook_manager=hook_manager,
@@ -144,7 +151,6 @@ async def build_agent(
     profile: AgentProfile,
     *,
     session: ActiveSession,
-    settings_handle: SettingsHandle,
     persistence: SessionPersistence,
     bus: EventBus,
     agent_registry: AgentProfileRegistry | None,
@@ -171,32 +177,21 @@ async def build_agent(
     if profile.acp is not None:
         raise ValueError(f"ACP profile {profile.name!r} is sub-agent-only and cannot be launched as the main agent")
 
-    intermediate_buffer = IntermediateTextBuffer()
+    batch_counter = ResponseBatchCounter()
     intermediate_texts: dict[int, str] = {}
 
-    # Both callbacks record ``batch_id → text`` at capture time — list
-    # position cannot reconstruct ids after the fact (retries continue
-    # numbering, and batch boundaries can fire without a captured text).
-    # Shared rule: an empty-text boundary signal still advances the counter
-    # but writes no mapping entry; a non-empty text advances the counter
-    # FIRST (``new_batch()`` here; ``store()`` already calls it internally
-    # in the sync path), then records the post-increment batch_id — the
-    # same id the batch's subsequent tool calls are stamped with, so the
-    # text attaches to the batch it precedes.
+    # Every tool-calling response records ``batch_id → text`` at capture
+    # time — list position cannot reconstruct ids after the fact (retries
+    # continue numbering, and batch boundaries can fire without a captured
+    # text). An empty-text boundary signal still advances the counter but
+    # writes no mapping entry; a non-empty text records the post-increment
+    # batch_id — the same id the batch's subsequent tool calls are stamped
+    # with, so the text attaches to the batch it precedes.
 
-    async def _on_intermediate_async(text: str) -> None:
-        intermediate_buffer.new_batch()
+    def _on_intermediate(text: str) -> None:
+        batch_counter.new_batch()
         if text:
-            intermediate_texts[intermediate_buffer.batch_id] = text
-
-    def _on_intermediate_sync(text: str) -> None:
-        intermediate_buffer.store(text)
-        if text:
-            intermediate_texts[intermediate_buffer.batch_id] = text
-
-    def _commit_intermediate_text(text: str, batch_id: int) -> None:
-        if text:
-            intermediate_texts[batch_id] = text
+            intermediate_texts[batch_counter.batch_id] = text
 
     injection = InjectionMiddleware()
     consumed_injections: list[ConsumedInjection] = []
@@ -313,10 +308,8 @@ async def build_agent(
             bus=bus,
             agent_registry=agent_registry,
             injection=injection,
-            intermediate_buffer=intermediate_buffer,
-            on_intermediate_async=_on_intermediate_async,
-            on_intermediate_sync=_on_intermediate_sync,
-            commit_intermediate_text=_commit_intermediate_text,
+            batch_counter=batch_counter,
+            on_intermediate=_on_intermediate,
             on_usage=usage_publisher.publish_usage,
             on_sub_agent_usage=usage_publisher.accumulate_invocation_usage,
             on_side_call_usage=usage_publisher.accumulate_side_call_usage,
@@ -339,11 +332,15 @@ async def build_agent(
             persist_recovery_now=checkpoints.persist_now,
             turn_context=turn_context,
             allow_user_interaction=allow_user_interaction,
+            # `icode run` holds a reply's text until it knows whether it is the final answer; the TUI and ACP stream it.
+            shows_answer_text=session.surface is not SessionSurface.CLI,
+            # Only the TUI's chat cards show a sub-agent's answer text; `icode run` and ACP show none of it.
+            sub_agent_shows_answer_text=session.surface not in (SessionSurface.CLI, SessionSurface.ACP),
         )
         # The judge creates its client on first evaluation, never during the
         # build, so the build's own rollback has nothing of it to close.
         result.prepared.own(approval_judge.aclose)
-        settings = settings_handle.prepare(staged.loaded)
+        settings = staged.prepared
         result.loop_recorder.on_pre_wire_barrier = checkpoints.persist_barrier
         result.loop_recorder.on_result_checkpoint = checkpoints.save_checkpoint
         result.bindings.inputs.recovery_input_recorder = turn_state.set_current_input

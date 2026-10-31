@@ -9,31 +9,14 @@ from textual.geometry import Size
 from textual.widget import Widget
 from textual.widgets import Static
 
+from chrys.app.tui.widgets.chat.messages import UserMessage
 from chrys.app.tui.widgets.chat.panel import ChatPanel, _ChatBottomSpacer, _ScrollToBottomButton
 from chrys.app.tui.widgets.markdown import VirtualizedMarkdown
+from tests.app.tui.widgets._chat_scroll import fill_eight_turns, record_layouts, scrolled_to_bottom
 from tests.app.tui.widgets._scroll_gc import install_fake_chat_panel_gc
 from tests.support.pilot_barrier import screen_is_settled
-from tests.support.tui_helpers import (
-    ChatPanelApp,
-    _simulate_chat_panel_user_scroll_y,
-)
+from tests.support.tui_helpers import ChatPanelApp, _simulate_chat_panel_user_scroll_y
 from tests.support.waiting import wait_for
-
-
-async def _fill_eight_turns(cp: ChatPanel, pilot: object) -> None:
-    """Add eight user/agent turns so an 80x20 panel overflows, then let layout settle."""
-    body = "\n".join(f"line {i}" for i in range(8))
-    for i in range(8):
-        await cp.add_user_message(f"message {i}")
-        await cp.add_agent_message(body)
-    await pilot.pause()
-
-
-async def _scrolled_to_bottom(cp: ChatPanel, pilot: object) -> None:
-    """Fill the panel with eight turns and settle it at the exact bottom."""
-    await _fill_eight_turns(cp, pilot)
-    cp.scroll_end(immediate=True, animate=False)
-    await pilot.pause()
 
 
 async def test_chat_panel_bottom_spacer_lifecycle() -> None:
@@ -42,8 +25,8 @@ async def test_chat_panel_bottom_spacer_lifecycle() -> None:
     The spacer's ``height: 1fr`` has an effective ``min-height: 1`` in Textual —
     leaving it visible while the welcome widget (``height: 100%``) is present
     produces a phantom 1-row scrollbar.  After the first user message the
-    welcome is removed and the spacer becomes the flexible tail that gives
-    ``scroll_visible(top=True)`` room to scroll into.
+    welcome is removed and the spacer becomes the flexible tail below the
+    new user message.
     """
     async with ChatPanelApp().run_test() as pilot:
         cp = pilot.app.query_one(ChatPanel)
@@ -199,6 +182,279 @@ async def test_chat_panel_dismiss_welcome_preserves_hidden_spacer_after_first_tu
         assert spacer.display is False
 
 
+async def test_content_growing_past_the_viewport_lays_out_no_spacer_row_below_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Textual gives the spacer's ``1fr`` one row once no space remains; ``arrange`` leaves it out.
+
+    That row showed a scrollbar for a frame, and scrolled the view by it and back.
+    """
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        spacer = cp.query_one(_ChatBottomSpacer)
+        await cp.add_user_message("hello")
+        await pilot.pause()
+        assert spacer.display is True
+        layouts = record_layouts(monkeypatch)
+
+        await cp.mount(Static("\n".join(f"line {index}" for index in range(30))))
+        await wait_for(
+            lambda: spacer.display is False and screen_is_settled(pilot.app, cp.screen),
+            pilot=pilot,
+            description="the spacer hid once the content filled the viewport",
+        )
+
+        content_height = cp.virtual_size.height
+        assert content_height > cp.size.height
+        assert layouts
+        assert all(height <= content_height and scroll_y <= cp.scroll_y for height, scroll_y in layouts), layouts
+
+
+def _in_view(cp: ChatPanel, widget: Widget) -> bool:
+    return bool(widget.region) and cp.region.contains_region(widget.region)
+
+
+async def test_a_scrolled_up_view_comes_down_to_a_new_message_that_mounted_while_a_batch_held_layout() -> None:
+    """The footer recomposes inside ``batch_update`` as a run starts, which can cover the message's mount.
+
+    Textual runs the screen's ``call_after_refresh`` callbacks whenever it idles in a
+    batch, before any layout, so a scroll deferred to one found the message unplaced and
+    did nothing. The failed turn it replaced left the content shorter, so growth did not
+    bring the view down either: the message stayed below the viewport until the reply.
+    """
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        app = pilot.app
+        cp = app.query_one(ChatPanel)
+        await fill_eight_turns(cp, pilot)
+        await cp.add_user_message("a question that failed")
+        await cp.add_error("Connection error")
+        await pilot.pause()
+        _simulate_chat_panel_user_scroll_y(cp, 0)
+        await pilot.pause()
+        # A geometry read since that layout leaves Textual's map of every widget built
+        # without the new message, so the message reads no region until a layout places it.
+        assert cp.query(UserMessage).last().region
+        cp.agent_running = True
+        callbacks_ran: list[bool] = []
+        with app.batch_update():
+            await cp.add_user_message("new question")
+            cp.call_after_refresh(callbacks_ran.append, True)
+            await wait_for(lambda: callbacks_ran, pilot=pilot, description="refresh callbacks ran inside the batch")
+        message = cp.query(UserMessage).last()
+        assert not message.outer_size
+        # The composer's blinking cursor wakes the screen in the app.
+        app.screen.check_idle()
+        await wait_for(
+            lambda: _in_view(cp, message) and cp.scroll_y == cp.max_scroll_y and cp._anchor_released is False,
+            pilot=pilot,
+            description="the new message in view, following the bottom",
+        )
+
+
+async def test_a_tall_message_sent_again_after_a_failed_turn_shows_from_its_top() -> None:
+    """Removing the failed turn queues a settle re-pin to the bottom, which must not undo the reveal after it."""
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        app = pilot.app
+        cp = app.query_one(ChatPanel)
+        await fill_eight_turns(cp, pilot)
+        prompt = "\n".join(f"prompt {index}" for index in range(30))
+        await cp.add_user_message(prompt)
+        await cp.add_error("Connection error")
+        cp.scroll_end(immediate=True, animate=False)
+        await wait_for(
+            lambda: cp.scroll_y == cp.max_scroll_y and screen_is_settled(app, cp.screen),
+            pilot=pilot,
+            description="following the bottom past the failed turn",
+        )
+        assert cp._anchor_released is False
+        cp.agent_running = True
+
+        await cp.add_user_message(prompt)
+        message = cp.query(UserMessage).last()
+        await wait_for(
+            lambda: message.outer_size and screen_is_settled(app, cp.screen),
+            pilot=pilot,
+            description="the message laid out",
+        )
+        assert cp.scroll_y == message.virtual_region_with_margin.y < cp.max_scroll_y
+        assert cp._anchor_released is True
+
+
+async def test_a_new_message_laid_out_while_it_mounted_comes_into_view_at_once() -> None:
+    """A message a layout placed before its reveal was asked for needs no further layout."""
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        await fill_eight_turns(cp, pilot)
+        _simulate_chat_panel_user_scroll_y(cp, 0)
+        await pilot.pause()
+        message = UserMessage("new question")
+        await cp.mount_transcript_widget(message)
+        await wait_for(
+            lambda: message.outer_size and screen_is_settled(pilot.app, cp.screen),
+            pilot=pilot,
+            description="the message laid out",
+        )
+        assert cp.scroll_y == 0
+
+        cp.scroll_user_message_to_top(message)
+        assert cp.scroll_y == cp.max_scroll_y
+        assert cp._anchor_released is False
+
+
+async def test_a_new_message_taller_than_the_viewport_shows_from_its_top() -> None:
+    """The view holds the message's first line at the top; the reply's growth resumes following."""
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        cp = pilot.app.query_one(ChatPanel)
+        await scrolled_to_bottom(cp, pilot)
+        cp.agent_running = True
+        await cp.add_user_message("\n".join(f"line {index}" for index in range(30)))
+        message = cp.query(UserMessage).last()
+        await wait_for(
+            lambda: message.outer_size and screen_is_settled(pilot.app, cp.screen),
+            pilot=pilot,
+            description="the message laid out",
+        )
+        assert cp.scroll_y == message.virtual_region_with_margin.y < cp.max_scroll_y
+        assert cp._anchor_released is True
+
+        await cp.add_agent_message("\n".join(f"answer {index}" for index in range(10)))
+        await wait_for(
+            lambda: cp.scroll_y == cp.max_scroll_y and cp._anchor_released is False,
+            pilot=pilot,
+            description="the reply resumed following the bottom",
+        )
+
+
+@pytest.mark.parametrize("geometry_read_first", [False, True], ids=["layout", "geometry_read_first"])
+async def test_entries_a_replay_lands_above_a_new_message_are_no_reply_to_follow(geometry_read_first: bool) -> None:
+    """The view hold keeps a tall message's top in place; only growth below it resumes following."""
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        app = pilot.app
+        cp = app.query_one(ChatPanel)
+        await scrolled_to_bottom(cp, pilot)
+        cp.begin_view_hold()
+        cp.agent_running = True
+        await cp.add_user_message("\n".join(f"line {index}" for index in range(30)))
+        message = cp.query(UserMessage).last()
+        await wait_for(
+            lambda: message.outer_size and screen_is_settled(pilot.app, cp.screen),
+            pilot=pilot,
+            description="the message laid out",
+        )
+        assert cp.scroll_y == message.virtual_region_with_margin.y < cp.max_scroll_y
+        assert cp._anchor_released is True
+
+        older = Static("\n".join(f"older {index}" for index in range(30)))
+        if geometry_read_first:
+            with app.batch_update():
+                await cp.mount_replay_batch([older], before=cp.transcript_content_children()[0])
+                # As a scroll-only refresh leaves the map: the read arranges the batch, the layout again.
+                app.screen._compositor._full_map_invalidated = True
+                assert older.size and not older.outer_size
+            app.screen.check_idle()
+        else:
+            await cp.mount_replay_batch([older], before=cp.transcript_content_children()[0])
+        await wait_for(
+            lambda: older.outer_size.height == 30 and screen_is_settled(app, cp.screen),
+            pilot=pilot,
+            description="older entries landed above",
+        )
+        cp.end_view_hold()
+        assert cp.scroll_y == message.virtual_region_with_margin.y
+        assert cp._anchor_released is True
+
+        # The rows the hold counted went with the layout that placed them: growth below follows, however small.
+        reply = Static("\n".join(f"reply {index}" for index in range(10)))
+        await cp.mount(reply, before=cp.bottom_spacer())
+        await wait_for(
+            lambda: reply.outer_size.height == 10 and screen_is_settled(app, cp.screen),
+            pilot=pilot,
+            description="the reply grew below the message",
+        )
+        assert cp._anchor_released is False
+        assert cp.scroll_y == cp.max_scroll_y
+
+
+async def test_a_new_message_waits_for_the_layout_that_gives_the_panel_its_height() -> None:
+    """A geometry read can place the message before any layout gave the panel its new height.
+
+    Textual rebuilds its map of every widget lazily, the message included, while the
+    panel keeps the virtual size of its last layout. Judged then, a message taller than
+    the viewport seemed to end the content, and the view followed the bottom past its top.
+    """
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        app = pilot.app
+        cp = app.query_one(ChatPanel)
+        await fill_eight_turns(cp, pilot)
+        _simulate_chat_panel_user_scroll_y(cp, 0)
+        await pilot.pause()
+        cp.agent_running = True
+        message = UserMessage("\n".join(f"line {index}" for index in range(30)))
+        with app.batch_update():
+            await cp.mount_transcript_widget(message)
+            # As a scroll-only refresh leaves the map: the next geometry read rebuilds it.
+            app.screen._compositor._full_map_invalidated = True
+            assert message.size and not message.outer_size
+            cp.scroll_user_message_to_top(message)
+        app.screen.check_idle()
+        await wait_for(
+            lambda: message.outer_size and screen_is_settled(app, cp.screen),
+            pilot=pilot,
+            description="the message laid out",
+        )
+        assert cp.scroll_y == message.virtual_region_with_margin.y < cp.max_scroll_y
+        assert cp._anchor_released is True
+
+
+async def test_stopping_a_scroll_animation_for_a_new_message_is_no_user_scroll() -> None:
+    """The stop lands the view at the animation's end first, a move up the user did not make: no pause."""
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        app = pilot.app
+        cp = app.query_one(ChatPanel)
+        await fill_eight_turns(cp, pilot)
+        cp.agent_running = True
+        message = UserMessage("\n".join(f"line {index}" for index in range(30)))
+        await cp.mount_transcript_widget(message)
+        await wait_for(
+            lambda: message.outer_size and screen_is_settled(app, cp.screen),
+            pilot=pilot,
+            description="the message laid out",
+        )
+        cp.scroll_to(y=0, animate=True, duration=1.0, immediate=True)
+        assert app.animator.is_being_animated(cp, "scroll_y")
+        assert cp._auto_scroll_paused_by_user is False
+
+        cp.scroll_user_message_to_top(message)
+        assert not app.animator.is_being_animated(cp, "scroll_y")
+        assert cp.scroll_y == message.virtual_region_with_margin.y
+        assert cp._auto_scroll_paused_by_user is False
+
+
+async def test_a_new_message_stops_a_scroll_animation_under_way() -> None:
+    """A scroll the user started still animating when the message lands would carry the view away from it."""
+    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
+        app = pilot.app
+        cp = app.query_one(ChatPanel)
+        await scrolled_to_bottom(cp, pilot)
+        cp.agent_running = True
+        cp.scroll_to(y=0, animate=True, duration=1.0, immediate=True)
+        assert app.animator.is_being_animated(cp, "scroll_y")
+
+        await cp.add_user_message("\n".join(f"line {index}" for index in range(30)))
+        message = cp.query(UserMessage).last()
+        await wait_for(
+            lambda: (
+                message.outer_size
+                and not app.animator.is_being_animated(cp, "scroll_y")
+                and screen_is_settled(app, cp.screen)
+            ),
+            pilot=pilot,
+            description="the message laid out and no scroll animating",
+        )
+        assert cp.scroll_y == message.virtual_region_with_margin.y < cp.max_scroll_y
+        assert cp._anchor_released is True
+
+
 async def test_chat_panel_arrange_defuses_short_canvas_anchor_pin() -> None:
     """When the arranged canvas is shorter than the container, ``arrange`` must
     release the bottom-anchor + reset ``scroll_y`` BEFORE the compositor reads
@@ -344,37 +600,34 @@ async def test_chat_panel_manual_scroll_schedules_no_repaint(monkeypatch: pytest
         assert non_gc_timers == []
 
 
-async def test_chat_panel_user_pause_blocks_growth_reanchor() -> None:
-    """New tool/intermediate growth must not override an explicit user scroll-up."""
-    from textual.geometry import Size
-
+@pytest.mark.parametrize("scroll_reflow", [False, True], ids=["layout", "scroll_reflow_first"])
+@pytest.mark.parametrize("paused", [False, True], ids=["soft_release", "user_paused"])
+async def test_growth_below_reanchors_a_soft_release_not_a_user_scroll_up(paused: bool, scroll_reflow: bool) -> None:
+    """New tool/intermediate growth takes back a view the user-message soft release let go, never an explicit
+    scroll-up: entries growing below the view, laid out, as they do, also when a scroll-only reflow sized them first."""
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
+        await scrolled_to_bottom(cp, pilot)
         cp.agent_running = True
         cp._anchor_released = True
-        cp._auto_scroll_paused_by_user = True
-        cp.set_reactive(Widget.scroll_y, 5.0)
+        cp._auto_scroll_paused_by_user = paused
+        held = cp.max_scroll_y - 5
+        cp.set_reactive(Widget.scroll_y, float(held))
 
-        cp.watch_virtual_size(Size(cp.size.width, 20), Size(cp.size.width, 80))
+        mounted = cp.mount(Static("\n".join(f"growth {index}" for index in range(60))))
+        if scroll_reflow:
+            # As a scroll lands with the mount: the panel takes the new size without the watcher, then the layout.
+            pilot.app.screen._refresh_layout(scroll=True)
+        await mounted
+        await wait_for(
+            lambda: cp.max_scroll_y > held + 60 and screen_is_settled(pilot.app, cp.screen),
+            pilot=pilot,
+            description="the growth laid out",
+        )
 
-        assert cp._anchor_released is True
-        assert cp._auto_scroll_paused_by_user is True
-
-
-async def test_chat_panel_soft_release_still_reanchors_on_growth() -> None:
-    """The user-message soft-release flow should still reanchor on real growth."""
-    from textual.geometry import Size
-
-    async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
-        cp = pilot.app.query_one(ChatPanel)
-        cp.agent_running = True
-        cp._anchor_released = True
-        cp._auto_scroll_paused_by_user = False
-        cp.set_reactive(Widget.scroll_y, 0.0)
-
-        cp.watch_virtual_size(Size(cp.size.width, 20), Size(cp.size.width, 80))
-
-        assert cp._anchor_released is False
+        assert cp._anchor_released is paused
+        assert cp._auto_scroll_paused_by_user is paused
+        assert cp.scroll_y == (held if paused else cp.max_scroll_y)
 
 
 async def test_chat_panel_check_anchor_reengages_at_exact_bottom_only() -> None:
@@ -410,7 +663,7 @@ async def test_chat_panel_second_upward_scroll_stays_paused(monkeypatch: pytest.
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
         bottom_y = cp.scroll_y
         assert bottom_y == cp.max_scroll_y > 6
 
@@ -436,7 +689,7 @@ async def test_chat_panel_tool_growth_follows_after_exact_bottom_resume(monkeypa
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
         assert cp.max_scroll_y > 6
 
         cp.agent_running = True
@@ -461,13 +714,11 @@ async def test_chat_panel_tool_growth_follows_after_exact_bottom_resume(monkeypa
 
 async def test_chat_panel_tool_growth_stays_detached_after_user_scroll_up(monkeypatch: pytest.MonkeyPatch) -> None:
     """Detached state should block tool anchor-sync and growth reanchor."""
-    from textual.geometry import Size
-
     install_fake_chat_panel_gc(monkeypatch)
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _fill_eight_turns(cp, pilot)
+        await fill_eight_turns(cp, pilot)
 
         assert cp.max_scroll_y > 6
         cp._set_scroll_y_programmatically(cp.max_scroll_y)
@@ -485,7 +736,12 @@ async def test_chat_panel_tool_growth_stays_detached_after_user_scroll_up(monkey
         cp._schedule_anchor_sync()
         assert cp._anchor_sync_scheduled is False
 
-        cp.watch_virtual_size(Size(cp.size.width, 20), Size(cp.size.width, 80))
+        await cp.mount(Static("\n".join(f"growth {index}" for index in range(60))))
+        await wait_for(
+            lambda: cp.max_scroll_y > 60 and screen_is_settled(pilot.app, cp.screen),
+            pilot=pilot,
+            description="the growth laid out",
+        )
 
         assert cp._auto_scroll_paused_by_user is True
         assert cp._anchor_released is True
@@ -543,7 +799,7 @@ async def test_chat_panel_bottom_clamp_does_not_mark_user_pause(monkeypatch: pyt
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _fill_eight_turns(cp, pilot)
+        await fill_eight_turns(cp, pilot)
 
         assert cp.max_scroll_y > 0
         cp.agent_running = True
@@ -557,7 +813,7 @@ async def test_chat_panel_bottom_clamp_does_not_mark_user_pause(monkeypatch: pyt
         assert cp._auto_scroll_paused_by_user is False
 
 
-async def test_chat_panel_intermediate_message_does_not_resume_user_pause() -> None:
+async def test_chat_panel_streamed_answer_text_does_not_resume_user_pause() -> None:
     async with ChatPanelApp().run_test() as pilot:
         cp = pilot.app.query_one(ChatPanel)
         cp.agent_running = True
@@ -565,7 +821,8 @@ async def test_chat_panel_intermediate_message_does_not_resume_user_pause() -> N
         cp._auto_scroll_paused_by_user = True
         cp._final_response_started = False
 
-        await cp.add_agent_message("checking files", is_intermediate=True)
+        # Streamed text may still turn out to be commentary before a tool call.
+        await cp.add_answer_delta("s1", "checking files")
 
         assert cp._auto_scroll_paused_by_user is True
         assert cp._anchor_released is True
@@ -580,7 +837,9 @@ async def test_chat_panel_final_response_resumes_once() -> None:
         cp._auto_scroll_paused_by_user = True
         cp._final_response_started = False
 
-        await cp.add_agent_message("final starts", is_final=False)
+        await cp.add_answer_delta("s1", "final answer")
+        assert cp._auto_scroll_paused_by_user is True
+        await cp.add_agent_message("final answer")
 
         # The mount's layout frame can transiently release the anchor with a
         # deferred re-anchor, so wait until the resume state lands.
@@ -594,7 +853,7 @@ async def test_chat_panel_final_response_resumes_once() -> None:
         cp._anchor_released = True
         cp._auto_scroll_paused_by_user = True
 
-        await cp.add_agent_message("final complete", is_final=True)
+        await cp.add_agent_message("final complete")
 
         assert cp._auto_scroll_paused_by_user is True
         assert cp._anchor_released is True
@@ -605,7 +864,7 @@ async def test_chat_panel_final_response_scrolls_detached_to_bottom(monkeypatch:
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
         assert cp.max_scroll_y > 6
 
         cp.agent_running = True
@@ -613,7 +872,9 @@ async def test_chat_panel_final_response_scrolls_detached_to_bottom(monkeypatch:
         assert cp._auto_scroll_paused_by_user is True
         assert cp._anchor_released is True
 
-        await cp.add_agent_message("final starts", is_final=False)
+        await cp.add_answer_delta("s1", "final answer")
+        assert cp._auto_scroll_paused_by_user is True
+        await cp.add_agent_message("final answer")
 
         # Same deferred re-anchor settle as above: one pause is not enough on
         # slow runners, so wait until the yank to the bottom lands.
@@ -645,7 +906,7 @@ async def test_chat_panel_status_messages_scroll_detached_to_bottom(
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
         assert cp.max_scroll_y > 6
 
         cp.agent_running = True
@@ -686,17 +947,17 @@ async def test_chat_panel_agent_running_resets_final_response_autoscroll_gate() 
     async with ChatPanelApp().run_test() as pilot:
         cp = pilot.app.query_one(ChatPanel)
         cp.agent_running = True
-        await cp.add_agent_message("first run starts", is_final=False)
+        await cp.add_agent_message("first run final")
 
         cp._anchor_released = True
         cp._auto_scroll_paused_by_user = True
-        await cp.add_agent_message("first run final", is_final=True)
+        await cp.add_agent_message("first run late final")
         assert cp._auto_scroll_paused_by_user is True
         assert cp._anchor_released is True
 
         cp.agent_running = False
         cp.agent_running = True
-        await cp.add_agent_message("retry starts", is_final=False)
+        await cp.add_agent_message("retry final")
 
         # The mount's layout frame can transiently release the anchor and
         # defer the re-anchor via ``call_after_refresh`` (see the settle loop
@@ -712,7 +973,7 @@ async def test_chat_panel_agent_running_resets_final_response_autoscroll_gate() 
 async def test_chat_panel_agent_running_post_run_disables_running_only_scroll_state() -> None:
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
 
         cp.agent_running = True
         cp.agent_running = False
@@ -764,7 +1025,7 @@ async def test_a_toc_jump_is_not_pulled_back_by_the_settle_repin_its_own_layout_
     """
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
         await wait_for(lambda: cp.scroll_y == cp.max_scroll_y > 0, pilot=pilot, description="settled at the bottom")
         assert cp._anchor_released is False
 
@@ -808,7 +1069,7 @@ async def test_chat_panel_ignores_focus_center_scroll() -> None:
 
     async with ChatPanelApp().run_test(size=(80, 20)) as pilot:
         cp = pilot.app.query_one(ChatPanel)
-        await _scrolled_to_bottom(cp, pilot)
+        await scrolled_to_bottom(cp, pilot)
         bottom_y = cp.scroll_y
         assert bottom_y == cp.max_scroll_y > 0, "test setup must produce a bottom-scrolled panel"
 
@@ -837,7 +1098,7 @@ async def test_chat_panel_textual_anchor_contract() -> None:
     * ``widget._anchored`` — bool flag set by ``widget.anchor()``
     * ``widget._anchor_released`` — bool toggled on user scroll-away / restored on scroll-to-bottom
     * ``widget._container_size`` — ``Size`` mutated inside our ``arrange()`` override so the compositor's anchor pin reads the fresh value
-    * ``widget.anchor()`` / ``widget.release_anchor()`` / ``scroll_visible(top=...)``
+    * ``widget.anchor()`` / ``widget.release_anchor()``
 
     All four are either private (``_``-prefixed) or depend on private state, so a
     Textual upgrade could rename / remove them silently.  This test asserts the
@@ -880,9 +1141,9 @@ async def test_chat_panel_textual_anchor_contract() -> None:
         cp.anchor()
         assert cp._anchored is True, "anchor() must set _anchored=True"
 
-        # release_anchor() flips _anchor_released True — this is what
-        # scroll_visible(top=True) triggers, and what watch_virtual_size
-        # flips back to False to re-engage auto-follow.
+        # release_anchor() flips _anchor_released True — this is what a user
+        # scroll triggers, and what watch_virtual_size flips back to False to
+        # re-engage auto-follow.
         cp._anchor_released = False
         cp.release_anchor()
         assert cp._anchor_released is True, "release_anchor() must set _anchor_released=True"
