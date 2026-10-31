@@ -2,12 +2,12 @@
 
 """Import MCP servers configured in pi, the coding agent.
 
-Baseline: pi 1.3.0 (tag ``v1.3.0`` of earendil-works/pi, commit 71023aec1,
-2026-10-15). Each rule is tagged with the source it was read from:
+Baseline: pi 1.4.0 (tag ``v1.4.0`` of earendil-works/pi, commit 4a080252f,
+2026-10-22). Each rule is tagged with the source it was read from:
 ``[code: CA/core/mcp-servers.ts:248]`` with ``CA`` =
 ``packages/coding-agent/src``.
 
-What is read [code: CA/extensions/mcp/config.ts:91-156]:
+What is read [code: CA/extensions/mcp/config.ts:92-157]:
 
 - ``global``: ``mcp.json`` in pi's agent folder, ``$PI_CODING_AGENT_DIR``
   when set (``~`` expanded; relative to the folder pi starts in, for which the
@@ -28,8 +28,9 @@ servers listed but locked: pi doesn't run them. A folder pi would ask about
 counts as trusted; the user decides here instead. The launch flags that
 decide trust for one run are unknown here.
 
-Both files are strict JSON: a comment, a trailing comma or a byte-order mark
-makes pi skip the whole file. Each server is checked as pi checks it
+Both files are strict JSON after one leading byte-order mark, which pi drops
+[code: CA/extensions/mcp/config.ts:97]: a comment or a trailing comma makes
+pi skip the whole file. Each server is checked as pi checks it
 [code: CA/core/mcp-servers.ts:248-305]; one pi rejects is left out, as are a
 second name differing from another only in ``-`` versus ``_``, and a project
 server with ``auth``. Only ``env`` and ``headers`` values hold variables
@@ -109,7 +110,6 @@ SCOPE_PROJECT = "project"
 
 _CONFIG_FILE_NAME = "mcp.json"
 _PROJECT_DIR_NAME = ".pi"
-_UTF8_BOM = b"\xef\xbb\xbf"
 
 _SERVER_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 _VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -266,8 +266,6 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     raw = read_source_bytes(path)
     if raw is None:
         return None
-    if raw.startswith(_UTF8_BOM):
-        raise SourceReadError(SourceErrorKind.INVALID_JSON)
     try:
         document = json.loads(decode_source(raw), parse_constant=_reject_constant)
     except (ValueError, RecursionError) as exc:
@@ -282,7 +280,7 @@ def _reject_constant(name: str) -> Any:
 
 
 def _add_entry(state: _State, name: str, value: object, source: str, scope: str, scope_path: str) -> None:
-    """One server into the list, as pi adds it [code: CA/extensions/mcp/config.ts:107-141]."""
+    """One server into the list, as pi adds it [code: CA/extensions/mcp/config.ts:108-142]."""
     if scope == SCOPE_PROJECT and isinstance(value, dict) and not ({"command", "url", "type"} & value.keys()):
         base = state.entries.get(name)
         if base is None or value.keys() - _OVERRIDE_KEYS:

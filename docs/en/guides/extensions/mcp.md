@@ -89,7 +89,7 @@ Entries Claude Code itself doesn't load are not listed, such as a URL with no `t
 
 ### Codex
 
-The importer follows [Codex 0.163.0](https://github.com/openai/codex/tree/rust-v0.163.0), using its source code and tests as the reference.
+The importer follows [Codex 0.166.0](https://github.com/openai/codex/tree/rust-v0.166.0), using its source code and tests as the reference.
 
 - "user": servers under `[mcp_servers]` in `~/.codex/config.toml`, or `config.toml` in the folder `CODEX_HOME` names. A relative `CODEX_HOME` is resolved from the working folder.
 - "project": `.codex/config.toml` from the project root down to the working folder, with the nearer file taking precedence. The root is the nearest folder containing a `project_root_markers` entry (default: `.git`); without one, only the working folder is searched. Tables merge by key, including environment variables and headers; arrays replace earlier arrays. A warning names the other files contributing to a server.
@@ -134,7 +134,7 @@ iCode lists the servers pi uses in the working folder:
 
 pi reads project servers only when it trusts the folder. If you told pi not to trust the working folder, or pi is set never to trust a new folder (`"defaultProjectTrust": "never"`), the project servers are listed but can't be imported. If pi hasn't asked yet, they are listed as usual: you decide here.
 
-pi skips a configuration file with a comment, a trailing comma or a byte order mark at the start, and iCode reports such a file. Also:
+pi skips a configuration file with a comment or a trailing comma, and iCode reports such a file. A byte order mark at the start of the file is fine. Also:
 
 - `${GITHUB_TOKEN}` and `$GITHUB_TOKEN` become `{{GITHUB_TOKEN}}`, and `$$` becomes `$`. A value starting with `!` is the output of a command pi runs; iCode doesn't run commands for values, so such a server can't be imported.
 - Text pi treats literally, such as `${TOKEN:-default}` and literal braces in environment variables or headers, is preserved. pi doesn't support defaults in variable references.

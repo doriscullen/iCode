@@ -552,6 +552,51 @@ def test_well_typed_settings_keep_the_entry(home: Path, entry: dict[str, Any]) -
     assert [candidate.name for candidate in ClaudeCodeSource().discover(_context(home)).candidates] == ["server"]
 
 
+def _url(units: int, prefix: str = "https://x.test/") -> str:
+    """A URL *units* UTF-16 code units long, ending in a character beyond U+FFFF, which is two of them."""
+    return prefix + "a" * (units - len(prefix) - 2) + "\U0001f600"
+
+
+def _metadata_url(value: str) -> dict[str, Any]:
+    return {"type": "http", "url": "https://x.test", "oauth": {"authServerMetadataUrl": value}}
+
+
+# Claude Code counts a URL in UTF-16 code units, before trimming it [observed 2.1.316].
+@pytest.mark.parametrize(
+    ("entry", "listed"),
+    [
+        ({"type": "http", "url": _url(65_536)}, True),
+        ({"type": "http", "url": _url(65_537)}, False),
+        ({"type": "http", "url": " " + _url(65_536)}, False),
+        ({"type": "sse", "url": _url(65_536)}, True),
+        ({"type": "sse", "url": _url(65_537)}, False),
+        ({"type": "ws", "url": _url(65_536, "wss://x.test/")}, True),
+        ({"type": "ws", "url": _url(65_537, "wss://x.test/")}, False),
+        (_metadata_url(_url(4_096, "https://auth.test/")), True),
+        (_metadata_url(_url(4_097, "https://auth.test/")), False),
+        (_metadata_url(" " + _url(4_096, "https://auth.test/")), False),
+    ],
+    ids=[
+        "http-at-limit",
+        "http-over-limit",
+        "http-over-limit-untrimmed",
+        "sse-at-limit",
+        "sse-over-limit",
+        "ws-at-limit",
+        "ws-over-limit",
+        "metadata-at-limit",
+        "metadata-over-limit",
+        "metadata-over-limit-untrimmed",
+    ],
+)
+def test_a_url_longer_than_claude_code_reads_is_not_listed(home: Path, entry: dict[str, Any], listed: bool) -> None:
+    _write_json(home / ".claude.json", {"mcpServers": {"server": entry}})
+
+    names = [candidate.name for candidate in ClaudeCodeSource().discover(_context(home)).candidates]
+
+    assert names == (["server"] if listed else [])
+
+
 def test_a_blank_server_name_is_not_listed(home: Path) -> None:
     _write_json(home / ".claude.json", {"mcpServers": {"  ": {"command": "cmd"}}})
 

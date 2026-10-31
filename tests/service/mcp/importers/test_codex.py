@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Codex importer behavior against openai/codex tag rust-v0.163.0."""
+"""Codex importer behavior against openai/codex tag rust-v0.166.0."""
 
 from __future__ import annotations
 
@@ -252,6 +252,15 @@ def test_remote_execution_cannot_become_a_local_command(ctx: ImportContext, sett
         'url = "https://example.test"\noauth = {client_id = "client", client_secret = ""}',
         'url = "https://example.test"\noauth = {callback_port = 65536}',
         'url = "https://example.test"\noauth = {authorization_server_issuer = "issuer"}',
+        (
+            'url = "https://example.test"\nauth = "ema_auth"\n'
+            'oauth = {client_id = "client", client_secret = "secret", token_endpoint_auth_method = "private_key_jwt"}'
+        ),
+        (
+            'url = "https://example.test"\n'
+            'oauth = {client_id = "client", client_secret = "secret", token_endpoint_auth_method = "client_secret_post"}'
+        ),
+        'url = "https://example.test"\nauth = "ema_auth"\noauth = {token_endpoint_auth_method = "client_secret_basic"}',
         'command = "server"\ntools = {write = {output_token_limit = 0}}',
         'command = "server"\nomit_tools_from = ["invalid"]',
     ],
@@ -260,6 +269,16 @@ def test_invalid_entries_are_not_candidates(ctx: ImportContext, entry: str) -> N
     _user(ctx, f'[mcp_servers.invalid]\n{entry}\n[mcp_servers.good]\ncommand = "good"')
     result = CodexSource().discover(ctx)
     assert [candidate.name for candidate in result.candidates] == ["good"]
+
+
+@pytest.mark.parametrize("method", ["client_secret_basic", "client_secret_post"])
+def test_an_ema_client_with_a_secret_may_name_its_token_endpoint_auth_method(ctx: ImportContext, method: str) -> None:
+    _user(
+        ctx,
+        '[mcp_servers.s]\nurl = "https://example.test"\nauth = "ema_auth"\n'
+        f'oauth = {{client_id = "client", client_secret = "secret", token_endpoint_auth_method = "{method}"}}',
+    )
+    assert [candidate.name for candidate in CodexSource().discover(ctx).candidates] == ["s"]
 
 
 @pytest.mark.parametrize(

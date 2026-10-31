@@ -2,10 +2,10 @@
 
 """Import local Codex MCP configuration without starting Codex or its servers.
 
-Baseline: https://github.com/openai/codex, tag ``rust-v0.163.0`` (0.163.0),
-commit ``83086188ae0614bd882818ff1aa23f3194962012``. Source paths below are
+Baseline: https://github.com/openai/codex, tag ``rust-v0.166.0`` (0.166.0),
+commit ``6ff1e1ca3b30fc8b914720681fcf5fe62e95f856``. Source paths below are
 relative to ``codex-rs`` at that commit; the release source is available at
-https://github.com/openai/codex/tree/rust-v0.163.0/codex-rs.
+https://github.com/openai/codex/tree/rust-v0.166.0/codex-rs.
 
 Read ``$CODEX_HOME/config.toml`` (default ``~/.codex/config.toml``), then
 ``.codex/config.toml`` from the nearest project root down to the workspace.
@@ -23,7 +23,7 @@ variables become iCode templates, never captured secrets. A stdio server's
 iCode's stdio servers inherit. Environment headers beat static headers; bearer
 auth beats Authorization [rmcp-client/src/utils.rs, codex-mcp/src/rmcp_client.rs].
 Optional header references get a warning because iCode requires them to be set.
-The default tool timeout is 300 seconds [codex-mcp/src/rmcp_client.rs:105]. Deny-only tool filters are
+The default tool timeout is 300 seconds [codex-mcp/src/rmcp_client.rs:122]. Deny-only tool filters are
 imported with no tools, since iCode cannot express a deny list without a catalog.
 
 Not read: system/managed/cloud configuration, selected profile files,
@@ -81,6 +81,9 @@ _HTTP_FIELDS = {
     "oauth_resource",
     "auth",
 }
+# The values Codex accepts for ``oauth.token_endpoint_auth_method``, set only with ``auth = "ema_auth"``
+# and ``oauth.client_secret``.
+_TOKEN_ENDPOINT_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
 _CARRIED_FIELDS = _STDIO_FIELDS | _HTTP_FIELDS | {"enabled", "tool_timeout_sec", "enabled_tools", "disabled_tools"}
 # protocol/src/shell_environment.rs::NON_INHERITABLE_ENV_VARS, case-insensitive on every OS.
 _NON_INHERITABLE = frozenset(
@@ -331,6 +334,13 @@ def _oauth_valid(value: dict[str, Any]) -> bool:
     ):
         return False
     if "client_secret" in oauth and (not oauth["client_secret"].strip() or not oauth.get("client_id", "").strip()):
+        return False
+    # [config/src/mcp_types.rs:McpServerOAuthConfig, config/src/mcp_ema.rs:McpEmaTokenEndpointAuthMethod]
+    if "token_endpoint_auth_method" in oauth and (
+        oauth["token_endpoint_auth_method"] not in _TOKEN_ENDPOINT_AUTH_METHODS
+        or value.get("auth") != "ema_auth"
+        or "client_secret" not in oauth
+    ):
         return False
     return "authorization_server_issuer" not in oauth or value.get("auth") == "ema_auth"
 

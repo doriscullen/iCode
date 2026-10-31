@@ -2,12 +2,14 @@
 
 """Import MCP servers configured in Claude Code.
 
-Baseline: Claude Code 2.1.302, checked 2026-10-19 against
+Baseline: Claude Code 2.1.316, checked 2026-10-31 against
 code.claude.com/docs/en/{mcp,managed-mcp,settings-reference}. Each rule is
 tagged with its evidence: ``[doc: page, "section"]``, ``[observed 2.1.302]``
 (behavior the docs leave out, seen by running that release; a few were seen
 in 2.1.303) or ``[binary 2.1.302]`` (read from that release's config schema;
-internal).
+internal). The rules were written against 2.1.302; on 2.1.316 the observed
+ones were seen again and its schema read again, which changed only the URL
+length limits tagged with that release.
 
 What is read [doc: mcp, "MCP installation scopes"]:
 
@@ -173,8 +175,14 @@ _HTTP_ALIASES = frozenset({"http", "streamable-http"})
 _UNSUPPORTED_REMOTE_TRANSPORTS = frozenset({"sse", "ws"})
 
 # The per-server ``timeout`` is in milliseconds and values below one second are ignored
-# [doc: mcp, tips under "Push messages with channels"].
+# [doc: mcp, "Time limits on MCP tool calls"].
 _MIN_TIMEOUT_MS = 1000
+
+# Claude Code skips a remote server whose ``url``, or whose ``oauth.authServerMetadataUrl``,
+# is longer than these, counted as JavaScript counts a string's length, on the value as
+# written, before any trimming [binary 2.1.316; observed 2.1.316]. 2.1.314 had no limit.
+_MAX_URL_LENGTH = 65_536
+_MAX_AUTH_SERVER_METADATA_URL_LENGTH = 4_096
 
 # A remote server's ``request_timeout_ms`` becomes its ``timeout`` when it sets none,
 # capped at five minutes; any other value is dropped [binary 2.1.302, internal].
@@ -450,10 +458,17 @@ def _transport(entry: dict[str, Any]) -> str:
     return "http" if declared in _HTTP_ALIASES else declared
 
 
+def _js_length(text: str) -> int:
+    """``text.length`` in JavaScript: UTF-16 code units, two for a character beyond U+FFFF."""
+    return len(text) + sum(1 for char in text if ord(char) > 0xFFFF)
+
+
 def _remote_shape_is_valid(entry: dict[str, Any], transport: str) -> bool:
     """Whether Claude Code would connect the remote entry: a non-empty url, string headers, well-typed settings."""
     url = entry.get("url")
     if not isinstance(url, str) or not url.strip() or not _is_str_mapping(entry.get("headers", {})):
+        return False
+    if _js_length(url) > _MAX_URL_LENGTH:
         return False
     checks = _WEBSOCKET_CHECKS if transport == "ws" else _HTTP_CHECKS
     return _settings_are_valid(entry, checks)
@@ -630,7 +645,7 @@ def _is_https_url(value: object) -> bool:
     Claude Code trims the value first and reads ``\\`` as ``/``. When unsure this accepts: iCode
     never imports ``oauth``, and rejecting it would hide a server Claude Code loads.
     """
-    if not isinstance(value, str):
+    if not isinstance(value, str) or _js_length(value) > _MAX_AUTH_SERVER_METADATA_URL_LENGTH:
         return False
     text = value.strip(_JS_WHITESPACE)
     if not text.startswith("https://"):

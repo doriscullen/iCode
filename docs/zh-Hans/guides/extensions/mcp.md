@@ -89,7 +89,7 @@ Claude Code 自己不会加载的条目不会列出，例如有 URL 但没有 `t
 
 ### Codex
 
-导入器以 [Codex 0.163.0](https://github.com/openai/codex/tree/rust-v0.163.0) 的源码和测试为依据。
+导入器以 [Codex 0.166.0](https://github.com/openai/codex/tree/rust-v0.166.0) 的源码和测试为依据。
 
 - “用户”：`~/.codex/config.toml` 中 `[mcp_servers]` 下的服务器，或 `CODEX_HOME` 指定文件夹中的 `config.toml`。相对的 `CODEX_HOME` 路径以当前工作文件夹为基准。
 - “项目”：从项目根目录到工作文件夹之间各层的 `.codex/config.toml`，较近的文件优先。项目根目录是最近的包含 `project_root_markers` 中任一标记的文件夹（默认标记为 `.git`）；没有标记时，只搜索工作文件夹本身。表按键合并，包括环境变量和请求头；数组整体替换。多个文件参与同一服务器的配置时，提示会列出其他文件。
@@ -134,7 +134,7 @@ iCode 会列出 pi 在工作文件夹中使用的服务器：
 
 pi 只有在信任文件夹时才读取项目服务器。如果你让 pi 不信任当前工作文件夹，或者 pi 设置为从不信任新文件夹（`"defaultProjectTrust": "never"`），项目服务器会列出，但无法导入。如果 pi 还没有询问过，它们会正常列出，由你在这里决定。
 
-pi 会跳过含有注释、末尾多余逗号或开头有字节顺序标记的配置文件，iCode 也会提示这类文件。此外：
+pi 会跳过含有注释或末尾多余逗号的配置文件，iCode 也会提示这类文件。文件开头有字节顺序标记不影响读取。此外：
 
 - `${GITHUB_TOKEN}` 和 `$GITHUB_TOKEN` 会转换为 `{{GITHUB_TOKEN}}`，`$$` 转换为 `$`。以 `!` 开头的值是 pi 运行命令得到的输出；iCode 不会为配置值运行命令，因此这类服务器无法导入。
 - pi 按原样处理的文本会保留，例如 `${TOKEN:-default}`，以及环境变量或请求头中的字面量花括号。pi 不支持在变量引用中指定默认值。

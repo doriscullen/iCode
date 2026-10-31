@@ -2,9 +2,11 @@
 
 """Import MCP servers configured in opencode.
 
-Baseline: opencode 1.19.3 (tag ``v1.19.3``, commit e3c4eb2425, 2026-10-16),
-the release ``npm install opencode-ai`` installs; the ``v2.0.x`` tags of the
-same repository are an unreleased rewrite and are not followed. Each rule is
+Baseline: opencode 1.19.5 (tag ``v1.19.5`` of anomalyco/opencode, commit
+810c0eba1a, 2026-10-28), the release ``npm install opencode-ai`` installs and
+the one the repository marks as latest. opencode 2, a rewrite released from
+the same repository as the npm package ``@opencode/cli`` (``v2.x`` tags), is
+not followed. Each rule is
 tagged with the source it was read from, relative to the repository root:
 ``[code: C/config.ts:42]`` with ``C`` = ``packages/opencode/src/config``,
 ``M`` = ``packages/opencode/src/mcp`` and ``K`` = ``packages/core/src``.

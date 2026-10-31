@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Tests for importing MCP servers configured in pi 1.3.0."""
+"""Tests for importing MCP servers configured in pi 1.4.0."""
 
 from __future__ import annotations
 
@@ -325,10 +325,18 @@ def test_a_file_pi_skips_is_reported(home: Path, text: str, kind: SourceErrorKin
     assert PiSource().discover(_context(home)) == McpImportResult(source_errors=(McpSourceError(str(path), kind),))
 
 
-def test_a_byte_order_mark_makes_pi_skip_the_file(home: Path) -> None:
+def test_pi_drops_one_leading_byte_order_mark(home: Path) -> None:
     path = home / ".pi" / "agent" / "mcp.json"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"mcpServers": {"s": {"command": "cmd"}}}).encode())
+
+    assert [candidate.name for candidate in _discover(home)] == ["s"]
+
+
+def test_a_second_byte_order_mark_makes_pi_skip_the_file(home: Path) -> None:
+    path = home / ".pi" / "agent" / "mcp.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"\xef\xbb\xbf" * 2 + json.dumps({"mcpServers": {"s": {"command": "cmd"}}}).encode())
 
     result = PiSource().discover(_context(home))
 
