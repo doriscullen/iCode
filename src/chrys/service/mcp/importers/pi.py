@@ -12,21 +12,14 @@ What is read [code: CA/extensions/mcp/config.ts:92-157]:
 - ``global``: ``mcp.json`` in pi's agent folder, ``$PI_CODING_AGENT_DIR``
   when set (``~`` expanded; relative to the folder pi starts in, for which the
   workspace stands in), else ``~/.pi/agent`` on every OS [code: CA/config.ts:581-611].
-- ``project``: ``.pi/mcp.json`` in the workspace itself, no folder above it,
-  read only when pi trusts the workspace. Its servers replace global ones of
+- ``project``: ``.pi/mcp.json`` in the workspace itself, no folder above it.
+  Its servers replace global ones of
   the same name; an entry with none of ``command``, ``url`` and ``type`` only
   changes the ``enabled``, ``exposure`` and ``toolExposure`` of the global
   server it names.
 
-Trust [code: CA/core/project-trust.ts:47-97, CA/core/trust-manager.ts]: pi
-looks up the workspace and each folder above it in ``trust.json`` in the agent
-folder, the nearest ``true`` or ``false`` deciding; without one it follows
-``defaultProjectTrust`` in the agent folder's ``settings.json``, and asks
-when that is ``ask`` (the default). A folder pi distrusts, or one it would
-never ask about because ``defaultProjectTrust`` is ``never``, has its project
-servers listed but locked: pi doesn't run them. A folder pi would ask about
-counts as trusted; the user decides here instead. The launch flags that
-decide trust for one run are unknown here.
+pi's project trust settings are not read: the user decides which configurations
+to import. Import does not start servers or change pi's trust settings.
 
 Both files are strict JSON after one leading byte-order mark, which pi drops
 [code: CA/extensions/mcp/config.ts:97]: a comment or a trailing comma makes
@@ -36,8 +29,13 @@ second name differing from another only in ``-`` versus ``_``, and a project
 server with ``auth``. Only ``env`` and ``headers`` values hold variables
 [code: CA/core/resolve-config-value.ts]: ``${NAME}`` and ``$NAME`` become
 iCode's ``{{NAME}}``, ``$$`` and ``$!`` a literal ``$`` and ``!``; a value
-starting with ``!`` runs a command, which iCode doesn't, so its server can't
-be imported. pi fails the connection on an unset or empty variable, as iCode
+starting with ``!`` runs a command. It is not converted to iCode's
+``{{!command}}``: pi uses its process cwd and shell, a 10-second limit,
+uncached output and accepts more than one line of UTF-8 text [code:
+CA/core/resolve-config-value.ts]. iCode uses the home folder, its configured
+shell, a 30-second limit and single-line printable ASCII, with HTTP credential
+caching and refresh. Such a server needs manual configuration. pi fails the
+connection on an unset or empty variable, as iCode
 does. ``~`` in ``command`` and ``args`` is expanded on import, as pi expands
 it on start [code: CA/extensions/mcp/runtime.ts:89-121].
 
@@ -138,13 +136,11 @@ class _Entry:
 @dataclass(slots=True)
 class _State:
     entries: dict[str, _Entry] = field(default_factory=dict)
-    untrusted: list[_Entry] = field(default_factory=list)
     errors: list[McpSourceError] = field(default_factory=list)
-    auto_enable_codemode: bool = True
 
 
 class PiSource:
-    """Reads pi's global servers and, when pi trusts the workspace, its project servers."""
+    """Reads pi's global and project servers for the user to choose from."""
 
     @property
     def source_id(self) -> str:
@@ -156,7 +152,9 @@ class PiSource:
 
     def detect(self, ctx: ImportContext) -> bool:
         agent_dir = _agent_dir(ctx)
-        if agent_dir is not None and agent_dir.is_dir():
+        # An empty agent folder (which pi creates on start) holds no servers, so it is not
+        # a sign that anything can be imported; the global mcp.json and the project file are.
+        if agent_dir is not None and (agent_dir / _CONFIG_FILE_NAME).is_file():
             return True
         project = _project_file(ctx)
         return project is not None and project.is_file()
@@ -165,17 +163,11 @@ class PiSource:
         state = _State()
         agent_dir = _agent_dir(ctx)
         if agent_dir is not None:
-            _read_file(state, agent_dir / _CONFIG_FILE_NAME, SCOPE_GLOBAL, trusted=True)
+            _read_file(state, agent_dir / _CONFIG_FILE_NAME, SCOPE_GLOBAL)
         project = _project_file(ctx)
         if project is not None and project.exists():
-            trusted = _project_trusted(ctx, agent_dir)
-            _read_file(state, project, SCOPE_PROJECT, trusted=trusted, scope_path=str(project.parent.parent))
-        on_demand_search = any(
-            _ON_DEMAND_SEARCH in _exposures(entry.config) for entry in state.entries.values() if _enabled(entry.config)
-        )
-        codemode_off = not state.auto_enable_codemode and not on_demand_search
-        candidates = [_candidate(entry, ctx, codemode_off=codemode_off) for entry in state.entries.values()]
-        candidates.extend(_untrusted_candidate(entry) for entry in state.untrusted)
+            _read_file(state, project, SCOPE_PROJECT, scope_path=str(project.parent.parent))
+        candidates = [_candidate(entry, ctx) for entry in state.entries.values()]
         return McpImportResult(candidates=tuple(candidates), source_errors=tuple(state.errors))
 
 
@@ -203,42 +195,7 @@ def _expand_home(value: str, home: Path) -> str:
     return value
 
 
-def _project_trusted(ctx: ImportContext, agent_dir: Path | None) -> bool:
-    """Whether pi would read the project file, or ask the user whether to."""
-    if agent_dir is None or not ctx.workspace_cwd:
-        return True
-    decision = _trust_decision(agent_dir / "trust.json", ctx.workspace_cwd)
-    if decision is not None:
-        return decision
-    settings = _read_lenient(agent_dir / "settings.json")
-    return settings.get("defaultProjectTrust") != "never"
-
-
-def _trust_decision(trust_file: Path, workspace: str) -> bool | None:
-    """The nearest explicit decision for *workspace* or a folder above it [code: CA/core/trust-manager.ts:45-59]."""
-    data = _read_lenient(trust_file)
-    try:
-        folder = Path(os.path.realpath(workspace))
-    except OSError, ValueError:
-        return None
-    for candidate in (folder, *folder.parents):
-        value = data.get(str(candidate))
-        if isinstance(value, bool):
-            return value
-    return None
-
-
-def _read_lenient(path: Path) -> dict[str, Any]:
-    """A JSON object pi keeps for itself (byte-order mark allowed); empty when missing or unusable."""
-    try:
-        raw = read_source_bytes(path)
-        document = None if raw is None else json.loads(decode_source(raw))
-    except SourceReadError, ValueError, RecursionError:
-        return {}
-    return document if isinstance(document, dict) else {}
-
-
-def _read_file(state: _State, path: Path, scope: str, *, trusted: bool, scope_path: str = "") -> None:
+def _read_file(state: _State, path: Path, scope: str, *, scope_path: str = "") -> None:
     try:
         document = _read_json(path)
     except SourceReadError as exc:
@@ -250,14 +207,7 @@ def _read_file(state: _State, path: Path, scope: str, *, trusted: bool, scope_pa
     if not isinstance(servers, dict):
         state.errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_CONFIG))
         return
-    if trusted and isinstance(document.get("autoEnableCodemode"), bool):
-        state.auto_enable_codemode = document["autoEnableCodemode"]
     for name, value in servers.items():
-        if not trusted:
-            config = _validate(name, value)
-            if config is not None:
-                state.untrusted.append(_Entry(name, config, str(path), scope, scope_path))
-            continue
         _add_entry(state, name, value, str(path), scope, scope_path)
 
 
@@ -449,14 +399,6 @@ def _enabled(config: dict[str, Any]) -> bool:
 
 # --- candidates ---------------------------------------------------------------
 
-# The exposure pi reaches through tool search, which it turns on even without codemode.
-_ON_DEMAND_SEARCH = "deferred"
-
-
-def _exposures(config: dict[str, Any]) -> set[str]:
-    tool_exposure = config.get("toolExposure", {})
-    return {config.get("exposure", "codemode"), *tool_exposure.values()}
-
 
 def _shown(config: dict[str, Any]) -> dict[str, Any]:
     if _transport(config) == "http":
@@ -469,20 +411,7 @@ def _transport(config: dict[str, Any]) -> str:
     return "http" if "url" in config else "stdio"
 
 
-def _untrusted_candidate(entry: _Entry) -> McpImportCandidate:
-    return McpImportCandidate(
-        entry.name,
-        entry.scope,
-        entry.source,
-        None,
-        unsupported=UnsupportedReason.UNTRUSTED_PROJECT,
-        entry=_shown(entry.config),
-        transport=_transport(entry.config),
-        scope_path=entry.scope_path,
-    )
-
-
-def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpImportCandidate:
+def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
     config = entry.config
     transport = _transport(config)
 
@@ -514,7 +443,10 @@ def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpI
     cwd = config.get("cwd")
     if transport == "stdio" and isinstance(cwd, str) and cwd not in {"", "."}:
         warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=cwd))
-    if transport == "http" and "oauth" in config:
+    if transport == "http" and (
+        "oauth" in config
+        or ("auth" not in config and not any(key.lower() == "authorization" for key in config.get("headers", {})))
+    ):
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     if transport == "http" and "auth" in config:
         warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=config["auth"]["provider"]))
@@ -522,11 +454,7 @@ def _candidate(entry: _Entry, ctx: ImportContext, *, codemode_off: bool) -> McpI
         warnings.append(ImportWarning(ImportWarningKind.MERGED, original=entry.override))
     access = _tool_access(config)
     warnings.extend(access.warnings)
-    if codemode_off and "codemode" in _exposures(config):
-        warnings.append(ImportWarning(ImportWarningKind.CODEMODE_OFF))
     enabled = _enabled(config)
-    if not enabled:
-        warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     timeout = config.get("timeout")
     # The source's own config, no tool name prefix: the dialog gives every import one
     # (base.with_tool_name_prefix), as pi names tools mcp__<server>__<tool>.

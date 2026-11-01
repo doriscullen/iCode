@@ -93,8 +93,11 @@ def test_detect_needs_the_global_folder_or_a_config_file(home: Path, workspace: 
     assert source.detect(_context(home, managed, workspace)) is True
 
     (workspace / "opencode.jsonc").unlink()
-    # opencode creates its global folder on every start.
+    # opencode creates its global folder on every start; an empty one holds no servers to import.
     (home / ".config" / "opencode").mkdir(parents=True)
+    assert source.detect(_context(home, managed, workspace)) is False
+
+    _write(home / ".config" / "opencode" / "opencode.json", "{}")
     assert source.detect(_context(home, managed, workspace)) is True
 
 
@@ -165,16 +168,15 @@ def test_converted_values_resolve_as_opencode_substitutes_them(monkeypatch: pyte
     assert resolve_env_templates(render_template(parts), location="test") == "{{x}} secret}"
 
 
-def test_an_unset_variable_gets_a_warning(home: Path, managed: Path) -> None:
-    # opencode reads an unset or empty variable as empty [code: C/variable.ts:37]; iCode fails the connection.
+def test_variable_references_are_imported_without_checking_current_values(home: Path, managed: Path) -> None:
     _global(home, {"mcp": {"s": _local("cmd", environment={"A": "{env:SET}", "B": "{env:EMPTY}{env:MISSING}"})}})
 
     (candidate,) = _discover(home, managed, SET="1", EMPTY="")
 
-    assert candidate.warnings == (
-        ImportWarning(ImportWarningKind.VARIABLE_UNSET, "EMPTY", field="B"),
-        ImportWarning(ImportWarningKind.VARIABLE_UNSET, "MISSING", field="B"),
-    )
+    assert candidate.config is not None
+    assert candidate.config.env == {"A": "{{SET}}", "B": "{{EMPTY}}{{MISSING}}"}
+    assert candidate.warnings == ()
+    assert _discover(home, managed, SET="changed", EMPTY="now-set", MISSING="now-set") == (candidate,)
 
 
 def test_settings_icode_lacks_are_reported(home: Path, managed: Path) -> None:
@@ -185,6 +187,7 @@ def test_settings_icode_lacks_are_reported(home: Path, managed: Path) -> None:
                 "worker": _local("cmd", cwd="tools", enabled=False, timeout=1500),
                 "here": _local("cmd", cwd="."),
                 "signin": _remote("https://x.test/mcp", oauth={"clientId": "id"}),
+                "implicit": _remote("https://implicit.test/mcp"),
                 "plain": _remote("https://y.test/mcp", oauth=False),
             }
         },
@@ -196,12 +199,10 @@ def test_settings_icode_lacks_are_reported(home: Path, managed: Path) -> None:
     assert worker.config is not None
     assert worker.config.enabled is False
     assert worker.config.request_timeout == 2
-    assert worker.warnings == (
-        ImportWarning(ImportWarningKind.CWD_IGNORED, original="tools"),
-        ImportWarning(ImportWarningKind.DISABLED),
-    )
+    assert worker.warnings == (ImportWarning(ImportWarningKind.CWD_IGNORED, original="tools"),)
     assert candidates["here"].warnings == ()
     assert candidates["signin"].warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
+    assert candidates["implicit"].warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
     assert candidates["plain"].warnings == ()
 
 
@@ -340,14 +341,8 @@ def test_jsonc_comments_and_trailing_commas_are_read(home: Path, managed: Path) 
             '{"mcp": {"bad": {"type": "local", "command": ["cmd"], "timeout": 1%s}}}' % ("0" * 400),
             SourceErrorKind.INVALID_CONFIG,
         ),
-        ('{"tools": {"x": "no"}}', SourceErrorKind.INVALID_CONFIG),
-        ('{"permission": "sometimes"}', SourceErrorKind.INVALID_CONFIG),
-        ('{"permissions": {}}', SourceErrorKind.INVALID_CONFIG),
         ('{"mcp": null}', SourceErrorKind.INVALID_CONFIG),
         ('{"experimental": {"mcp_timeout": null}}', SourceErrorKind.INVALID_CONFIG),
-        # Any JSON value where opencode expects a word.
-        ('{"permission": {"bash": {"x": []}}}', SourceErrorKind.INVALID_CONFIG),
-        ('{"agent": {"b": {"permission": {"x": {"y": {}}}}}}', SourceErrorKind.INVALID_CONFIG),
     ],
 )
 def test_a_project_file_opencode_rejects_is_reported_and_the_rest_still_listed(
@@ -420,7 +415,10 @@ def test_files_merge_per_server_and_per_key_later_files_winning(home: Path, work
     # Headers merge per key: the one only the global file sets goes to the project's URL too.
     assert api.config.headers == {"Authorization": "Bearer {{T}}", "X-Team": "b"}
     assert (api.scope, api.source_path, api.scope_path) == ("project", str(project_file), str(workspace))
-    assert api.warnings == (ImportWarning(ImportWarningKind.MERGED, field="Authorization", original=str(global_file)),)
+    assert api.warnings == (
+        ImportWarning(ImportWarningKind.OAUTH_IGNORED),
+        ImportWarning(ImportWarningKind.MERGED, field="Authorization", original=str(global_file)),
+    )
     tool = candidates["tool"]
     assert tool.config is not None
     # Arrays are replaced, not merged.
@@ -438,10 +436,7 @@ def test_a_bare_switch_in_a_later_file_turns_an_inherited_server_off(
     assert candidate.config is not None and candidate.config.enabled is False
     # The server is still the global file's: that file set its type.
     assert (candidate.scope, candidate.source_path) == ("global", str(global_file))
-    assert candidate.warnings == (
-        ImportWarning(ImportWarningKind.MERGED, original=str(project_file)),
-        ImportWarning(ImportWarningKind.DISABLED),
-    )
+    assert candidate.warnings == (ImportWarning(ImportWarningKind.MERGED, original=str(project_file)),)
 
 
 def test_layers_are_read_in_opencode_order(home: Path, tmp_path: Path, workspace: Path, managed: Path) -> None:
@@ -571,63 +566,53 @@ def test_opencode_2_forms_are_lowered(home: Path, managed: Path) -> None:
     assert flat is not None and (flat.enabled, flat.request_timeout) == (True, 3)
 
 
-def test_a_server_whose_tools_opencode_hides_is_imported_without_them(home: Path, managed: Path) -> None:
-    _global(
-        home,
-        {
-            "tools": {"gh_*": False, "gh_search": True, "gh_s*": False, "gh_read": True},
-            "mcp": {"gh": _local("cmd"), "other": _local("cmd")},
-        },
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"tools": {"gh_*": False, "gh_read": True}},
+        {"permission": {"*": "deny"}},
+        {"permissions": {}},
+        {"tools": {"x": "invalid"}},
+        {"permission": {"bash": {"x": []}}},
+    ],
+)
+def test_global_tool_permissions_are_reported_without_interpreting_them(
+    home: Path, managed: Path, policy: dict
+) -> None:
+    _global(home, {**policy, "mcp": {"gh": _local("cmd", enabled=False, timeout=1500)}})
+    (candidate,) = _discover(home, managed)
+    assert candidate.config is not None
+    assert (candidate.config.enabled, candidate.config.request_timeout, candidate.config.allowed_tools) == (
+        False,
+        2,
+        None,
+    )
+    assert candidate.warnings == (
+        ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original=next(iter(policy))),
     )
 
-    candidates = _by_name(_discover(home, managed))
 
-    gh = candidates["gh"].config
-    assert gh is not None
-    # A later rule hides gh_search again; gh_read stays shown.
-    assert gh.allowed_tools == ["read"]
-    assert candidates["gh"].warnings == (ImportWarning(ImportWarningKind.TOOLS_LIMITED, field="gh_*", original="read"),)
-    assert candidates["other"].config is not None and candidates["other"].config.allowed_tools is None
-    assert candidates["other"].warnings == ()
-
-
-@pytest.mark.parametrize("key", ["*", "*_*", "g?_*", "g*"])
-def test_any_pattern_covering_every_tool_hides_the_server(home: Path, managed: Path, key: str) -> None:
-    _global(home, {"permission": {key: "deny"}, "mcp": {"gh": _local("cmd")}})
-
-    (candidate,) = _discover(home, managed)
-
-    assert candidate.config is not None and candidate.config.allowed_tools == []
-
-
-def test_rules_icode_cant_express_are_named(home: Path, managed: Path) -> None:
+@pytest.mark.parametrize("section", ["agents", "agent", "mode"])
+def test_agent_permissions_do_not_gate_valid_mcp_settings(home: Path, managed: Path, section: str) -> None:
+    document = {"mcp": {"gh": _local("cmd")}}
+    _global(home, document)
+    expected = _discover(home, managed)
     _global(
-        home,
-        {
-            # "gh" alone names a tool called gh, never one of the server's.
-            "tools": {"gh": False, "gh_delete": False},
-            "permission": {"gh_write*": {"*": "deny"}, "gh_read": {"/secret": "deny"}},
-            "agent": {"plan": {"tools": {"gh_*": False}}},
-            "mcp": {"gh": _local("cmd")},
-        },
+        home, {**document, section: {"build": {"tools": {"gh_*": False}, "permission": {"x": []}, "permissions": {}}}}
     )
+    assert _discover(home, managed) == expected
 
-    (candidate,) = _discover(home, managed)
 
+@pytest.mark.parametrize("permission", ['{"gh_*": "deny"}', "not json"])
+def test_environment_permissions_are_reported_without_overriding_the_server(
+    home: Path, managed: Path, permission: str
+) -> None:
+    _global(home, {"mcp": {"gh": _local("cmd")}})
+    (candidate,) = _discover(home, managed, OPENCODE_PERMISSION=permission)
     assert candidate.config is not None and candidate.config.allowed_tools is None
     assert candidate.warnings == (
-        ImportWarning(ImportWarningKind.TOOL_RULES_IGNORED, original="gh_delete, gh_write*, plan: gh_*"),
+        ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original="OPENCODE_PERMISSION"),
     )
-
-
-def test_permission_from_the_environment_is_applied_last(home: Path, managed: Path) -> None:
-    _global(home, {"tools": {"gh_*": True}, "mcp": {"gh": _local("cmd")}})
-
-    (candidate,) = _discover(home, managed, OPENCODE_PERMISSION='{"gh_*": "deny"}')
-    assert candidate.config is not None and candidate.config.allowed_tools == []
-
-    (candidate,) = _discover(home, managed, OPENCODE_PERMISSION="not json")
-    assert candidate.config is not None and candidate.config.allowed_tools is None
 
 
 def test_the_home_opencode_folder_is_global_even_when_the_project_search_finds_it(home: Path, managed: Path) -> None:

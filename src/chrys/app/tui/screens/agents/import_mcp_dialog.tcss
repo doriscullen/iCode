@@ -35,6 +35,11 @@ ImportMcpServersDialog {
     scrollbar-gutter: stable;
 }
 
+/* Hover renders cache their separator too; keep its background stable across focus changes. */
+#mcp-import-sources:focus {
+    background-tint: transparent;
+}
+
 /* Right panel: the servers, with the buttons that act on them below */
 #mcp-import-right {
     width: 1fr;

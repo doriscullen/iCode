@@ -2,17 +2,19 @@
 
 """Dialog that imports MCP servers configured in other agents (Claude Code, opencode, pi).
 
-The left pane lists the agents detected on this machine; the right pane lists
-the MCP servers the highlighted agent has configured. Ticked servers are
-returned as configs for the MCP tab to add as unsaved cards.
+The left pane lists the agents that have MCP server configuration on this
+machine; the right pane lists the MCP servers the highlighted agent has
+configured. Ticked servers are returned as configs for the MCP tab to add as
+unsaved cards.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from rich.text import Text
@@ -72,6 +74,7 @@ logger = logging.getLogger(__name__)
 _TITLE = msg("tui.mcp.import.title", fallback="Import from Other Applications")
 _IMPORT = msg("tui.mcp.import.button.import", fallback="Import")
 _CANCEL = msg("tui.mcp.import.button.cancel", fallback="Cancel")
+_NOT_ENABLED = msg("tui.mcp.import.field.enabled.no", fallback="No")
 _DETECTING = msg("tui.mcp.import.detecting", fallback="Looking for agents...")
 _DETECT_FAILED = msg(
     "tui.mcp.import.detect_failed",
@@ -140,16 +143,14 @@ _FILE_REFERENCE = msg(
 _VALUE_FROM_COMMAND = msg(
     "tui.mcp.import.unsupported.value_from_command",
     fallback=(
-        "Can't import: an environment variable or header value is the output of a command, which {app} doesn't run."
+        "Can't import: a command supplies an environment variable or header value, and {app} runs credential "
+        "commands differently. Add the server manually and configure {template} for the value. "
+        "Review the command's shell, working folder, output and refresh behavior before testing."
     ),
 )
 _VARIABLE_NAME = msg(
     "tui.mcp.import.unsupported.variable_name",
     fallback="Can't import: a setting uses an environment variable whose name {app} can't write.",
-)
-_UNTRUSTED_PROJECT = msg(
-    "tui.mcp.import.unsupported.untrusted_project",
-    fallback="Can't import: {agent} doesn't trust this folder, so it doesn't run this server.",
 )
 _REMOTE_ENVIRONMENT = msg(
     "tui.mcp.import.unsupported.remote_environment",
@@ -170,16 +171,14 @@ _DEFAULT_DROPPED = msg(
 _HEADERS_HELPER_IGNORED = msg(
     "tui.mcp.import.warning.headers_helper_ignored",
     fallback=(
-        "The headers helper command is not imported: {app} doesn't run it. "
-        "Add the headers it produces under Headers yourself."
+        "The headers helper is not imported: it returns a set of headers, while {app} credential commands "
+        "supply one value. Add the headers under Headers yourself. For a value supplied by a command, "
+        "configure {template} manually and review its working folder and refresh behavior."
     ),
 )
 _OAUTH_IGNORED = msg(
     "tui.mcp.import.warning.oauth_ignored",
-    fallback=(
-        "The OAuth sign-in settings are not imported: {app} doesn't sign in to MCP servers with OAuth. "
-        "Add an Authorization header under Headers yourself, or the server may refuse the connection."
-    ),
+    fallback=("OAuth sign-in is not imported. If this server requires it, configure an Authorization header in {app}."),
 )
 _CREDENTIAL_VARIABLE = msg(
     "tui.mcp.import.warning.credential_variable",
@@ -196,10 +195,6 @@ _CLAUDE_PROJECT_DIR = msg(
         "the server gets the reference as written, or its default. {app} doesn't set {variable} and fails the "
         "connection unless you set it before starting {app}. Write the folder path instead."
     ),
-)
-_DISABLED = msg(
-    "tui.mcp.import.warning.disabled",
-    fallback="{agent} has this server turned off, so it is imported turned off. Tick {enabled} in its card to use it.",
 )
 _CWD_IGNORED = msg(
     "tui.mcp.import.warning.cwd_ignored",
@@ -222,16 +217,22 @@ _MERGED_VALUES = msg(
 _AUTH_PROVIDER_IGNORED = msg(
     "tui.mcp.import.warning.auth_provider_ignored",
     fallback=(
-        "{agent} sends this server the token of its {provider} sign-in; {app} doesn't. "
-        "Add an Authorization header under Headers yourself, or the server may refuse the connection."
+        "This server is configured in {agent} to authenticate with a {provider} sign-in token. "
+        "{app} doesn't support this authentication method. If authentication is required, "
+        "configure an Authorization header under Headers using other credentials supported by the server."
     ),
 )
 _TOOL_RULES_IGNORED = msg(
     "tui.mcp.import.warning.tool_rules_ignored",
     fallback=(
-        "Not imported, {app} can't apply {agent}'s settings for single tools: {rules}. "
-        "Set the available tools yourself if needed."
+        "These tool rules from {agent} were not imported: {rules}. These tools will follow "
+        "the server's overall settings in {app}, so their availability or loading behavior may differ. "
+        "Check Available Tool Scope and Loading Strategy."
     ),
+)
+_TOOL_PERMISSIONS_IGNORED = msg(
+    "tui.mcp.import.warning.tool_permissions_ignored",
+    fallback="Tool permissions from {agent} are not imported ({fields}). Configure tool access and approval in {app}.",
 )
 _TOOLS_LIMITED_NONE = msg(
     "tui.mcp.import.warning.tools_limited.none",
@@ -240,20 +241,6 @@ _TOOLS_LIMITED_NONE = msg(
 _TOOLS_LIMITED_SOME = msg(
     "tui.mcp.import.warning.tools_limited.some",
     fallback="{agent} hides this server's tools ({rule}) except some, so it is imported with only: {tools}.",
-)
-_CODEMODE_OFF = msg(
-    "tui.mcp.import.warning.codemode_off",
-    fallback=(
-        "{agent} calls this server's tools only from codemode, which it doesn't turn on (autoEnableCodemode is "
-        "false), so it can't call them unless codemode is on. {app} loads them on demand."
-    ),
-)
-_VARIABLE_UNSET = msg(
-    "tui.mcp.import.warning.variable_unset",
-    fallback=(
-        "{field} references {variable}, which is not set now. {agent} then uses an empty value, "
-        "but {app} fails to connect. Set {variable} before starting {app}."
-    ),
 )
 _OPTIONAL_VARIABLE = msg(
     "tui.mcp.import.warning.optional_variable",
@@ -319,11 +306,7 @@ def _source_error(error: McpSourceError, agent: str) -> MessageRef:
 
 
 def is_already_added(config: MCPServerConfig, existing: Sequence[MCPServerConfig]) -> bool:
-    """Whether *existing* already has a server with *config*'s connection.
-
-    Names are not compared (two servers may share one); neither are env and
-    headers, which hold credentials the user may have edited since importing.
-    """
+    """Whether *existing* already has the same server settings, apart from its label and tool prefix."""
     return any(_connection_key(config) == _connection_key(server) for server in existing)
 
 
@@ -333,11 +316,12 @@ def _key_value_pairs(values: Mapping[Any, Any]) -> tuple[tuple[str, str], ...]:
     )
 
 
-def _connection_key(config: MCPServerConfig) -> tuple[str, ...]:
-    if config.transport == "http":
-        url = config.url.strip()
-        return ("http", url.removesuffix("/"))
-    return ("stdio", config.command.strip(), *config.args)
+def _connection_key(config: MCPServerConfig) -> str:
+    # Credentials, environment and tool scope can distinguish servers sharing one endpoint.
+    values = asdict(config)
+    for key in ("name", "description", "tool_name_prefix"):
+        del values[key]
+    return json.dumps(values, sort_keys=True)
 
 
 class _ImportRow(Checkbox):
@@ -798,8 +782,8 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
     def _unsupported_note(self, candidate: McpImportCandidate, agent: str) -> str | None:
         if candidate.unsupported is None:
             return None
-        if candidate.unsupported is UnsupportedReason.UNTRUSTED_PROJECT:
-            return self._render_message(_UNTRUSTED_PROJECT.bind(agent=agent))
+        if candidate.unsupported is UnsupportedReason.VALUE_FROM_COMMAND:
+            return self._render_message(_VALUE_FROM_COMMAND.bind(app=APP_DISPLAY_NAME, template="{{!command}}"))
         return self._render_message(_UNSUPPORTED_REASONS[candidate.unsupported].bind(app=APP_DISPLAY_NAME))
 
     def _summary_fields(self, candidate: McpImportCandidate, agent: str) -> list[_CardField]:
@@ -828,6 +812,10 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             else _SCOPE_EVERY_PROJECT.bind(scope=scope)
         )
         fields.append(_CardField(self._render_message(_SCOPE.bind(agent=agent)), self._render_message(where)))
+        if candidate.config is not None and not candidate.config.enabled:
+            fields.append(
+                _CardField(self._render_message(MCP_ENABLED.bind()), self._render_message(_NOT_ENABLED.bind()))
+            )
         return fields
 
     def _settings_title(self, candidate: McpImportCandidate) -> str:
@@ -906,7 +894,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     app=APP_DISPLAY_NAME,
                 )
             case ImportWarningKind.HEADERS_HELPER_IGNORED:
-                reference = _HEADERS_HELPER_IGNORED.bind(app=APP_DISPLAY_NAME)
+                reference = _HEADERS_HELPER_IGNORED.bind(app=APP_DISPLAY_NAME, template="{{!command}}")
             case ImportWarningKind.OAUTH_IGNORED:
                 reference = _OAUTH_IGNORED.bind(app=APP_DISPLAY_NAME)
             case ImportWarningKind.CREDENTIAL_VARIABLE:
@@ -915,8 +903,6 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 reference = _CLAUDE_PROJECT_DIR.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
             case ImportWarningKind.UNKNOWN_FIELDS_IGNORED:
                 reference = _UNKNOWN_FIELDS_IGNORED.bind(fields=original, app=APP_DISPLAY_NAME)
-            case ImportWarningKind.DISABLED:
-                reference = _DISABLED.bind(agent=agent, enabled=self._render_message(MCP_ENABLED.bind()))
             case ImportWarningKind.CWD_IGNORED:
                 reference = _CWD_IGNORED.bind(agent=agent, folder=original, app=APP_DISPLAY_NAME)
             case ImportWarningKind.MERGED:
@@ -929,16 +915,14 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 reference = _AUTH_PROVIDER_IGNORED.bind(agent=agent, provider=original, app=APP_DISPLAY_NAME)
             case ImportWarningKind.TOOL_RULES_IGNORED:
                 reference = _TOOL_RULES_IGNORED.bind(agent=agent, rules=original, app=APP_DISPLAY_NAME)
+            case ImportWarningKind.TOOL_PERMISSIONS_IGNORED:
+                reference = _TOOL_PERMISSIONS_IGNORED.bind(agent=agent, fields=original, app=APP_DISPLAY_NAME)
             case ImportWarningKind.TOOLS_LIMITED:
                 reference = (
                     _TOOLS_LIMITED_SOME.bind(agent=agent, rule=field, tools=original)
                     if original
                     else _TOOLS_LIMITED_NONE.bind(agent=agent, rule=field)
                 )
-            case ImportWarningKind.CODEMODE_OFF:
-                reference = _CODEMODE_OFF.bind(agent=agent, app=APP_DISPLAY_NAME)
-            case ImportWarningKind.VARIABLE_UNSET:
-                reference = _VARIABLE_UNSET.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
             case ImportWarningKind.OPTIONAL_VARIABLE:
                 reference = _OPTIONAL_VARIABLE.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
             case ImportWarningKind.DENY_LIST:
@@ -976,7 +960,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
     def _selected(self) -> list[MCPServerConfig]:
         selected: list[MCPServerConfig] = []
         # One server per connection, as the covered cards promise, even if two were ticked at once.
-        taken: set[tuple[str, ...]] = set()
+        taken: set[str] = set()
         for source in self._sources:
             result = self._results.get(source.source_id)
             ticked = self._ticked.get(source.source_id, set())

@@ -79,7 +79,11 @@ def test_detect_needs_the_agent_folder_or_a_project_file(home: Path, workspace: 
     assert source.detect(_context(home, workspace)) is True
 
     (workspace / ".pi" / "mcp.json").unlink()
+    # pi creates its agent folder on start; an empty one holds no servers to import.
     (home / ".pi" / "agent").mkdir(parents=True)
+    assert source.detect(_context(home, workspace)) is False
+
+    _write(home / ".pi" / "agent" / "mcp.json", {"mcpServers": {}})
     assert source.detect(_context(home, workspace)) is True
 
 
@@ -219,10 +223,7 @@ def test_settings_icode_lacks_are_reported(home: Path) -> None:
 
     worker = candidates["worker"]
     assert worker.config is not None and worker.config.enabled is False
-    assert worker.warnings == (
-        ImportWarning(ImportWarningKind.CWD_IGNORED, original="tools"),
-        ImportWarning(ImportWarningKind.DISABLED),
-    )
+    assert worker.warnings == (ImportWarning(ImportWarningKind.CWD_IGNORED, original="tools"),)
     assert candidates["signin"].warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
     assert candidates["provider"].warnings == (
         ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original="radius"),
@@ -262,6 +263,24 @@ def test_entries_pi_rejects_are_not_listed(home: Path, entry: object) -> None:
     _global(home, {"skipped": entry, "kept": {"command": "cmd"}})
 
     assert [candidate.name for candidate in _discover(home)] == ["kept"]
+
+
+@pytest.mark.parametrize(
+    "settings, warned",
+    [
+        ({}, True),
+        ({"headers": {"authorization": "Bearer example"}}, False),
+        ({"auth": {"provider": "example"}}, False),
+        ({"oauth": {"clientId": "id"}}, True),
+    ],
+)
+def test_default_oauth_is_reported_unless_headers_or_provider_auth_replace_it(
+    home: Path, settings: dict, warned: bool
+) -> None:
+    _global(home, {"server": {"url": "https://example.test/mcp", **settings}})
+    (candidate,) = _discover(home)
+    assert candidate.config is not None
+    assert any(w.kind is ImportWarningKind.OAUTH_IGNORED for w in candidate.warnings) is warned
 
 
 def test_oauth_settings_pi_accepts_are_listed(home: Path) -> None:
@@ -376,7 +395,6 @@ def test_project_servers_replace_global_ones_and_overrides_adjust_them(home: Pat
     assert second.warnings == (
         ImportWarning(ImportWarningKind.MERGED, original=str(project_file)),
         ImportWarning(ImportWarningKind.TOOLS_LIMITED, field="exposure: hidden"),
-        ImportWarning(ImportWarningKind.DISABLED),
     )
     # An override may only set enabled, exposure and toolExposure.
     assert third.config is not None and third.config.enabled is True
@@ -392,17 +410,17 @@ def test_only_the_workspace_folder_holds_project_servers(home: Path, tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("trust", "default", "trusted"),
+    ("trust", "default"),
     [
-        (None, None, True),
-        (True, "never", True),
-        (False, "always", False),
-        (None, "never", False),
-        (None, "always", True),
+        (None, None),
+        (True, "never"),
+        (False, "always"),
+        (None, "never"),
+        (None, "always"),
     ],
 )
-def test_project_servers_follow_pis_trust_in_the_folder(
-    home: Path, workspace: Path, trust: bool | None, default: str | None, trusted: bool
+def test_project_servers_can_be_imported_regardless_of_pis_trust(
+    home: Path, workspace: Path, trust: bool | None, default: str | None
 ) -> None:
     _global(home, {"shared": {"command": "global"}})
     _project(workspace, {"shared": {"command": "project"}, "local": {"url": "https://x.test/mcp"}})
@@ -413,18 +431,11 @@ def test_project_servers_follow_pis_trust_in_the_folder(
 
     candidates = _discover(home, workspace)
 
-    if trusted:
-        assert [(c.name, c.scope, c.unsupported) for c in candidates] == [
-            ("shared", "project", None),
-            ("local", "project", None),
-        ]
-    else:
-        assert [(c.name, c.scope, c.unsupported) for c in candidates] == [
-            ("shared", "global", None),
-            ("shared", "project", UnsupportedReason.UNTRUSTED_PROJECT),
-            ("local", "project", UnsupportedReason.UNTRUSTED_PROJECT),
-        ]
-        assert candidates[2].transport == "http"
+    assert [(c.name, c.scope, c.unsupported) for c in candidates] == [
+        ("shared", "project", None),
+        ("local", "project", None),
+    ]
+    assert all(candidate.config is not None for candidate in candidates)
 
 
 def test_the_agent_dir_variable_is_followed(home: Path, tmp_path: Path, workspace: Path) -> None:
@@ -484,14 +495,16 @@ def test_exposure_becomes_icodes_tool_settings(
     )
 
 
-def test_codemode_off_is_reported_when_nothing_reaches_the_tools(home: Path, workspace: Path) -> None:
+def test_codemode_runtime_settings_do_not_change_imported_servers(home: Path, workspace: Path) -> None:
     _global(home, {"a": {"command": "cmd"}, "b": {"command": "cmd", "exposure": "direct"}}, autoEnableCodemode=True)
-    # The project value wins.
+    baseline = _discover(home, workspace)
     _project(workspace, {}, autoEnableCodemode=False)
 
-    candidates = _by_name(_discover(home, workspace))
-    assert ImportWarning(ImportWarningKind.CODEMODE_OFF) in candidates["a"].warnings
-    assert candidates["b"].warnings == ()
+    assert _discover(home, workspace) == baseline
+    candidates = _by_name(baseline)
+    assert candidates["a"].config is not None and candidates["a"].config.use_progressive_disclosure is True
+    assert candidates["b"].config is not None and candidates["b"].config.use_progressive_disclosure is False
+    assert all(candidate.warnings == () for candidate in baseline)
 
     # A deferred server makes pi turn tool search on, which reaches codemode tools too.
     _global(home, {"a": {"command": "cmd"}, "c": {"command": "cmd", "exposure": "deferred"}})

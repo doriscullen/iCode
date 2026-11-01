@@ -84,7 +84,7 @@ enabled = false
     )
     assert candidate.scope == "user"
     assert candidate.scope_path == ""
-    assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.DISABLED]
+    assert candidate.warnings == ()
 
 
 def test_forwarded_variables_are_left_to_the_inherited_environment(ctx: ImportContext) -> None:
@@ -102,6 +102,33 @@ env = { OVERRIDE = "literal {{text}}" }
     (candidate,) = CodexSource().discover(ctx).candidates
     assert candidate.config is not None
     assert candidate.config.env == {"OVERRIDE": "literal {{{{text}}}}"}
+    assert candidate.warnings == ()
+
+
+@pytest.mark.parametrize("variable", ["PYTHONPATH", "PYTHONHOME"])
+def test_explicit_python_environment_forwarding_survives_runtime_filtering(
+    ctx: ImportContext, monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    from chrys.foundation.util.env_templates import EnvVarResolutionError
+    from chrys.service.mcp.cache import resolve_mcp_effective_config
+
+    _user(ctx, f'[mcp_servers.py]\ncommand = "python"\nenv_vars = ["{variable}"]\n')
+    monkeypatch.delenv(variable, raising=False)
+    (candidate,) = CodexSource().discover(ctx).candidates
+    assert candidate.config is not None
+    assert candidate.config.env == {variable: "{{" + variable + "}}"}
+    assert [(w.kind, w.variable) for w in candidate.warnings] == [(ImportWarningKind.OPTIONAL_VARIABLE, variable)]
+    with pytest.raises(EnvVarResolutionError):
+        resolve_mcp_effective_config(candidate.config)
+    monkeypatch.setenv(variable, "/user/python/path")
+    effective = resolve_mcp_effective_config(candidate.config)
+    assert effective.stdio_env is not None and effective.stdio_env[variable] == "/user/python/path"
+
+
+def test_explicit_environment_values_override_forwarded_python_variables(ctx: ImportContext) -> None:
+    _user(ctx, '[mcp_servers.py]\ncommand = "python"\nenv_vars = ["PYTHONPATH"]\nenv = {PYTHONPATH = "explicit"}\n')
+    (candidate,) = CodexSource().discover(ctx).candidates
+    assert candidate.config is not None and candidate.config.env == {"PYTHONPATH": "explicit"}
     assert candidate.warnings == ()
 
 
@@ -183,6 +210,22 @@ disabled_tools = ["delete"]
     ]
 
 
+@pytest.mark.parametrize(
+    "rules",
+    [
+        "tools = {write = {output_token_limit = 0}}",
+        'tools = "not a policy table"',
+        'default_tools_approval_mode = "future-mode"',
+    ],
+)
+def test_source_tool_policies_do_not_gate_valid_server_settings(ctx: ImportContext, rules: str) -> None:
+    _user(ctx, '[mcp_servers.server]\ncommand = "server"\n' + rules)
+    (candidate,) = CodexSource().discover(ctx).candidates
+    assert candidate.config is not None and candidate.config.command == "server"
+    assert candidate.config.allowed_tools is None
+    assert any(w.kind is ImportWarningKind.TOOL_PERMISSIONS_IGNORED for w in candidate.warnings)
+
+
 def test_dropped_settings_warn_without_copying_credentials_or_running_helpers(ctx: ImportContext) -> None:
     _user(
         ctx,
@@ -206,8 +249,8 @@ output_token_limit = 500
     assert "secret-" not in repr(candidate)
     warnings = {warning.kind: warning.original for warning in candidate.warnings}
     assert ImportWarningKind.OAUTH_IGNORED in warnings
-    assert warnings[ImportWarningKind.TOOL_RULES_IGNORED] == "write"
-    assert any(warning.original == "http_headers_helper" for warning in candidate.warnings)
+    assert warnings[ImportWarningKind.TOOL_PERMISSIONS_IGNORED] == "default_tools_approval_mode, tools"
+    assert ImportWarningKind.HEADERS_HELPER_IGNORED in warnings
     assert "required" in warnings[ImportWarningKind.UNKNOWN_FIELDS_IGNORED]
 
 
@@ -261,7 +304,6 @@ def test_remote_execution_cannot_become_a_local_command(ctx: ImportContext, sett
             'oauth = {client_id = "client", client_secret = "secret", token_endpoint_auth_method = "client_secret_post"}'
         ),
         'url = "https://example.test"\nauth = "ema_auth"\noauth = {token_endpoint_auth_method = "client_secret_basic"}',
-        'command = "server"\ntools = {write = {output_token_limit = 0}}',
         'command = "server"\nomit_tools_from = ["invalid"]',
     ],
 )
@@ -328,17 +370,14 @@ def test_relative_codex_home_uses_workspace_without_expanding_tilde(ctx: ImportC
 
 
 @pytest.mark.parametrize("decision", [None, "untrusted", "trusted"])
-def test_project_trust_gates_import_and_cannot_grant_itself_trust(ctx: ImportContext, decision: str | None) -> None:
+def test_project_import_does_not_depend_on_codex_trust(ctx: ImportContext, decision: str | None) -> None:
     assert ctx.workspace_cwd is not None
     _user(ctx, "" if decision is None else _trust(ctx.workspace_cwd, decision))
     _project(ctx, '[mcp_servers.project]\ncommand = "project"' + _trust(ctx.workspace_cwd))
     (candidate,) = CodexSource().discover(ctx).candidates
     assert candidate.scope_path == ctx.workspace_cwd
-    if decision == "trusted":
-        assert candidate.config is not None
-    else:
-        assert candidate.config is None
-        assert candidate.unsupported == UnsupportedReason.UNTRUSTED_PROJECT
+    assert candidate.config is not None
+    assert candidate.unsupported is None
 
 
 def test_project_layers_merge_nested_values_replace_arrays_and_preserve_disabled_override(ctx: ImportContext) -> None:
@@ -377,12 +416,12 @@ env = { OVERRIDE = "new", PROJECT = "project" }
     assert any(str(project) in warning.original for warning in candidate.warnings)
 
 
-def test_untrusted_project_does_not_override_user_server(ctx: ImportContext) -> None:
+def test_project_settings_are_available_without_a_source_trust_decision(ctx: ImportContext) -> None:
     _user(ctx, '[mcp_servers.shared]\ncommand = "user"')
     _project(ctx, '[mcp_servers.shared]\ncommand = "project"')
-    user, project = CodexSource().discover(ctx).candidates
-    assert user.config is not None and user.config.command == "user"
-    assert project.config is None and project.unsupported == UnsupportedReason.UNTRUSTED_PROJECT
+    (project,) = CodexSource().discover(ctx).candidates
+    assert project.config is not None and project.config.command == "project"
+    assert any(w.kind is ImportWarningKind.MERGED for w in project.warnings)
 
 
 def test_recursive_merge_does_not_silently_change_transports(ctx: ImportContext) -> None:
@@ -392,7 +431,7 @@ def test_recursive_merge_does_not_silently_change_transports(ctx: ImportContext)
     assert CodexSource().discover(ctx).candidates == ()
 
 
-def test_custom_root_markers_limit_discovery_and_nearest_trust_wins(ctx: ImportContext) -> None:
+def test_custom_root_markers_limit_discovery_without_enforcing_trust(ctx: ImportContext) -> None:
     assert ctx.workspace_cwd is not None
     workspace = Path(ctx.workspace_cwd)
     child = workspace / "child"
@@ -402,10 +441,10 @@ def test_custom_root_markers_limit_discovery_and_nearest_trust_wins(ctx: ImportC
     _project(ctx, '[mcp_servers.root]\ncommand = "root"')
     _write(child / ".codex/config.toml", '[mcp_servers.child]\ncommand = "child"')
     result = CodexSource().discover(ImportContext(str(child), ctx.home))
-    root, locked = result.candidates
+    root, project = result.candidates
     assert root.config is not None and root.name == "root"
-    assert locked.unsupported == UnsupportedReason.UNTRUSTED_PROJECT
-    assert locked.name == "child"
+    assert project.config is not None and project.unsupported is None
+    assert project.name == "child"
 
 
 def test_without_root_marker_parent_project_config_is_not_read(ctx: ImportContext) -> None:
@@ -441,7 +480,7 @@ env = { openai_identity_token_file = "secret-location", NORMAL = "value" }
     assert {warning.original for warning in candidate.warnings} == {"env.openai_identity_token_file"}
 
 
-def test_trust_accepts_original_symlink_spelling(ctx: ImportContext, tmp_path: Path) -> None:
+def test_project_discovery_accepts_symlink_spelling(ctx: ImportContext, tmp_path: Path) -> None:
     assert ctx.workspace_cwd is not None
     alias = tmp_path / "alias"
     symlink_or_skip(alias, Path(ctx.workspace_cwd), target_is_directory=True)
@@ -451,7 +490,7 @@ def test_trust_accepts_original_symlink_spelling(ctx: ImportContext, tmp_path: P
     assert candidate.config is not None
 
 
-def test_empty_project_trust_entry_does_not_mask_root_trust(ctx: ImportContext) -> None:
+def test_empty_project_trust_entry_does_not_block_import(ctx: ImportContext) -> None:
     assert ctx.workspace_cwd is not None
     root = Path(ctx.workspace_cwd)
     child = root / "child"

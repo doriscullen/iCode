@@ -49,7 +49,6 @@ class UnsupportedReason(StrEnum):
     FILE_REFERENCE = "file_reference"
     VALUE_FROM_COMMAND = "value_from_command"
     VARIABLE_NAME = "variable_name"
-    UNTRUSTED_PROJECT = "untrusted_project"
     REMOTE_ENVIRONMENT = "remote_environment"
 
 
@@ -62,14 +61,12 @@ class ImportWarningKind(StrEnum):
     CREDENTIAL_VARIABLE = "credential_variable"
     CLAUDE_PROJECT_DIR = "claude_project_dir"
     UNKNOWN_FIELDS_IGNORED = "unknown_fields_ignored"
-    DISABLED = "disabled"
     CWD_IGNORED = "cwd_ignored"
     MERGED = "merged"
     AUTH_PROVIDER_IGNORED = "auth_provider_ignored"
     TOOL_RULES_IGNORED = "tool_rules_ignored"
+    TOOL_PERMISSIONS_IGNORED = "tool_permissions_ignored"
     TOOLS_LIMITED = "tools_limited"
-    CODEMODE_OFF = "codemode_off"
-    VARIABLE_UNSET = "variable_unset"
     OPTIONAL_VARIABLE = "optional_variable"
     DENY_LIST = "deny_list"
 
@@ -118,7 +115,8 @@ class McpSourceError:
 class McpImportCandidate:
     """One server another agent runs, found in its config.
 
-    Entries the agent itself skips are not candidates. ``config`` is set
+    Entries with invalid server settings are not candidates. Source application
+    permissions and project trust do not gate import. ``config`` is set
     exactly when the server can be imported; otherwise ``unsupported`` says why
     not, and ``entry`` keeps the server's settings as the source wrote them so
     the UI can show them, in the keys ``command`` (the program), ``args``,

@@ -32,6 +32,7 @@ from chrys.app.tui.screens.agents.import_mcp_dialog import (
     is_already_added,
 )
 from chrys.app.tui.screens.agents.panels.mcp import MCPConfigPanel, MCPConnectionCard, format_mcp_command_line
+from chrys.app.tui.theme import CHRYS_THEME
 from chrys.app.tui.widgets import Checkbox, HatchedEmptyState
 from chrys.foundation.config.settings import Settings
 from chrys.foundation.i18n import Localizer
@@ -184,12 +185,16 @@ def test_already_added_compares_connections_not_names() -> None:
     assert is_already_added(_stdio("fs", "uvx", "other"), existing) is False
     assert is_already_added(_stdio("fs", "uvx"), existing) is False
     assert is_already_added(_stdio("fs", "mcp-fs", "uvx"), existing) is False
-    trailing = MCPServerConfig(name="other", transport="http", url="https://x.test/mcp/", headers={"B": "2"})
-    assert is_already_added(trailing, existing) is True
+    trailing = replace(existing[1], name="other", url="https://x.test/mcp/")
+    assert is_already_added(trailing, existing) is False
+    assert is_already_added(replace(existing[1], name="renamed"), existing) is True
+    assert is_already_added(replace(existing[1], headers={"A": "2"}), existing) is False
     stdio_named_like_url = _stdio("remote", "https://x.test/mcp")
     assert is_already_added(stdio_named_like_url, existing) is False
     with_env = MCPServerConfig(name="fs", transport="stdio", command="uvx", args=["mcp-fs"], env={"T": "x"})
-    assert is_already_added(with_env, existing) is True
+    assert is_already_added(with_env, existing) is False
+    assert is_already_added(replace(existing[0], allowed_tools=["read"]), existing) is False
+    assert is_already_added(replace(existing[0], enabled=False), existing) is False
 
 
 def test_import_messages_keep_english_and_localize_chinese() -> None:
@@ -401,7 +406,7 @@ async def test_cards_that_cant_be_ticked_open_folded_and_a_rebuild_keeps_the_use
     )
     panel = MCPConfigPanel([_stdio("fs", "uvx", "mcp-fs")])
     app = _PanelApp(panel)
-    async with app.run_test(size=(120, 60)) as pilot:  # tall enough that no fold toggle scrolls away
+    async with app.run_test(size=(120, 60)) as pilot:
         await _cards(panel, pilot, 1)
         dialog = await _open_dialog(app, panel, pilot)
         await _wait_for_rows(dialog, pilot, 3)
@@ -421,6 +426,7 @@ async def test_cards_that_cant_be_ticked_open_folded_and_a_rebuild_keeps_the_use
 
         new, legacy, _fs = dialog.query(_ImportCard)
         await click_when_settled(pilot, legacy.query_one(".mcp-import-fold"))
+        new.query_one(".mcp-import-fold").scroll_visible(animate=False)
         await click_when_settled(pilot, new.query_one(".mcp-import-fold"))
         expected = [("new", True, False), ("legacy", False, True), ("fs", True, False)]
         await wait_for(lambda: folds() == expected, pilot=pilot, description="the clicked cards fold and unfold")
@@ -576,18 +582,16 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         )
         # The command may hold a credential: the warning, saved in the description, never names it.
         helper = (
-            "The headers helper command is not imported: iCode doesn't run it. "
-            "Add the headers it produces under Headers yourself."
+            "The headers helper is not imported: it returns a set of headers, while iCode credential commands "
+            "supply one value. Add the headers under Headers yourself. For a value supplied by a command, "
+            "configure {{!command}} manually and review its working folder and refresh behavior."
         )
         credential = (
             "Authorization references ANTHROPIC_API_KEY, which Claude Code sends to a remote server as empty, "
             "so iCode imports it as empty too; a header left blank is not imported. To send this credential, "
             "copy it into a variable with another name and reference that."
         )
-        oauth = (
-            "The OAuth sign-in settings are not imported: iCode doesn't sign in to MCP servers with OAuth. "
-            "Add an Authorization header under Headers yourself, or the server may refuse the connection."
-        )
+        oauth = "OAuth sign-in is not imported. If this server requires it, configure an Authorization header in iCode."
         unknown = "Not imported, iCode has no matching setting: future."
         warnings = [str(widget.render()) for widget in dialog.query(".mcp-import-warning")]
         assert warnings == [dropped, project_dir, dropped_token, helper, credential, oauth, unknown]
@@ -642,6 +646,36 @@ async def test_import_lists_claude_servers_and_adds_ticked_ones_as_unsaved_cards
         assert configs[0].description == _USER_ORIGIN
         assert configs[1].headers == {"Authorization": "Bearer {{TOKEN}}"}
         assert configs[1].description == _USER_ORIGIN
+
+
+async def test_imported_environment_survives_editing_saving_and_runtime_resolution(
+    claude_home: Path, tmp_path: Path
+) -> None:
+    from chrys.service.mcp.cache import resolve_mcp_effective_config
+    from chrys.service.profiles.agents.loader import load_profile_from_yaml
+    from chrys.service.profiles.agents.schema import AgentProfile
+    from chrys.service.profiles.agents.serializer import save_profile
+
+    env = {"PASSWORD": " padded ", "EMPTY": "", "SPACES": "  ", "LINES": "first\nsecond"}
+    _write_claude_servers(claude_home, {"values": {"command": "server", "env": env}})
+    panel = MCPConfigPanel([])
+    app = _PanelApp(panel)
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = await _open_dialog(app, panel, pilot)
+        (row,) = await _wait_for_rows(dialog, pilot, 1)
+        row.value = True
+        await _import_ticked(dialog, pilot)
+        (card,) = await _cards(panel, pilot, 1)
+        assert card.validate() == []
+        configs = panel.get_config()
+        assert configs[0].env == env
+        path = save_profile(
+            AgentProfile(name="Imported", tools=ToolsConfig(mcp=configs)), target_dir=tmp_path / "profiles"
+        )
+        (loaded,) = load_profile_from_yaml(path).tools.mcp
+        effective = resolve_mcp_effective_config(loaded)
+        assert effective.stdio_env is not None
+        assert {key: effective.stdio_env[key] for key in env} == env
 
 
 def _ticks(dialog: ImportMcpServersDialog) -> list[tuple[str, bool, bool]]:
@@ -926,6 +960,38 @@ async def test_a_ticked_server_locks_the_same_server_elsewhere_and_is_imported_o
         assert [(config.name, config.command) for config in imported] == [("github", "npx")]
 
 
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+async def test_same_endpoint_with_different_credentials_can_be_imported_together(
+    tmp_path: Path, transport: str
+) -> None:
+    configs = (
+        [
+            MCPServerConfig(name=name, transport="stdio", command="server", env={"DATABASE_URL": name})
+            for name in ("a", "b")
+        ]
+        if transport == "stdio"
+        else [
+            MCPServerConfig(name=name, transport="http", url="https://x.test/mcp", headers={"Authorization": name})
+            for name in ("a", "b")
+        ]
+    )
+    source = _ListedSource("example", "Example", tuple(_candidate(c.name, "user", c) for c in configs))
+    results: list[list[MCPServerConfig] | None] = []
+    app = _PanelApp(MCPConfigPanel([]))
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = _open_with(app, [source], tmp_path, results)
+        first, second = await _wait_for_rows(dialog, pilot, 2)
+        first.value = True
+        await pilot.pause()
+        assert not second.disabled
+        second.value = True
+        await _import_ticked(dialog, pilot)
+        await wait_for(lambda: results, pilot=pilot, description="both configurations imported")
+        imported = results[0]
+        assert imported is not None
+        assert [(c.env, c.headers) for c in imported] == [(c.env, c.headers) for c in configs]
+
+
 async def test_two_servers_ticked_at_once_with_one_connection_are_imported_once(tmp_path: Path) -> None:
     github = _stdio("github", "npx", "-y", "server-github")
     source = _ListedSource(
@@ -1153,7 +1219,7 @@ def test_every_import_warning_has_a_message(warning: ImportWarning) -> None:
 
     text = dialog._warning_text(warning, "opencode")
 
-    assert text and "{" not in text.replace("{{VAR}}", "")
+    assert text and "{" not in text.replace("{{VAR}}", "").replace("{{!command}}", "")
 
 
 @pytest.mark.parametrize("reason", list(UnsupportedReason))
@@ -1163,7 +1229,7 @@ def test_every_unsupported_reason_has_a_message(reason: UnsupportedReason) -> No
 
     text = dialog._unsupported_note(candidate, "pi")
 
-    assert text and text.startswith("Can't import:") and "{" not in text
+    assert text and text.startswith("Can't import:") and "{" not in text.replace("{{!command}}", "")
 
 
 @pytest.mark.parametrize("kind", list(SourceErrorKind))
@@ -1182,6 +1248,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
     opencode_config.write_text(
         """{
   // opencode allows comments
+  "agent": {"build": {"tools": {"files_write_note": false}}},
   "mcp": {
     "files": {"type": "local", "command": ["npx", "server-files"], "environment": {"T": "{env:FILES_TOKEN}"},
               "enabled": false},
@@ -1196,7 +1263,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
         json.dumps({"mcpServers": {"docs": {"url": "https://docs.test/mcp", "description": description}}}),
         encoding="utf-8",
     )
-    environ = {**_quiet_environ(tmp_path), "XDG_CONFIG_HOME": str(home / ".config"), "FILES_TOKEN": "t"}
+    environ = {**_quiet_environ(tmp_path), "XDG_CONFIG_HOME": str(home / ".config")}
     results: list[list[MCPServerConfig] | None] = []
     app = _PanelApp(MCPConfigPanel([]))
     async with app.run_test(size=(120, 40)) as pilot:
@@ -1210,15 +1277,13 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
         (files,) = await _wait_for_rows(dialog, pilot, 1)
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         assert [str(sources.get_option_at_index(i).prompt) for i in range(sources.option_count)] == ["opencode", "pi"]
-        disabled = (
-            "opencode has this server turned off, so it is imported turned off. Tick Enabled in its card to use it."
-        )
         assert _cards_in(dialog) == [
             (
                 "files",
                 [
                     _transport("STDIO"),
                     _scope("opencode", "global, used in every project"),
+                    ("Enabled", "No"),
                     ("Command", format_mcp_command_line("npx", ["server-files"])),
                     ("Environment Variables", [("T", "{{FILES_TOKEN}}")]),
                     _prefix("files"),
@@ -1226,7 +1291,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 True,
             )
         ]
-        assert [str(widget.render()) for widget in dialog.query(".mcp-import-warning")] == [disabled]
+        assert not dialog.query(".mcp-import-warning")
         files.value = True
 
         sources.highlighted = sources.get_option_index("pi")
@@ -1273,13 +1338,16 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 "files",
                 False,
                 "files",
-                f"Imported from opencode. There it is a global server, used in every project.\n- {disabled}",
+                "Imported from opencode. There it is a global server, used in every project.",
             ),
             (
                 "docs",
                 True,
                 "docs",
-                f"{description}\nImported from pi. There it is a project server, used only in {workspace}.",
+                (
+                    f"{description}\nImported from pi. There it is a project server, used only in {workspace}.\n"
+                    "- OAuth sign-in is not imported. If this server requires it, configure an Authorization header in iCode."
+                ),
             ),
         ]
 
@@ -1325,8 +1393,89 @@ async def test_codex_servers_are_detected_previewed_and_imported(tmp_path: Path)
         assert server.description.startswith("Imported from Codex.")
 
 
+@pytest.mark.parametrize("source_id", ["pi", "claude_code", "codex"])
+async def test_command_migration_guidance_is_shown_without_copying_the_command(tmp_path: Path, source_id: str) -> None:
+    home = tmp_path / "home"
+    command = "credential-helper --secret private-command-argument"
+    if source_id == "codex":
+        path = home / ".codex" / "config.toml"
+        text = (
+            '[mcp_servers.remote]\nurl = "https://example.test/mcp"\nhttp_headers_helper = '
+            + json.dumps(command)
+            + "\n"
+        )
+    else:
+        path = home / ".pi" / "agent" / "mcp.json" if source_id == "pi" else home / ".claude.json"
+        server: dict[str, Any] = {"type": "http", "url": "https://example.test/mcp"}
+        server["headers" if source_id == "pi" else "headersHelper"] = (
+            {"Authorization": "!" + command} if source_id == "pi" else command
+        )
+        text = json.dumps({"mcpServers": {"remote": server}})
+    path.parent.mkdir(parents=True)
+    path.write_text(text, encoding="utf-8")
+    results: list[list[MCPServerConfig] | None] = []
+    app = _PanelApp(MCPConfigPanel([]))
+    app.locale_controller = LocaleController(Settings(locale="en"))
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = ImportMcpServersDialog(
+            workspace_cwd=None,
+            existing=[],
+            locale_controller=app.locale_controller,
+            context=ImportContext(None, home, _quiet_environ(tmp_path)),
+        )
+        app.push_screen(dialog, callback=results.append)
+        (row,) = await _wait_for_rows(dialog, pilot, 1)
+        selector = ".mcp-import-note" if source_id == "pi" else ".mcp-import-warning"
+        guidance = " ".join(str(widget.render()) for widget in dialog.query(selector))
+        assert "configure {{!command}}" in guidance
+        assert "working folder" in guidance
+        assert command not in guidance and "private-command-argument" not in guidance
+        assert row.disabled is (source_id == "pi")
+
+        app.locale_controller.switch_locale("zh-Hans")
+        await wait_for(
+            lambda: "手动" in " ".join(str(widget.render()) for widget in dialog.query(selector)),
+            pilot=pilot,
+            description="the command migration guidance is translated",
+        )
+        if source_id != "pi":
+            (row,) = await _wait_for_rows(dialog, pilot, 1)
+            row.value = True
+            await _import_ticked(dialog, pilot)
+            await wait_for(lambda: results, pilot=pilot, description="the server with omitted helper is imported")
+            (imported,) = results
+            assert imported is not None
+            (config,) = imported
+            assert "{{!command}}" in config.description
+            assert "private-command-argument" not in config.description
+
+
 def _option_list_lines(option_list: OptionList) -> list[str]:
     return [option_list.render_line(y).text.strip() for y in range(option_list.size.height)]
+
+
+async def test_sidebar_hover_keeps_separator_background_when_focus_returns(tmp_path: Path) -> None:
+    sources = [
+        _ListedSource(source_id, source_id, (_candidate(source_id, "user", _stdio(source_id, source_id)),))
+        for source_id in ("first", "second", "third")
+    ]
+    app = _PanelApp(MCPConfigPanel([]))
+    app.register_theme(CHRYS_THEME)
+    app.theme = CHRYS_THEME.name
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = _open_with(app, sources, tmp_path)
+        await _wait_for_rows(dialog, pilot, 1)
+        option_list = dialog.query_one("#mcp-import-sources", OptionList)
+        dialog.query_one("#mcp-import-cancel", Button).focus()
+        await pilot.hover(option_list, offset=(1, 2))
+        await pilot.pause()
+        # Cache the hovered option together with the separator beneath it while blurred.
+        option_list.render_line(2)
+        option_list.focus()
+        await pilot.pause()
+        background = option_list.rich_style.bgcolor
+        for y in (1, 3, 4, 5):
+            assert all(segment.style.bgcolor == background for segment in option_list.render_line(y))
 
 
 async def test_agents_in_the_sidebar_are_divided_by_rules_the_cursor_skips(tmp_path: Path) -> None:
@@ -1424,7 +1573,9 @@ async def test_a_file_that_cant_be_read_is_not_followed_by_the_empty_state(tmp_p
 
 
 async def test_cards_and_the_empty_state_follow_a_locale_switch(tmp_path: Path) -> None:
-    listed = _ListedSource("listed", "Listed Agent", (_candidate("a", "user", _stdio("a", "uvx")),))
+    listed = _ListedSource(
+        "listed", "Listed Agent", (_candidate("a", "user", replace(_stdio("a", "uvx"), enabled=False)),)
+    )
     empty = _ListedSource("empty", "Empty Agent", ())
     app = _PanelApp(MCPConfigPanel([]))
     # Its own controller: the class-level one is shared by every test in this module.
@@ -1445,6 +1596,7 @@ async def test_cards_and_the_empty_state_follow_a_locale_switch(tmp_path: Path) 
             description="the card's fields are rendered again in Chinese",
         )
         assert _cards_in(dialog)[0][1][1] == (scope, "用户，在所有项目中使用")  # noqa: RUF001
+        assert _cards_in(dialog)[0][1][2] == ("启用", "否")
 
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         sources.highlighted = sources.get_option_index("empty")

@@ -1075,8 +1075,8 @@ async def test_mcp_add_button_appends_another_editable_row() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stdio_validate_rejects_partial_env_rows() -> None:
-    """Partially-filled stdio env rows should block Save with clear errors."""
+async def test_stdio_validate_allows_empty_env_values() -> None:
+    """An empty environment override can intentionally clear an inherited value."""
 
     app = _MCPPanelApp()
     async with app.run_test(size=(120, 40)) as pilot:
@@ -1093,7 +1093,8 @@ async def test_stdio_validate_rejects_partial_env_rows() -> None:
 
         errors = card.validate()
 
-    assert "Server 'New Server': Environment Variables row 1: value is required for key 'API_KEY'." in errors
+        assert card.get_config().env == {"API_KEY": ""}
+    assert errors == []
 
 
 @pytest.mark.asyncio

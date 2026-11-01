@@ -10,25 +10,26 @@ https://github.com/openai/codex/tree/rust-v0.166.0/codex-rs.
 Read ``$CODEX_HOME/config.toml`` (default ``~/.codex/config.toml``), then
 ``.codex/config.toml`` from the nearest project root down to the workspace.
 The root uses ``project_root_markers`` (default ``[".git"]``); absent a
-marker, only the workspace is searched. Project trust comes from the user
-file, checking the layer's folder before the project root and Git root.
-Untrusted and undecided project layers are shown locked, not merged
-[config/src/loader/mod.rs:ProjectTrustContext,discover_project_layers]. Tables merge
+marker, only the workspace is searched [config/src/loader/mod.rs:discover_project_layers].
+Source project trust does not gate this user-selected import. Tables merge
 recursively; arrays and scalars replace [config/src/merge.rs].
 
 Transport inference and validation follow config/src/mcp_types.rs. Values
 in ``env`` and ``http_headers`` are literal; header references to environment
 variables become iCode templates, never captured secrets. A stdio server's
-``env_vars``, which Codex forwards only while set, are left to the environment
-iCode's stdio servers inherit. Environment headers beat static headers; bearer
+``env_vars``, which Codex forwards only while set, are generally inherited.
+Python path overrides that iCode filters from inherited variables are written as
+explicit references, with a warning about requiring nonempty values.
+Environment headers beat static headers; bearer
 auth beats Authorization [rmcp-client/src/utils.rs, codex-mcp/src/rmcp_client.rs].
 Optional header references get a warning because iCode requires them to be set.
 The default tool timeout is 300 seconds [codex-mcp/src/rmcp_client.rs:122]. Deny-only tool filters are
 imported with no tools, since iCode cannot express a deny list without a catalog.
 
 Not read: system/managed/cloud configuration, selected profile files,
-session overrides, plugin servers, stored OAuth credentials, or main-checkout
-trust for linked worktrees. Remote execution environments cannot be imported.
+session overrides, plugin servers, stored OAuth credentials, or project trust.
+Tool approval policies are reported without validation or migration.
+Remote execution environments cannot be imported.
 Ignored runtime settings are named in warnings. iCode's subprocess environment
 inheritance differs from Codex's filtered environment. No commands, header
 helpers, OAuth flows or network discovery run during import.
@@ -49,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from chrys.foundation.platform.runtime_paths import strip_python_runtime_overrides
 from chrys.service.mcp.importers.base import (
     ImportContext,
     ImportWarning,
@@ -60,7 +62,6 @@ from chrys.service.mcp.importers.base import (
     SourceReadError,
     TemplateVariable,
     UnsupportedReason,
-    git_root,
     read_source_bytes,
     render_template,
     request_timeout_seconds,
@@ -108,7 +109,7 @@ class _Entry:
 
 
 class CodexSource:
-    """Reads Codex's user file and trusted project layers for the workspace."""
+    """Reads Codex's user file and project layers for the user to choose from."""
 
     @property
     def source_id(self) -> str:
@@ -122,33 +123,24 @@ class CodexSource:
         home = _codex_home(ctx)
         if home is not None and (home / "config.toml").exists():
             return True
-        return any((folder / ".codex/config.toml").exists() for folder, _trusted in _project_folders(ctx, {}))
+        return any((folder / ".codex/config.toml").exists() for folder in _project_folders(ctx, {}))
 
     def discover(self, ctx: ImportContext) -> McpImportResult:
         errors: list[McpSourceError] = []
         entries: dict[str, _Entry] = {}
-        locked: list[tuple[str, _Entry]] = []
         home = _codex_home(ctx)
         if home is None:
             return McpImportResult()
         user_path = home / "config.toml"
         user = _read(user_path, errors)
         _add_layer(entries, user, user_path, "user", "", errors)
-        for folder, trusted in _project_folders(ctx, user):
+        for folder in _project_folders(ctx, user):
             path = folder / ".codex/config.toml"
             if os.path.realpath(path) == os.path.realpath(user_path):
                 continue
             document = _read(path, errors)
-            if trusted:
-                _add_layer(entries, document, path, "project", str(folder), errors)
-            else:
-                isolated: dict[str, _Entry] = {}
-                _add_layer(isolated, document, path, "project", str(folder), errors)
-                locked.extend(isolated.items())
+            _add_layer(entries, document, path, "project", str(folder), errors)
         candidates = [_candidate(name, entry) for name, entry in entries.items() if _valid(name, entry.value)]
-        candidates.extend(
-            _candidate(name, entry, untrusted=True) for name, entry in locked if _valid(name, entry.value)
-        )
         return McpImportResult(tuple(candidates), tuple(errors))
 
 
@@ -175,7 +167,7 @@ def _read(path: Path, errors: list[McpSourceError]) -> dict[str, Any]:
     return {}
 
 
-def _project_folders(ctx: ImportContext, user: dict[str, Any]) -> list[tuple[Path, bool]]:
+def _project_folders(ctx: ImportContext, user: dict[str, Any]) -> list[Path]:
     if not ctx.workspace_cwd:
         return []
     workspace = Path(os.path.abspath(ctx.workspace_cwd))
@@ -184,23 +176,9 @@ def _project_folders(ctx: ImportContext, user: dict[str, Any]) -> list[tuple[Pat
         return []
     ancestors = (workspace, *workspace.parents)
     root = next((folder for folder in ancestors if any(_has_marker(folder, marker) for marker in markers)), workspace)
-    repository = git_root(str(workspace))
-    projects = user.get("projects", {})
-    trust = (
-        {
-            os.path.normcase(key): value.get("trust_level")
-            for key, value in projects.items()
-            if isinstance(value, dict) and value.get("trust_level") in ("trusted", "untrusted")
-        }
-        if isinstance(projects, dict)
-        else {}
-    )
-    result: list[tuple[Path, bool]] = []
+    result: list[Path] = []
     for folder in ancestors:
-        paths = [str(folder), str(root)] + ([repository] if repository else [])
-        keys = [key for path in paths for key in (os.path.realpath(path), path)]
-        decision = next((trust[os.path.normcase(key)] for key in keys if os.path.normcase(key) in trust), None)
-        result.append((folder, decision == "trusted"))
+        result.append(folder)
         if folder == root:
             break
     return list(reversed(result))
@@ -302,15 +280,13 @@ def _valid(name: str, value: dict[str, Any]) -> bool:
         return False
     if value.get("startup_readiness", "connection") not in ("connection", "catalog"):
         return False
-    if value.get("default_tools_approval_mode", "auto") not in ("auto", "prompt", "writes", "approve"):
-        return False
     helper = value.get("http_headers_helper")
     if helper is not None and (not helper.strip() or value.get("environment_id", "local") != "local"):
         return False
     variables = value.get("env_vars", [])
     if not isinstance(variables, list) or not all(_env_var_valid(item) for item in variables):
         return False
-    return _oauth_valid(value) and _tools_valid(value.get("tools", {}))
+    return _oauth_valid(value)
 
 
 def _env_var_valid(item: object) -> bool:
@@ -345,24 +321,7 @@ def _oauth_valid(value: dict[str, Any]) -> bool:
     return "authorization_server_issuer" not in oauth or value.get("auth") == "ema_auth"
 
 
-def _tools_valid(tools: object) -> bool:
-    if not isinstance(tools, dict):
-        return False
-    for item in tools.values():
-        if not isinstance(item, dict) or item.get("approval_mode", "auto") not in (
-            "auto",
-            "prompt",
-            "writes",
-            "approve",
-        ):
-            return False
-        limit = item.get("output_token_limit", 1)
-        if type(limit) is not int or limit <= 0:
-            return False
-    return True
-
-
-def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImportCandidate:
+def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
     value = entry.value
     stdio = "command" in value
     transport = "stdio" if stdio else "http"
@@ -382,8 +341,6 @@ def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImpor
             scope_path=entry.folder,
         )
 
-    if untrusted:
-        return unsupported(UnsupportedReason.UNTRUSTED_PROJECT)
     variables = value.get("env_vars", [])
     if value.get("environment_id", "local") != "local" or any(
         isinstance(item, dict) and item.get("source") == "remote" for item in variables
@@ -395,13 +352,19 @@ def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImpor
         if key.upper() in _NON_INHERITABLE:
             del env[key]
             warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=f"env.{key}"))
+    forwarded = {item if isinstance(item, str) else item["name"]: "" for item in variables}
+    inherited = strip_python_runtime_overrides(dict(forwarded))
+    for variable in sorted(forwarded.keys() - inherited.keys()):
+        if variable in env:
+            continue
+        env[variable] = render_template([TemplateVariable(variable)])
+        warnings.append(ImportWarning(ImportWarningKind.OPTIONAL_VARIABLE, variable=variable, field=variable))
     headers = {
         key.lower(): trim_header_value(render_template([literal]))
         for key, literal in value.get("http_headers", {}).items()
     }
-    # A stdio server's env_vars are left out: Codex forwards each one only while it is set, and iCode's
-    # stdio servers inherit the environment, where a {{VAR}} reference would fail the connection
-    # whenever the variable is unset.
+    # Other env_vars are inherited. Python path overrides need explicit references because iCode
+    # filters inherited ones; the warning explains that a reference requires a nonempty value.
     references = {} if stdio else {key.lower(): variable for key, variable in value.get("env_http_headers", {}).items()}
     for key, variable in references.items():
         if key == "authorization" and "bearer_token_env_var" in value:
@@ -421,18 +384,19 @@ def _candidate(name: str, entry: _Entry, *, untrusted: bool = False) -> McpImpor
         warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=value["auth"]))
     if "http_headers_helper" in value:
         # Helper arguments may contain credentials; expose the setting name, not the command.
-        warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="http_headers_helper"))
+        warnings.append(ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED))
     if stdio and value.get("cwd"):
         warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=value["cwd"]))
-    if not value.get("enabled", True):
-        warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     if entry.sources:
         warnings.append(ImportWarning(ImportWarningKind.MERGED, original=", ".join(entry.sources)))
-    ignored = sorted(value.keys() - _CARRIED_FIELDS - {"tools"})
+    permission_fields = value.keys() & {"tools", "default_tools_approval_mode"}
+    ignored = sorted(value.keys() - _CARRIED_FIELDS - permission_fields)
     if ignored:
         warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=", ".join(ignored)))
-    if value.get("tools"):
-        warnings.append(ImportWarning(ImportWarningKind.TOOL_RULES_IGNORED, original=", ".join(value["tools"])))
+    if permission_fields:
+        warnings.append(
+            ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original=", ".join(sorted(permission_fields)))
+        )
     allowed = value.get("enabled_tools")
     denied = value.get("disabled_tools", [])
     if allowed is not None:

@@ -803,7 +803,9 @@ class MCPConnectionCard(CollapsibleConfigCard):
         parsed: dict[str, str] = {}
         for row in container.query(".mcp-item-row"):
             key = row.query_one(".mcp-item-key-input", Input).value.strip()
-            value = row.query_one(".mcp-item-value-input", Input).value.strip()
+            value = row.query_one(".mcp-item-value-input", Input).value
+            if container_id != self._key_value_container_id(_MCP_ENV_ROWS):
+                value = value.strip()
             if key:
                 parsed[key] = value
         return parsed
@@ -1620,6 +1622,7 @@ class MCPConnectionCard(CollapsibleConfigCard):
                         self._key_value_container_id(_MCP_ENV_ROWS),
                         _ENVIRONMENT_VARIABLES,
                         display_name,
+                        allow_empty_values=True,
                     )
                 )
 
@@ -1652,6 +1655,8 @@ class MCPConnectionCard(CollapsibleConfigCard):
         container_id: str,
         label_definition: MessageDef,
         display_name: str,
+        *,
+        allow_empty_values: bool = False,
     ) -> list[str]:
         """Validate that partially-filled key-value rows are not saved silently."""
         localizer = widget_localizer(self)
@@ -1664,7 +1669,7 @@ class MCPConnectionCard(CollapsibleConfigCard):
             value = row.query_one(".mcp-item-value-input", Input).value.strip()
             if not key and not value:
                 continue
-            if key and not value:
+            if key and not value and not allow_empty_values:
                 errors.append(
                     self._render_server_error(
                         display_name,

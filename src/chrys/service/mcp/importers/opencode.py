@@ -48,18 +48,18 @@ remote and bare ``{"enabled": ...}`` forms, in that order, unknown keys dropped
 [code: K/v1/config/config.ts:113, K/v1/config/mcp.ts]. A file with a server
 of none of these forms is rejected whole by opencode, which then doesn't start
 (or, for a global file, starts without the global folder); its servers are not
-listed, the other files' still are. Only the settings an import needs are
-checked (``mcp``, ``tools``, ``permission``, agents' ``tools`` and
-``permission``, ``experimental.mcp_timeout``): a file opencode rejects for
-another setting is still read.
+listed, the other files' still are. Only MCP settings and
+``experimental.mcp_timeout`` are validated. Permissions and agent policies are
+not validated or migrated; global permission setting names are reported.
 
 opencode replaces ``{env:NAME}`` and ``{file:path}`` in a file's text before
 parsing it [code: C/variable.ts:34-91]. Here a server's values are read after
 parsing, and ``{env:NAME}`` becomes iCode's ``{{NAME}}``. opencode reads an
-unset variable as empty where iCode fails the connection, so an unset one
-gets a warning; opencode can also fill a variable from an organization it is
-signed in to, which iCode can't. A ``{file:...}`` in a setting iCode would
-import makes the server unimportable: iCode doesn't read the file, and copying
+unset variable as empty where iCode fails the connection; variable availability
+is checked when iCode connects, not during import. opencode can also fill a
+variable from an organization it is signed in to, which iCode can't. A
+``{file:...}`` in a setting iCode would import makes the server unimportable:
+iCode doesn't read the file, and copying
 its content would copy a secret out of the file the user keeps it in. A
 reference outside a JSON string, such as a timeout written ``{env:T}``, makes
 the file invalid JSON here.
@@ -72,15 +72,9 @@ other files changed it too, a warning names them. ``timeout`` (milliseconds,
 else ``experimental.mcp_timeout``) bounds each call [code: M/index.ts:661-684]
 and becomes iCode's request timeout in seconds, rounded up; iCode also waits
 at most that long to connect, where opencode waits 30 seconds unless the
-server sets ``timeout``. opencode hides the
-tools a ``deny`` rule in ``tools`` or ``permission`` matches
-[code: C/config.ts:567-578, packages/opencode/src/permission/index.ts:186-218]:
-a rule hiding all of a server's tools is imported as an empty tool list, plus
-the tools a later rule names exactly (also ``$OPENCODE_PERMISSION``'s rules) —
-by the name opencode shows, in which characters other than letters, digits,
-``_`` and ``-`` are ``_``, so a tool whose own name has others stays hidden;
-a rule iCode can't express that way, or an agent's own rule, is named in a
-warning.
+server sets ``timeout``. Global ``tools``, ``permission``, ``permissions`` and
+``$OPENCODE_PERMISSION`` settings are reported as omitted. Their rules and
+precedence are not reproduced; users configure tool access and approval in iCode.
 
 Runtime differences an imported server may notice: opencode starts a local
 server in ``cwd`` (default: the folder it was started in), iCode always in the
@@ -129,7 +123,7 @@ from chrys.service.mcp.importers.base import (
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
 
 SCOPE_GLOBAL = "global"
 SCOPE_PROJECT = "project"
@@ -148,10 +142,6 @@ _FILE_REFERENCE_RE = re.compile(r"\{file:[^}]+\}")
 # The variable names iCode's ``{{NAME}}`` can hold.
 _VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
-# Characters opencode keeps in a tool name's server part [code: M/catalog.ts:117-119].
-_TOOL_NAME_UNSAFE_RE = re.compile(r"[^a-zA-Z0-9_-]")
-
-_PERMISSION_ACTIONS = frozenset({"ask", "allow", "deny"})
 _OAUTH_FIELDS = {
     "clientId": str,
     "clientSecret": str,
@@ -187,9 +177,7 @@ class _Settings:
     """The settings an import needs from one file, as opencode decodes them."""
 
     mcp: dict[str, dict[str, Any]] = field(default_factory=dict)
-    tools: dict[str, bool] = field(default_factory=dict)
-    permission: dict[str, Any] = field(default_factory=dict)
-    agents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    permission_fields: tuple[str, ...] = ()
     mcp_timeout: int | None = None
 
 
@@ -216,8 +204,8 @@ class OpenCodeSource:
         return "opencode"
 
     def detect(self, ctx: ImportContext) -> bool:
-        if _global_dir(ctx).is_dir():
-            return True
+        # An empty global folder (which opencode creates on start) holds no servers, so it is not
+        # a sign that anything can be imported; the global files and the other layers are.
         return any(
             layer.text is not None or (layer.path is not None and layer.path.is_file()) for layer in _layers(ctx)
         )
@@ -443,7 +431,6 @@ def _strip_jsonc(text: str) -> str:
 
 
 def _decode_settings(document: dict[str, Any]) -> _Settings:
-    _reject_v2_permissions(document)
     settings = _Settings()
     mcp = document.get("mcp")
     experimental = document.get("experimental")
@@ -462,62 +449,8 @@ def _decode_settings(document: dict[str, Any]) -> _Settings:
         if not isinstance(mcp_timeout, int | float) or not _is_positive_int(mcp_timeout):
             raise _InvalidConfig
         settings.mcp_timeout = int(mcp_timeout)
-    if "tools" in document:
-        settings.tools = _decode_tools(document["tools"])
-    if "permission" in document:
-        settings.permission = _decode_permission(document["permission"])
-    for key in ("agent", "mode"):
-        agents = document.get(key)
-        if not isinstance(agents, dict):
-            continue
-        for name, agent in agents.items():
-            if not isinstance(agent, dict):
-                continue
-            rules: dict[str, Any] = {}
-            if isinstance(agent.get("tools"), dict):
-                rules["tools"] = _decode_tools(agent["tools"])
-            if "permission" in agent:
-                rules["permission"] = _decode_permission(agent["permission"])
-            if rules:
-                settings.agents[name] = rules
+    settings.permission_fields = tuple(key for key in ("tools", "permission", "permissions") if key in document)
     return settings
-
-
-def _reject_v2_permissions(document: dict[str, Any]) -> None:
-    """opencode 2's ``permissions`` fail the file [code: C/v2-compat.ts:92-110]."""
-    if "permissions" in document:
-        raise _InvalidConfig
-    for key in ("agents", "agent", "mode"):
-        agents = document.get(key)
-        if isinstance(agents, dict) and any(
-            isinstance(agent, dict) and "permissions" in agent for agent in agents.values()
-        ):
-            raise _InvalidConfig
-
-
-def _decode_tools(value: object) -> dict[str, bool]:
-    if not isinstance(value, dict) or not all(isinstance(item, bool) for item in value.values()):
-        raise _InvalidConfig
-    return dict(value)
-
-
-def _decode_permission(value: object) -> dict[str, Any]:
-    """``permission`` as opencode decodes it: an action for every tool, or one per tool name."""
-    if isinstance(value, str):
-        if value not in _PERMISSION_ACTIONS:
-            raise _InvalidConfig
-        return {"*": value}
-    if not isinstance(value, dict):
-        raise _InvalidConfig
-    for rule in value.values():
-        if isinstance(rule, str):
-            if rule not in _PERMISSION_ACTIONS:
-                raise _InvalidConfig
-        elif not isinstance(rule, dict) or not all(
-            isinstance(action, str) and action in _PERMISSION_ACTIONS for action in rule.values()
-        ):
-            raise _InvalidConfig
-    return dict(value)
 
 
 def _lower_v2(mcp: dict[str, Any]) -> tuple[dict[str, Any], int | None]:
@@ -742,51 +675,31 @@ def _merge_servers(loaded: list[tuple[_Layer, _Settings]]) -> dict[str, _Server]
 
 @dataclass(frozen=True, slots=True)
 class _Merged:
-    tools: dict[str, bool]
-    permission: dict[str, Any]
-    agents: dict[str, Any]
+    permission_fields: tuple[str, ...]
     mcp_timeout: int | None
 
 
 def _result(
     ctx: ImportContext, loaded: list[tuple[_Layer, _Settings]], errors: list[McpSourceError]
 ) -> McpImportResult:
-    tools: dict[str, bool] = {}
-    permission: dict[str, Any] = {}
-    agents: dict[str, Any] = {}
+    permission_fields: set[str] = set()
     mcp_timeout: int | None = None
     for _layer, settings in loaded:
-        tools = {**tools, **settings.tools}
-        merged_permission = _merge_deep(permission, settings.permission)
-        permission = merged_permission if isinstance(merged_permission, dict) else {}
-        merged_agents = _merge_deep(agents, settings.agents)
-        agents = merged_agents if isinstance(merged_agents, dict) else {}
+        permission_fields.update(settings.permission_fields)
         if settings.mcp_timeout is not None:
             mcp_timeout = settings.mcp_timeout
-    permission = _with_permission_env(ctx, permission)
-    merged = _Merged(tools, permission, agents, mcp_timeout)
+    if ctx.environ.get("OPENCODE_PERMISSION"):
+        permission_fields.add("OPENCODE_PERMISSION")
+    merged = _Merged(tuple(sorted(permission_fields)), mcp_timeout)
     candidates = []
     for name, server in _merge_servers(loaded).items():
-        candidate = _candidate(ctx, name, server, merged)
+        candidate = _candidate(name, server, merged)
         if candidate is not None:
             candidates.append(candidate)
     return McpImportResult(candidates=tuple(candidates), source_errors=tuple(errors))
 
 
-def _with_permission_env(ctx: ImportContext, permission: dict[str, Any]) -> dict[str, Any]:
-    """*permission* with ``$OPENCODE_PERMISSION`` merged over it; opencode skips it when it isn't JSON [code: C/config.ts:559-565]."""
-    value = ctx.environ.get("OPENCODE_PERMISSION", "")
-    if not value:
-        return permission
-    try:
-        extra = json.loads(value)
-    except ValueError, RecursionError:
-        return permission
-    merged = _merge_deep(permission, extra)
-    return merged if isinstance(merged, dict) else permission
-
-
-def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) -> McpImportCandidate | None:
+def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidate | None:
     entry = server.entry
     layer = server.type_layer
     kind = entry.get("type")
@@ -835,7 +748,6 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
             UnsupportedReason.TEMPLATE_IN_COMMAND if kind == "local" else UnsupportedReason.TEMPLATE_IN_URL
         )
     converted: dict[str, str] = {}
-    variables: list[tuple[str, str]] = []
     for key, value in values.items():
         parts = _env_parts(value)
         if parts is None:
@@ -845,24 +757,19 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
         rendered = render_template(parts)
         # opencode's fetch trims a header value; iCode's HTTP client refuses one it doesn't.
         converted[key] = trim_header_value(rendered) if values_key == "headers" else rendered
-        variables.extend((key, part.name) for part in parts if isinstance(part, TemplateVariable))
 
-    warnings: list[ImportWarning] = [
-        ImportWarning(ImportWarningKind.VARIABLE_UNSET, variable, field=key)
-        for key, variable in dict.fromkeys(variables)
-        if not ctx.environ.get(variable)
-    ]
+    warnings: list[ImportWarning] = []
     cwd = entry.get("cwd") if kind == "local" else None
     if isinstance(cwd, str) and cwd not in {"", "."}:
         warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=cwd))
-    if kind == "remote" and isinstance(entry.get("oauth"), dict):
+    if kind == "remote" and entry.get("oauth") is not False:
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     warnings.extend(_merged_warning(server, values_key))
-    allowed_tools, tool_warnings = _tool_access(name, merged)
-    warnings.extend(tool_warnings)
+    if merged.permission_fields:
+        warnings.append(
+            ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original=", ".join(merged.permission_fields))
+        )
     enabled = entry.get("enabled") is not False
-    if not enabled:
-        warnings.append(ImportWarning(ImportWarningKind.DISABLED))
     timeout = entry.get("timeout") if _is_positive_int(entry.get("timeout")) else merged.mcp_timeout
     request_timeout = None if timeout is None else request_timeout_seconds(timeout / 1000)
     # The source's own config, no tool name prefix: the dialog gives every import one
@@ -875,7 +782,6 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
             args=list(entry["command"][1:]),
             env=converted,
             enabled=enabled,
-            allowed_tools=allowed_tools,
             request_timeout=request_timeout,
         )
     else:
@@ -885,7 +791,6 @@ def _candidate(ctx: ImportContext, name: str, server: _Server, merged: _Merged) 
             url=entry["url"],
             headers=converted,
             enabled=enabled,
-            allowed_tools=allowed_tools,
             request_timeout=request_timeout,
         )
     return McpImportCandidate(
@@ -935,121 +840,3 @@ def _merged_warning(server: _Server, values_key: str) -> Iterable[ImportWarning]
         if group == values_key and key in server.entry.get(values_key, {}) and layer is not server.connection_layer
     ]
     yield ImportWarning(ImportWarningKind.MERGED, field=", ".join(inherited), original=", ".join(others))
-
-
-# --- tool rules ---------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class _Rule:
-    key: str
-    pattern: str
-    action: str
-
-
-def _rules(tools: Mapping[str, bool], permission: Mapping[str, Any]) -> list[_Rule]:
-    """opencode's rule list: ``tools`` as allow/deny rules, overlaid by ``permission`` [code: C/config.ts:567-578]."""
-    from_tools: dict[str, Any] = {}
-    for tool, enabled in tools.items():
-        key = "edit" if tool in {"write", "edit", "patch"} else tool
-        from_tools[key] = "allow" if enabled else "deny"
-    combined = _merge_deep(from_tools, dict(permission)) if from_tools else dict(permission)
-    rules: list[_Rule] = []
-    for key, value in combined.items() if isinstance(combined, dict) else ():
-        if isinstance(value, str):
-            rules.append(_Rule(key, "*", value))
-        elif isinstance(value, dict):
-            rules.extend(_Rule(key, pattern, action) for pattern, action in value.items())
-    return rules
-
-
-def _wildcard(key: str) -> re.Pattern[str]:
-    """opencode's ``Wildcard.match`` pattern for *key* [code: K/util/wildcard.ts]."""
-    escaped = re.sub(r"[.+^${}()|\[\]\\]", lambda match: "\\" + match.group(0), key.replace("\\", "/"))
-    escaped = escaped.replace("*", ".*").replace("?", ".")
-    if escaped.endswith(" .*"):
-        escaped = escaped[:-3] + "( .*)?"
-    # Windows matches case-insensitively; opencode runs on the machine the import runs on.
-    flags = re.DOTALL | (re.IGNORECASE if sys.platform == "win32" else 0)
-    return re.compile("^" + escaped + "$", flags)
-
-
-def _matches(name: str, key: str) -> bool:
-    return _wildcard(key).match(name.replace("\\", "/")) is not None
-
-
-def _covers_all(key: str, prefix: str) -> bool:
-    """Whether the rule *key* matches every tool name starting with *prefix*.
-
-    A pattern ending in ``*`` that matches the prefix alone matches it followed by anything.
-    """
-    return key.endswith("*") and _matches(prefix, key)
-
-
-def _may_match(key: str, prefix: str) -> bool:
-    """Whether the rule *key* may match some tool name starting with *prefix*.
-
-    A key without wildcards names one tool; otherwise its text before the first
-    wildcard must agree with the prefix as far as both go.
-    """
-    key, prefix = _fold(key), _fold(prefix)
-    wildcard = min((index for index in (key.find("*"), key.find("?")) if index != -1), default=-1)
-    if wildcard == -1:
-        return key.startswith(prefix)
-    head = key[:wildcard]
-    return head.startswith(prefix) or prefix.startswith(head)
-
-
-def _fold(text: str) -> str:
-    return text.casefold() if sys.platform == "win32" else text
-
-
-def _is_exact(key: str) -> bool:
-    return "*" not in key and "?" not in key
-
-
-def _tool_access(name: str, merged: _Merged) -> tuple[list[str] | None, list[ImportWarning]]:
-    """The tools iCode should offer, after the rules opencode applies to this server's tool names.
-
-    opencode applies the last rule whose key matches a tool's name, and hides
-    the tool when that rule denies it for every pattern
-    [code: packages/opencode/src/permission/index.ts:204-219]. Only the last
-    rule covering every tool of the server and the rules after it matter.
-    """
-    prefix = _TOOL_NAME_UNSAFE_RE.sub("_", name) + "_"
-    rules = _rules(merged.tools, merged.permission)
-    baseline_index = max((index for index, rule in enumerate(rules) if _covers_all(rule.key, prefix)), default=-1)
-    hidden_by = ""
-    if baseline_index != -1:
-        rule = rules[baseline_index]
-        if rule.action == "deny" and rule.pattern == "*":
-            hidden_by = rule.key
-    ignored: list[str] = []
-    # Under a hidden baseline, the tools a later rule names exactly, and whether they end up shown.
-    named: dict[str, bool] = {}
-    for rule in rules[baseline_index + 1 :]:
-        if not _may_match(rule.key, prefix):
-            continue
-        hides = rule.action == "deny" and rule.pattern == "*"
-        if hidden_by and _is_exact(rule.key):
-            named[rule.key] = not hides
-            continue
-        if hidden_by:
-            for tool in named:
-                if _matches(tool, rule.key):
-                    named[tool] = not hides
-        if hides != bool(hidden_by):
-            ignored.append(rule.key)
-    for agent, agent_rules in merged.agents.items():
-        if not isinstance(agent_rules, dict):
-            continue
-        agent_list = _rules(agent_rules.get("tools", {}), agent_rules.get("permission", {}))
-        ignored.extend(f"{agent}: {rule.key}" for rule in agent_list if _may_match(rule.key, prefix))
-    warnings: list[ImportWarning] = []
-    allowed: list[str] | None = None
-    if hidden_by:
-        allowed = [tool[len(prefix) :] for tool, shown in named.items() if shown]
-        warnings.append(ImportWarning(ImportWarningKind.TOOLS_LIMITED, field=hidden_by, original=", ".join(allowed)))
-    if ignored:
-        warnings.append(ImportWarning(ImportWarningKind.TOOL_RULES_IGNORED, original=", ".join(dict.fromkeys(ignored))))
-    return allowed, warnings
