@@ -59,7 +59,7 @@ When you resume a long conversation, iCode shows its most recent part first so y
 
 A resumed conversation shows the model's saved thinking folded to one line above the reply it led to: **Thought:**, followed by how the thinking begins; click it to unfold it. If a reply was interrupted or failed, the thinking shown for the request that was cut off is not saved, so it does not appear.
 
-Successful turns also fold their intermediate activity by default. Each mid-turn user addition, and each compaction card from compacting during the turn, stays visible and starts a separate activity section. Its header counts the section's tool calls and what they were, for example `12 tool calls · 8 reads · 4 commands`, ending with how many failed or were interrupted, if any; a section without tool calls, or in compressed history, reads **Activity**. Click the header to inspect that section while keeping its inner details in their current state. A section holding only a thinking block, or only text between tool calls, folds to that block's own row instead. For keyboard access, `/fold` toggles activity sections, tool groups, thinking and text between tool calls together: it collapses them if any are open, and expands them otherwise. Thinking that is still being written and controls waiting for your input are left as they are. Copy commands still include intermediate replies and keep their original message counts. Turn off **Automatically fold completed turns** in [Settings](../configuration/settings.md#display-preferences) to keep future completed turns and subsequently opened sessions expanded. The last turn recovered from a crash stays open.
+Successful turns also fold their intermediate activity by default. Each mid-turn user addition, and each compaction card from compacting during the turn, stays visible and starts a separate activity section. Its header counts the section's tool calls and what they were, for example `12 tool calls: 8 reads · 4 commands`, ending with how many failed or were interrupted, if any; a section without tool calls, or in compressed history, reads **Activity**. Click the header to inspect that section while keeping its inner details in their current state. A section holding only a thinking block, or only text between tool calls, folds to that block's own row instead. For keyboard access, `/fold` toggles activity sections, tool groups, thinking and text between tool calls together: it collapses them if any are open, and expands them otherwise. Thinking that is still being written and controls waiting for your input are left as they are. Copy commands still include intermediate replies and keep their original message counts. Turn off **Automatically fold completed turns** in [Settings](../configuration/settings.md#display-preferences) to keep future completed turns and subsequently opened sessions expanded. The last turn recovered from a crash stays open.
 
 Clicking an activity header keeps focus in the input field. A restored turn waiting for sub-agents stays open. Compressed history shows only some tool details, so these sections are all labeled **Activity**.
 
@@ -109,6 +109,29 @@ Before starting, finish the current task and close other iCode instances, then f
 5. Close all iCode instances and restart, then press **F1** to open the "Chat Sessions" window and confirm that important sessions appear and can be resumed.
 
 Migration keeps the original data in the source directory; it is not deleted automatically. After confirming that migration is complete, if you need to free up space, close iCode and archive or delete the old `sessions` directory shown under "From" in the migration window. Manual deletion cannot be undone.
+
+## Check token usage and speed
+
+While an agent replies, the status bar above the input shows how fast text is arriving, for example `92 tok/s`. It goes away when no text has arrived for a few seconds, such as while a tool runs. It is a rough figure counted from the text on screen.
+
+To see usage across all your sessions, type `/usage`. The window has two tabs: click one, or press **Tab**, to switch. The window's bottom border lists the keys for the tab you are on, and **Esc** closes it. The numbers are from when the window opened; type `/usage` again for newer ones.
+
+**Overview** shows one date range at a time. Click a range at the top, or press the left and right arrow keys:
+
+- **New**: the tokens this range added: input the provider did not serve from its cache, plus output, including thinking. This is the number to watch; cached input is listed separately because it is much larger and usually costs much less.
+- **Hit**: how much of the input came from the provider's cache.
+- **Trend**: new tokens over the range: hour by hour for **Today**, day by day for **This week**. For a longer range, click **Daily** or **Weekly**, or press **t**. A column with only the faint pattern has no new tokens.
+- **Group**: a table of totals by model, by source (the main agent, sub-agents, workflow nodes and background tasks such as session titles) or by project. Click a button above the table or press **g** to switch. The up and down arrow keys, or a click, move between rows. On a narrow window the table shows fewer columns.
+- **TPS**: tokens per second, how fast a model produced output, from its first chunk to the end of the response, across all the requests that streamed. It depends on your provider and your network, so it may differ from a provider's published speed.
+
+**Calendar** shows one month of new tokens, with stronger colors on heavier days; the line under the calendar says what each color means, or only the lowest and highest on a narrow window. When the window has room, each day also shows its tokens. Click a day or use the arrow keys, and the panel beside the calendar shows that day's numbers and top models; a very narrow window leaves the panel out. Click the arrows beside the month, or press **[** and **]**, to change the month.
+
+Keep in mind:
+
+- Days follow your computer's time zone, and weeks start on Monday.
+- Requests that ended before the provider reported usage count as calls but add no tokens. The line at the bottom of **Overview** says how many there were in the range, and the foot of the day panel says how many on that day.
+- Deleted sessions and external ACP agents are not counted.
+- Sessions saved by older versions may show fewer cache reads for DeepSeek and no usage for requests that failed partway.
 
 ## Inspect session timing
 
