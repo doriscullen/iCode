@@ -8065,6 +8065,12 @@ msgstr ""
 msgid "tui.mcp.import.field.enabled.no"
 msgstr ""
 
+#. English: MCP Request Timeout
+#. chrys-meta={"fingerprint":"b8da2c6735ce5517e668a51e9084fc34eed4ba0716d3e83f2c36b9ccfa03fa43","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.field.request_timeout"
+msgstr ""
+
 #. English: Scope in {agent}
 #. chrys-meta={"fingerprint":"d32ca91b1caf8005ae77be6ca0c0e2ef80141e70924e67ed38c1bf108130989f","multiline":false,"placeholders":["agent"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
@@ -8095,14 +8101,15 @@ msgstr ""
 msgid "tui.mcp.import.loading"
 msgstr ""
 
-#. English: No supported agents found on this machine. Supported: {agents}.
-#. chrys-meta={"fingerprint":"cb251dba4a7e30b92da8392c3652e0487874331ab22894d3e29ae93d59942404","multiline":false,"placeholders":["agents"]}
+#. English: No MCP configuration found for supported applications: {agents}.
+#. chrys-meta={"fingerprint":"8de491163fc65578d2e48d750275293817e2f12e99ab99af9cbaa71ad919dcd1","multiline":false,"placeholders":["agents"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.no_agents"
 msgstr ""
 
-#. English: Couldn't read the MCP servers of {agent}.
-#. chrys-meta={"fingerprint":"a1c7c4365935e41b3f09f547604b6cea04dc63ea591c26ad664621b08cc4092c","multiline":false,"placeholders":["agent"]}
+#. English: Couldn't read the MCP servers of {agent}. Check file permissions
+#. and the log, then reopen import.
+#. chrys-meta={"fingerprint":"87d296e0d72600f96d14f21d217ff20fa0488963369220a984c6a3e7ed10014c","multiline":false,"placeholders":["agent"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.read_failed"
 msgstr ""
@@ -8164,22 +8171,37 @@ msgstr ""
 msgid "tui.mcp.import.source_error.invalid_toml"
 msgstr ""
 
-#. English: {path} does not contain a settings object.
-#. chrys-meta={"fingerprint":"65e1399ec73942b810e9cf7ad46d9117a9f681af02f71bbd0ce8a9bbb1c12f91","multiline":false,"placeholders":["path"]}
+#. English: {path} must contain a JSON object at the top level. Fix the file,
+#. then reopen import.
+#. chrys-meta={"fingerprint":"f45def2aa339134829f824363c28ad0cf1036046c427d8b6aee86cd4fdaf83f9","multiline":false,"placeholders":["path"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.source_error.not_an_object"
 msgstr ""
 
-#. English: {path} is too large to read.
-#. chrys-meta={"fingerprint":"8619ff31d6bb50d956bd62d069826401ea5f7e464c8091d54b74271ae59dae2a","multiline":false,"placeholders":["path"]}
+#. English: {path} exceeds the {limit_mib} MiB file size limit. Reduce its
+#. size, then reopen import.
+#. chrys-meta={"fingerprint":"bf421cae8018d2e6a61db809bc971f414e8681793364bd5130b2fb9e49f9cb7b","multiline":false,"placeholders":["limit_mib","path"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.source_error.too_large"
 msgstr ""
 
-#. English: Couldn't read {path}.
-#. chrys-meta={"fingerprint":"9e7395fc22732492a354c752115e3b0d8c629c3d71d1a2afcad3a28c3691d925","multiline":false,"placeholders":["path"]}
+#. English: Couldn't read {path}. Check file permissions, fix the problem, then
+#. reopen import.
+#. chrys-meta={"fingerprint":"ed13180d625890d9044bb9921e5678c3f4099917b646199fce5674a552213572","multiline":false,"placeholders":["path"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.source_error.unreadable"
+msgstr ""
+
+#. English: {seconds} s (source: {milliseconds} ms)
+#. chrys-meta={"fingerprint":"f7949623925e2afcddfeb686335070dff336429defb89a7b341f34bf833efca9","multiline":false,"placeholders":["milliseconds","seconds"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.timeout.converted"
+msgstr ""
+
+#. English: {seconds} s
+#. chrys-meta={"fingerprint":"97f0ce2592c1df38fc1daf90c7dc1c4a4b5c01e470b5dfe8cb1f3d8bccaaeea2","multiline":false,"placeholders":["seconds"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.timeout.seconds"
 msgstr ""
 
 #. English: Import from Other Applications
@@ -8245,6 +8267,12 @@ msgstr ""
 msgid "tui.mcp.import.unsupported.variable_name"
 msgstr ""
 
+#. English: Action:
+#. chrys-meta={"fingerprint":"82a1983b7f133ebc2f702746b4cae0b3999f67981bb27ae02af146485f7e801e","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.action"
+msgstr ""
+
 #. English: This server is configured in {agent} to authenticate with a
 #. {provider} sign-in token. {app} doesn't support this authentication method.
 #. If authentication is required, configure an Authorization header under
@@ -8264,11 +8292,31 @@ msgstr ""
 msgid "tui.mcp.import.warning.claude_project_dir"
 msgstr ""
 
-#. English: {field} references {variable}, which {agent} sends to a remote
-#. server as empty, so {app} imports it as empty too; a header left blank is
-#. not imported. To send this credential, copy it into a variable with another
-#. name and reference that.
-#. chrys-meta={"fingerprint":"fc03e8ff6ebb0a7e3bfd3c786185591fcf41dbae92a5e3f77908261dde05dbe7","multiline":false,"placeholders":["agent","app","field","variable"]}
+#. English: To send this credential, reference another variable containing it.
+#. chrys-meta={"fingerprint":"873d94580e039429c9f3fa5eaffccc3c37e2f7c339ff384e7871c67fa1307d38","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.credential.action"
+msgstr ""
+
+#. English: References to {variable} are replaced with an empty string; other
+#. text is kept. A header left entirely empty after trimming is omitted.
+#. chrys-meta={"fingerprint":"fb608a69cace3af73737ed209c0a1d26dd87b4bfdd73b72dd63218559452463e","multiline":false,"placeholders":["variable"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.credential.effect"
+msgstr ""
+
+#. English: Credential variable references will be removed
+#. chrys-meta={"fingerprint":"cb1dd2731a9cfc7540cff215c5ae09768685634f5fef0628bd9a80211c09596c","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.credential.title"
+msgstr ""
+
+#. English: {field} references {variable}, which {agent} replaces with an empty
+#. string for remote servers. {app} replaces that variable reference with an
+#. empty string too; other text in the value is kept. A header is omitted only
+#. if this leaves its entire value empty after trimming. To send this
+#. credential, copy it into a variable with another name and reference that.
+#. chrys-meta={"fingerprint":"ad18595674ce0e39393ef47667413e0ef659e47eab907492a885951a6865e123","multiline":false,"placeholders":["agent","app","field","variable"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.credential_variable"
 msgstr ""
@@ -8278,6 +8326,25 @@ msgstr ""
 #. chrys-meta={"fingerprint":"4b2351dd31d2fd672a93e7b45812415ab30abf4e52ae997cc8c4fe2b947a71dd","multiline":false,"placeholders":["agent","app","folder"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.cwd_ignored"
+msgstr ""
+
+#. English: Set {variable} before starting {app}, or enter a fixed value in
+#. these fields.
+#. chrys-meta={"fingerprint":"e7b9f5164e43e36418285bd2ad60731c0e84988200c6fa1f8289f73d7861ce13","multiline":false,"placeholders":["app","variable"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.default.action"
+msgstr ""
+
+#. English: The variable default in these fields will not be kept: {fields}.
+#. chrys-meta={"fingerprint":"5b111d1d4b2fed99d67138512c183119a0d5a9bcb51212c1a0320ec027e6ff7e","multiline":false,"placeholders":["fields"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.default.note"
+msgstr ""
+
+#. English: Variable defaults will not be kept
+#. chrys-meta={"fingerprint":"3be71c4ff4d4799bd30e14bfe612d43fdb85d77c71a0282597c20dbeab9f05a0","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.default.title"
 msgstr ""
 
 #. English: {field} gave {variable} a default value. {app} variables can't have
@@ -8296,6 +8363,18 @@ msgstr ""
 msgid "tui.mcp.import.warning.deny_list"
 msgstr ""
 
+#. English: Impact:
+#. chrys-meta={"fingerprint":"647b2ed40280d1ea9fecc2d62f31961d185197f093c7438a57d58b03d447eb66","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.effect"
+msgstr ""
+
+#. English: Affected fields:
+#. chrys-meta={"fingerprint":"4ba13a3994de65f7a94bd0fafa61d79c9856b4f474cfba996e3dd5e1702bf1d5","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.fields"
+msgstr ""
+
 #. English: The headers helper is not imported: it returns a set of headers,
 #. while {app} credential commands supply one value. Add the headers under
 #. Headers yourself. For a value supplied by a command, configure {template}
@@ -8303,6 +8382,13 @@ msgstr ""
 #. chrys-meta={"fingerprint":"c8a592be73aec147de3dd4d7a067d074c78457ee91fd1e398553e9baff376097","multiline":false,"placeholders":["app","template"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.headers_helper_ignored"
+msgstr ""
+
+#. English: Literal braces are escaped using {app} syntax; the text received by
+#. the server is unchanged.
+#. chrys-meta={"fingerprint":"8a8b609593dd193b75852d0cac00c2409cdfa778c4c3b4b33e18d5d5a34c94d8","multiline":false,"placeholders":["app"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.literal_braces_escaped"
 msgstr ""
 
 #. English: {agent} combines this server's settings from more than one file.
@@ -8320,9 +8406,17 @@ msgstr ""
 msgid "tui.mcp.import.warning.merged.values"
 msgstr ""
 
-#. English: OAuth sign-in is not imported. If this server requires it,
-#. configure an Authorization header in {app}.
-#. chrys-meta={"fingerprint":"ff7cb79c169892c901d4dffeb2379963de24051f79dd2dea3883e85f5a45197d","multiline":false,"placeholders":["app"]}
+#. English: Note:
+#. chrys-meta={"fingerprint":"4d7253bcdd5ded6606e6acbd2e11ebe3dff0acf71ffdf6b8610e511b68fd62bb","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.note"
+msgstr ""
+
+#. English: OAuth settings and sign-in state are not imported. {app} does not
+#. manage the OAuth login or token refresh flow. If the server accepts a
+#. manually supplied valid token or supports another authentication method,
+#. configure authentication headers as it requires.
+#. chrys-meta={"fingerprint":"d2b4bff98de9b83e41d8f3aa13e9418671ec6c7b3fa42c4661461ae76fe7d101","multiline":false,"placeholders":["app"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.oauth_ignored"
 msgstr ""
@@ -8335,9 +8429,34 @@ msgstr ""
 msgid "tui.mcp.import.warning.optional_variable"
 msgstr ""
 
+#. English: Enter the required folder path in these fields, or set {variable}
+#. before starting {app}.
+#. chrys-meta={"fingerprint":"5bea5c8ac4b3a619cf1c622c75897900bd2062948313ce572f3bacee47354a04","multiline":false,"placeholders":["app","variable"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.project_dir.action"
+msgstr ""
+
+#. English: {app} does not set {variable} automatically.
+#. chrys-meta={"fingerprint":"02a8e8643b7a7ac295bff9e381564c05d9229c6ba4e34e43c4b9fca164dcf173","multiline":false,"placeholders":["app","variable"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.project_dir.effect"
+msgstr ""
+
+#. English: Configure the project folder manually
+#. chrys-meta={"fingerprint":"77110c7ebaeda68d2de8499261941932d0ada4cd373830bdee2011c8632a6bf6","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.project_dir.title"
+msgstr ""
+
+#. English: Imported value:
+#. chrys-meta={"fingerprint":"7435f480d40d5a695477a8f6030a408cb4d6877afe9261bf6ed4a5782a12b8b6","multiline":false,"placeholders":[]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.result"
+msgstr ""
+
 #. English: Tool permissions from {agent} are not imported ({fields}).
-#. Configure tool access and approval in {app}.
-#. chrys-meta={"fingerprint":"54128f224ce22f1005055402aa046057fb7530f57d41dc9f62c1a6de95ceb4fb","multiline":false,"placeholders":["agent","app","fields"]}
+#. Configure Available Tool Scope and approval rules in {app}.
+#. chrys-meta={"fingerprint":"772bd15022f4d712e34b0cd2952a3f485c5b7fa4f3d4d688a026215922856703","multiline":false,"placeholders":["agent","app","fields"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.tool_permissions_ignored"
 msgstr ""

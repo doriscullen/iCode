@@ -67,12 +67,14 @@ What to know about imported servers, whichever agent they come from:
 
 - Values are copied as they are, including tokens and passwords in environment variables and headers. iCode saves them in the agent file, which only your user account can read. Surrounding whitespace is removed from header values.
 - Environment variable references are changed to iCode's form, `{{NAME}}`. Set each variable before starting iCode: iCode fails the connection when one is not set.
-- iCode never signs in to a server with OAuth: it only sends the headers you enter. If the other agent signed in to a server for you, add an `Authorization` header yourself.
+- OAuth settings and sign-in state are not imported. iCode does not manage the OAuth login or token refresh flow. If the server accepts a valid token you supply or supports another authentication method, configure authentication headers as it requires, for example `Authorization: Bearer <access-token>`. Replace an expired token if you entered it directly. You can also configure `Bearer {{!tokenprovider gettoken}}` if an external command obtains or refreshes the token; see [Move command values and headers helpers manually](#move-command-values-and-headers-helpers-manually).
 - Settings iCode has no equivalent for are not imported, and a warning names them, such as a working folder for the server (iCode always starts it in the current working folder).
 - Servers whose command or URL uses an environment variable cannot be imported. Some environment variable and header values also cannot be converted, such as `{${TOKEN}}`. Expand an unavailable server's card to read the reason, then adjust the source configuration or add the server manually.
 - Servers already configured in the current agent cannot be selected again. Servers with different environment variables, headers, enabled states or tool scopes can be imported separately even if their command or URL is the same. If "Save" reports duplicate names, rename one of the servers.
 - The same server may be listed more than once, for example as both a "user" and a "project" server, or in two agents. Once you tick one, other cards with the same settings are locked and say which one is ticked, so the server is imported only once. Untick it to choose another.
 - If a configuration file can't be read, or the agent itself would reject its MCP settings, a message at the top of the list names the file, and its servers are not listed.
+
+If no configuration is found, this means no supported application's MCP configuration was found, even if the application is installed. Files must not exceed 16 MiB; a JSON file must contain a JSON object at the top level. Check file permissions, size and format, fix the problem, then reopen import.
 
 ### Claude Code
 
@@ -85,11 +87,14 @@ iCode lists the servers Claude Code uses, labeled as Claude Code labels them:
 Entries Claude Code itself doesn't load are not listed, such as a URL with no `type`, an incomplete command, a setting of the wrong type, or a name Claude Code keeps for its own servers, such as `workspace`. Also:
 
 - `${GITHUB_TOKEN}` becomes `{{GITHUB_TOKEN}}`. Defaults such as `localhost` in `${HOST:-localhost}` are not imported. Set the variable before starting iCode, or replace the reference with the value you want.
+- Variable references stay dynamic. Leading or trailing whitespace supplied by an HTTP header variable is not removed after expansion and may cause an `Illegal header value` connection error. Remove that whitespace from the variable before starting iCode.
 - If a variable is not set, Claude Code passes the reference on as written, for example the text `${API_KEY}`, and warns about it in `claude mcp list`. iCode fails the connection instead, so set the variable before starting iCode.
-- iCode does not set `CLAUDE_PROJECT_DIR`. If a server depends on it, set it before starting iCode or replace references with the required folder path.
-- References to credential variables such as `ANTHROPIC_API_KEY` in remote server headers are imported as empty values, matching Claude Code's behavior. Empty headers are omitted, and `Bearer ${ANTHROPIC_API_KEY}` becomes `Bearer`. Check the authentication headers; if you need to send the credential, copy it into a variable with another name and reference that.
-- The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
-- Headers helpers and OAuth settings are not imported. Add the required headers yourself; for command-based headers, see [Move command values and headers helpers manually](#move-command-values-and-headers-helpers-manually).
+- A server may depend on capabilities Claude Code provides beyond the imported configuration. iCode does not set `CLAUDE_PROJECT_DIR` or provide MCP roots. If a server needs that variable, even without referencing it in the configuration, set it before starting iCode. For a server that needs roots, check whether it can use the working folder or an explicitly configured folder instead.
+- References to credential variables such as `ANTHROPIC_API_KEY` in remote server headers are replaced with an empty string, matching Claude Code's behavior. Other text is kept: `Bearer ${ANTHROPIC_API_KEY}` becomes `Bearer`, while a header containing only the removed reference is omitted. Check the authentication headers; if you need to send the credential, copy it into a variable with another name and reference that.
+- Literal braces in environment variables and headers are escaped using iCode syntax. A note appears only when escaping occurs: `{{literal}}` appears as `{{{{literal}}}}` in the configuration, but the server still receives `{{literal}}`. This is literal text, not an environment reference.
+- The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. The preview shows the final value and the source milliseconds when the duration changes, for example 1501 milliseconds becomes 2 seconds. An entry without a configured timeout shows no explicit timeout. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
+- HTTP `toolPermissions` limits are not migrated. Check "Available Tool Scope" and approval rules before using the imported tools.
+- Headers helpers, OAuth settings and sign-in state are not imported. If the server accepts a valid token you supply or supports another authentication method, configure the required authentication headers. iCode does not manage the OAuth login or token refresh flow. For command-based headers, see [Move command values and headers helpers manually](#move-command-values-and-headers-helpers-manually).
 - SSE and WebSocket servers can't be imported: iCode supports only STDIO and HTTP servers. The `streamable-http` type is read as HTTP.
 - iCode requires Streamable HTTP for remote servers. If "Test" fails, check whether the server offers a Streamable HTTP address; an SSE-only server cannot connect even if Claude Code lists it as HTTP.
 
@@ -127,7 +132,7 @@ Also:
 - A server opencode has turned off (`"enabled": false`) is imported turned off. Tick "Enabled" in its card to use it.
 - `timeout` in milliseconds becomes "MCP Request Timeout" in seconds, rounded up; without it, `experimental.mcp_timeout` is used. iCode also waits at most that long to connect.
 - Global `tools`, `permission`, `permissions`, `OPENCODE_PERMISSION` and agent-specific permission rules are not migrated. Configure "Available Tool Scope" and approval rules in iCode.
-- opencode enables OAuth by default unless `oauth` is `false`. The card warns that OAuth sign-in is not imported, even when the source configuration has no explicit `oauth` object. Configure authentication headers if the server requires them.
+- opencode enables OAuth by default unless `oauth` is `false`. The card warns that OAuth sign-in is not imported, even when the source configuration has no explicit `oauth` object. If the server accepts a valid token you supply or supports another authentication method, configure the required authentication headers. iCode does not manage the OAuth login or token refresh flow.
 - opencode also connects to a remote server over SSE when it doesn't support HTTP; iCode doesn't.
 
 ### pi

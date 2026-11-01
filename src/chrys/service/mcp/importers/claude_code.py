@@ -211,6 +211,7 @@ _HTTP_FIELDS = frozenset(
         "bareElicitationCapability",
         "discoveryCache",
         "role",
+        "toolPermissions",
     }
 )
 
@@ -504,7 +505,15 @@ def _stdio_candidate(name: str, entry: dict[str, Any], scope: str, source_path: 
         env=converted_env,
         request_timeout=_request_timeout(entry, remote=False),
     )
-    return McpImportCandidate(name, scope, source_path, config, warnings=warnings, transport="stdio")
+    return McpImportCandidate(
+        name,
+        scope,
+        source_path,
+        config,
+        warnings=warnings,
+        transport="stdio",
+        timeout_source_ms=int(entry["timeout"]) if config.request_timeout is not None else None,
+    )
 
 
 def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: str) -> McpImportCandidate | None:
@@ -527,6 +536,10 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
         warnings = (*warnings, ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED))
     if "oauth" in entry:
         warnings = (*warnings, ImportWarning(ImportWarningKind.OAUTH_IGNORED))
+    # HTTP toolPermissions caps the loaded tools' permissions [binary 2.1.316].
+    # tools.permission_policy is only confirmed for dynamic SDK servers, not these file scopes.
+    if entry.get("toolPermissions"):
+        warnings = (*warnings, ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original="toolPermissions"))
     warnings = (*warnings, *_unknown_fields(entry, _HTTP_FIELDS))
     config = MCPServerConfig(
         name=name,
@@ -535,7 +548,17 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
         headers=converted_headers,
         request_timeout=_request_timeout(entry, remote=True),
     )
-    return McpImportCandidate(name, scope, source_path, config, warnings=warnings, transport="http")
+    return McpImportCandidate(
+        name,
+        scope,
+        source_path,
+        config,
+        warnings=warnings,
+        transport="http",
+        timeout_source_ms=int(entry.get("timeout", entry.get("request_timeout_ms")))
+        if config.request_timeout is not None
+        else None,
+    )
 
 
 def _convertible(values: dict[str, str], *, read_as_empty: frozenset[str] = frozenset()) -> bool:
@@ -551,6 +574,8 @@ def _convert_mapping(
     for key, value in values.items():
         converted[key], value_warnings = convert_dollar_templates(value, read_as_empty=read_as_empty)
         warnings.extend(replace(warning, field=key) for warning in value_warnings)
+    if any("{{{{" in value or "}}}}" in value for value in converted.values()):
+        warnings.append(ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED))
     return converted, tuple(warnings)
 
 

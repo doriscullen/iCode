@@ -188,8 +188,33 @@ ImportMcpServersDialog {
     text-style: italic;
 }
 
-#mcp-import-servers .mcp-import-warning {
+#mcp-import-servers .mcp-import-warning,
+#mcp-import-servers .mcp-import-warning-label,
+#mcp-import-servers .mcp-import-warning-value {
     color: $warning;
+}
+
+#mcp-import-servers .mcp-import-warning-group {
+    height: auto;
+}
+
+#mcp-import-servers .mcp-import-warning-title {
+    text-style: bold;
+}
+
+#mcp-import-servers .mcp-import-warning-fields {
+    grid-size: 2;
+    grid-columns: auto 1fr;
+    grid-rows: auto;
+    grid-gutter: 0 1;
+    height: auto;
+    padding: 0 0 0 2;
+}
+
+#mcp-import-servers .mcp-import-warning-label,
+#mcp-import-servers .mcp-import-warning-value {
+    height: auto;
+    min-width: 0;
 }
 
 /* Said once above the cards: what importing a folder-only server changes. */

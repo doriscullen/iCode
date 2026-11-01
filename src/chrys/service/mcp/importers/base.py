@@ -69,6 +69,7 @@ class ImportWarningKind(StrEnum):
     TOOLS_LIMITED = "tools_limited"
     OPTIONAL_VARIABLE = "optional_variable"
     DENY_LIST = "deny_list"
+    LITERAL_BRACES_ESCAPED = "literal_braces_escaped"
 
 
 class SourceErrorKind(StrEnum):
@@ -138,6 +139,8 @@ class McpImportCandidate:
     entry: Mapping[str, Any] | None = None
     transport: str = ""
     scope_path: str = ""
+    # Preview metadata only; the connection uses config.request_timeout in seconds.
+    timeout_source_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

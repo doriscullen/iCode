@@ -772,6 +772,8 @@ def test_timeout_in_milliseconds_becomes_a_request_timeout_in_seconds(
 
     assert local.config is not None and remote.config is not None
     assert (local.config.request_timeout, remote.config.request_timeout) == (request_timeout, request_timeout)
+    expected_source_ms = timeout if request_timeout is not None else None
+    assert local.timeout_source_ms == remote.timeout_source_ms == expected_source_ms
     assert local.warnings == remote.warnings == ()
 
 
@@ -805,6 +807,9 @@ def test_a_remote_server_without_a_timeout_takes_its_request_timeout_ms(
 
     assert candidate.config is not None
     assert candidate.config.request_timeout == request_timeout
+    assert candidate.timeout_source_ms == (
+        entry_timeouts.get("timeout", entry_timeouts.get("request_timeout_ms")) if request_timeout is not None else None
+    )
     assert candidate.warnings == ()
 
 
@@ -857,7 +862,8 @@ def test_fields_icode_has_no_setting_for_are_listed_once(home: Path) -> None:
     assert plain.warnings == internal.warnings == remote_internal.warnings == ()
     # Per-tool approval rules have no iCode counterpart in a server's settings.
     assert permissions.warnings == (
-        ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="tools, toolPermissions"),
+        ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original="toolPermissions"),
+        ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="tools"),
     )
 
 
