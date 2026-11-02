@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,9 @@ from chrys.service.mcp.importers import (
 )
 from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS, render_template
 from chrys.service.mcp.importers.pi import PiSource, _value_parts
-from chrys.service.profiles.agents.schema import MCPServerConfig
+from chrys.service.profiles.agents.loader import load_profile_from_yaml
+from chrys.service.profiles.agents.schema import AgentProfile, MCPServerConfig, ToolsConfig
+from chrys.service.profiles.agents.serializer import save_profile
 
 
 @pytest.fixture
@@ -115,12 +118,14 @@ def test_stdio_and_http_servers_are_converted(home: Path) -> None:
         request_timeout=13,
     )
     assert (candidates["files"].scope, candidates["files"].transport) == ("global", "stdio")
-    assert candidates["files"].warnings == ()
+    assert candidates["files"].warnings == (ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED),)
+    assert candidates["files"].timeout_source_seconds == 12.5
     assert candidates["docs"].config == MCPServerConfig(
         name="docs",
         transport="http",
         url="https://docs.test/mcp",
         headers={"Authorization": "Bearer {{DOCS_TOKEN}}"},
+        request_timeout=60,
         use_progressive_disclosure=True,
     )
     assert candidates["docs"].transport == "http"
@@ -329,19 +334,23 @@ def test_an_entry_with_a_url_connects_over_http_whatever_its_type(home: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("text", "kind"),
+    ("text", "kind", "field", "line", "column"),
     [
-        ('{"mcpServers": {},}', SourceErrorKind.INVALID_JSON),
-        ('// note\n{"mcpServers": {}}', SourceErrorKind.INVALID_JSON),
-        ('{"mcpServers": {"a": NaN}}', SourceErrorKind.INVALID_JSON),
-        ("[]", SourceErrorKind.NOT_AN_OBJECT),
-        ('{"mcpServers": []}', SourceErrorKind.INVALID_CONFIG),
+        ('{"mcpServers": {},}', SourceErrorKind.INVALID_JSON, "", 1, 18),
+        ('// note\n{"mcpServers": {}}', SourceErrorKind.INVALID_JSON, "", 1, 1),
+        ('{"mcpServers": {"a": NaN}}', SourceErrorKind.INVALID_JSON, "", None, None),
+        ("[]", SourceErrorKind.NOT_AN_OBJECT, "", None, None),
+        ('{"mcpServers": []}', SourceErrorKind.INVALID_CONFIG, "mcpServers", None, None),
     ],
 )
-def test_a_file_pi_skips_is_reported(home: Path, text: str, kind: SourceErrorKind) -> None:
+def test_a_file_pi_skips_is_reported(
+    home: Path, text: str, kind: SourceErrorKind, field: str, line: int | None, column: int | None
+) -> None:
     path = _write(home / ".pi" / "agent" / "mcp.json", text)
 
-    assert PiSource().discover(_context(home)) == McpImportResult(source_errors=(McpSourceError(str(path), kind),))
+    assert PiSource().discover(_context(home)) == McpImportResult(
+        source_errors=(McpSourceError(str(path), kind, field, line, column),)
+    )
 
 
 def test_pi_drops_one_leading_byte_order_mark(home: Path) -> None:
@@ -359,7 +368,9 @@ def test_a_second_byte_order_mark_makes_pi_skip_the_file(home: Path) -> None:
 
     result = PiSource().discover(_context(home))
 
-    assert result == McpImportResult(source_errors=(McpSourceError(str(path), SourceErrorKind.INVALID_JSON),))
+    assert result == McpImportResult(
+        source_errors=(McpSourceError(str(path), SourceErrorKind.INVALID_JSON, line=1, column=1),)
+    )
 
 
 def test_project_servers_replace_global_ones_and_overrides_adjust_them(home: Path, workspace: Path) -> None:
@@ -536,3 +547,167 @@ def test_a_timeout_pi_reads_as_infinity_is_listed_without_a_limit(home: Path, ti
     endless = candidates["endless"].config
     assert endless is not None
     assert endless.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS
+    assert candidates["endless"].timeout_source_seconds == math.inf
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("  https://example.test/mcp  ", "https://example.test/mcp"),
+        ("\x00\t\nhttps://example.test/mcp\r\n", "https://example.test/mcp"),
+        ("https://example.test/m\tc\np?label=a b", "https://example.test/mcp?label=a b"),
+        ("https://example.test/a b", "https://example.test/a b"),
+    ],
+)
+def test_urls_keep_valid_path_spaces_and_normalize_fetch_whitespace(home: Path, url: str, expected: str) -> None:
+    _global(home, {"server": {"url": url, "headers": {"Authorization": "Bearer fixture"}}})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.config is not None
+    assert candidate.config.url == expected
+
+
+@pytest.mark.parametrize("url", ["https://bad host.test/mcp", "https://example.test:bad/mcp"])
+def test_invalid_url_authorities_are_not_listed(home: Path, url: str) -> None:
+    _global(home, {"server": {"url": url}})
+
+    assert _discover(home) == ()
+
+
+def test_case_aliased_headers_combine_in_source_order_and_keep_references(home: Path) -> None:
+    _global(
+        home,
+        {
+            "server": {
+                "url": "https://example.test/mcp",
+                "headers": {"X-Test": " first ", "x-test": "$DYNAMIC", "X-TEST": "", "Authorization": "fixture"},
+            }
+        },
+    )
+
+    (candidate,) = _discover(home)
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"X-Test": "first, {{DYNAMIC}},", "Authorization": "fixture"}
+
+
+def test_empty_header_alias_keeps_internal_separator_but_not_trailing_wire_whitespace(home: Path) -> None:
+    _global(
+        home,
+        {
+            "middle": {"url": "https://example.test", "headers": {"X-Test": "first", "x-test": "", "X-TEST": "last"}},
+            "end": {"url": "https://example.test", "headers": {"X-Test": "first", "x-test": ""}},
+        },
+    )
+
+    candidates = _by_name(_discover(home))
+
+    middle, end = candidates["middle"].config, candidates["end"].config
+    assert middle is not None and middle.headers == {"X-Test": "first, , last"}
+    assert end is not None and end.headers == {"X-Test": "first,"}
+
+
+@pytest.mark.parametrize("value", ["café", "prefix-你好", "${TOKEN} café", "\udcff"])
+def test_non_ascii_header_literals_refuse_import_without_copying_values(home: Path, value: str) -> None:
+    _global(home, {"server": {"url": "https://example.test/mcp", "headers": {"X-Test": value}}})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.config is None
+    assert candidate.unsupported is UnsupportedReason.HEADER_VALUE_ENCODING
+    assert candidate.unsupported_field == "mcpServers.server.headers.X-Test"
+    assert candidate.unsupported_variable == ""
+
+
+def test_dynamic_header_values_are_not_read_at_import(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOKEN", "café")
+    _global(home, {"server": {"url": "https://example.test/mcp", "headers": {"X-Test": "$TOKEN"}}})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"X-Test": "{{TOKEN}}"}
+    assert candidate.warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
+
+
+@pytest.mark.parametrize("value", ["{{literal}}", "${BAD-NAME}}", "{{!never-run}}"])
+def test_escaped_literal_braces_are_explained_even_across_parser_parts(home: Path, value: str) -> None:
+    _global(home, {"server": {"command": "cmd", "env": {"VALUE": value}}})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.warnings == (ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED),)
+
+
+@pytest.mark.parametrize("value", ["literal", "$TOKEN", "$!literal", "${TOKEN:-fallback}"])
+def test_values_without_brace_escaping_have_no_escape_notice(home: Path, value: str) -> None:
+    _global(home, {"server": {"command": "cmd", "env": {"VALUE": value}}})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.warnings == ()
+
+
+@pytest.mark.parametrize(
+    ("entry", "field"),
+    [
+        ({"command": "cmd", "env": {"TOKEN": "!do-not-run"}}, "env.TOKEN"),
+        ({"url": "https://example.test", "headers": {"X-Test": "!do-not-run"}}, "headers.X-Test"),
+        ({"command": "cmd", "env": {"TOKEN": "{${TOKEN}"}}, "env.TOKEN"),
+    ],
+)
+def test_unsupported_fields_are_named_without_values(home: Path, entry: dict[str, Any], field: str) -> None:
+    _global(home, {"server": entry})
+
+    (candidate,) = _discover(home)
+
+    assert candidate.config is None
+    assert candidate.unsupported_field == "mcpServers.server." + field
+
+
+def test_relative_and_home_cwd_notices_name_the_source_folder(home: Path, workspace: Path) -> None:
+    _global(home, {"relative": {"command": "cmd", "cwd": "tools"}, "home": {"command": "cmd", "cwd": "~/tools"}})
+
+    candidates = _by_name(_discover(home, workspace))
+
+    assert candidates["relative"].warnings == (
+        ImportWarning(ImportWarningKind.CWD_IGNORED, field=str(workspace), original="tools"),
+    )
+    assert candidates["home"].warnings == (ImportWarning(ImportWarningKind.CWD_IGNORED, original=str(home / "tools")),)
+
+
+@pytest.mark.parametrize("timeout", [None, 1, 1.501, 10**30])
+def test_timeout_preview_metadata_only_records_changed_source_seconds(home: Path, timeout: int | float | None) -> None:
+    _global(home, {"server": {"command": "cmd", **({"timeout": timeout} if timeout is not None else {})}})
+
+    (candidate,) = _discover(home)
+
+    expected = timeout if timeout in (1.501, 10**30) else None
+    assert candidate.timeout_source_seconds == expected
+
+
+def test_invalid_utf8_has_an_encoding_diagnostic(home: Path) -> None:
+    path = home / ".pi" / "agent" / "mcp.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"mcpServers":{"secret-value":"\xff"}}')
+
+    assert PiSource().discover(_context(home)) == McpImportResult(
+        source_errors=(McpSourceError(str(path), SourceErrorKind.INVALID_ENCODING),)
+    )
+
+
+def test_pi_default_timeout_and_explicit_timeout_survive_profile_roundtrip(home: Path, tmp_path: Path) -> None:
+    _global(home, {"default": {"command": "cmd"}, "explicit": {"command": "cmd", "timeout": 1}})
+
+    candidates = _by_name(_discover(home))
+    default, explicit = candidates["default"].config, candidates["explicit"].config
+    assert default is not None and default.request_timeout == 60
+    assert explicit is not None and explicit.request_timeout == 1
+    path = save_profile(
+        AgentProfile(name="Pi Import", tools=ToolsConfig(mcp=[default, explicit])), target_dir=tmp_path / "profiles"
+    )
+    loaded = {server.name: server for server in load_profile_from_yaml(path).tools.mcp}
+
+    assert loaded["default"].request_timeout == 60
+    assert loaded["explicit"].request_timeout == 1

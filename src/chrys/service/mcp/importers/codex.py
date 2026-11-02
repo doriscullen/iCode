@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from chrys.foundation.platform.runtime_paths import strip_python_runtime_overrides
+from chrys.service.mcp.importers._codex_headers import HeaderIgnoreReason, normalize_codex_headers
 from chrys.service.mcp.importers.base import (
     ImportContext,
     ImportWarning,
@@ -65,7 +66,6 @@ from chrys.service.mcp.importers.base import (
     read_source_bytes,
     render_template,
     request_timeout_seconds,
-    trim_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -162,7 +162,11 @@ def _read(path: Path, errors: list[McpSourceError]) -> dict[str, Any]:
         return {} if raw is None else tomllib.loads(raw.decode("utf-8"))
     except SourceReadError as exc:
         errors.append(McpSourceError(str(path), exc.kind))
-    except UnicodeDecodeError, ValueError, RecursionError:
+    except UnicodeDecodeError:
+        errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_ENCODING))
+    except tomllib.TOMLDecodeError as exc:
+        errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_TOML, line=exc.lineno, column=exc.colno))
+    except ValueError, RecursionError:
         errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_TOML))
     return {}
 
@@ -210,7 +214,7 @@ def _add_layer(
 ) -> None:
     servers = document.get("mcp_servers", {})
     if not isinstance(servers, dict):
-        errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_CONFIG))
+        errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_CONFIG, field="mcp_servers"))
         return
     for name, value in servers.items():
         previous = entries.get(name)
@@ -329,7 +333,7 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
     if not stdio:
         shown["headers"] = value.get("http_headers", {})
 
-    def unsupported(reason: UnsupportedReason) -> McpImportCandidate:
+    def unsupported(reason: UnsupportedReason, *, field: str = "", variable: str = "") -> McpImportCandidate:
         return McpImportCandidate(
             name,
             entry.scope,
@@ -339,6 +343,8 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
             entry=shown,
             transport=transport,
             scope_path=entry.folder,
+            unsupported_field=field,
+            unsupported_variable=variable,
         )
 
     variables = value.get("env_vars", [])
@@ -352,6 +358,7 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
         if key.upper() in _NON_INHERITABLE:
             del env[key]
             warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=f"env.{key}"))
+    braces_escaped = any(env[key] != literal for key, literal in value.get("env", {}).items() if key in env)
     forwarded = {item if isinstance(item, str) else item["name"]: "" for item in variables}
     inherited = strip_python_runtime_overrides(dict(forwarded))
     for variable in sorted(forwarded.keys() - inherited.keys()):
@@ -359,29 +366,48 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
             continue
         env[variable] = render_template([TemplateVariable(variable)])
         warnings.append(ImportWarning(ImportWarningKind.OPTIONAL_VARIABLE, variable=variable, field=variable))
-    headers = {
-        key.lower(): trim_header_value(render_template([literal]))
-        for key, literal in value.get("http_headers", {}).items()
-    }
+    source_headers = normalize_codex_headers(
+        value.get("http_headers", {}),
+        value.get("env_http_headers", {}),
+        bearer_authorization="bearer_token_env_var" in value,
+    )
+    if source_headers.conflicts:
+        return unsupported(UnsupportedReason.HEADER_NAME_COLLISION, field=", ".join(source_headers.conflicts))
+    warnings.extend(
+        ImportWarning(
+            ImportWarningKind.INVALID_HEADER_IGNORED,
+            field=ignored_header.field,
+            original="name" if ignored_header.reason is HeaderIgnoreReason.INVALID_NAME else "value",
+        )
+        for ignored_header in source_headers.ignored
+    )
+    headers = {key: render_template([literal]) for key, literal in source_headers.static_headers.items()}
+    braces_escaped |= any(
+        headers[key] != literal
+        for key, literal in source_headers.static_headers.items()
+        if key not in source_headers.env_headers
+    )
     # Other env_vars are inherited. Python path overrides need explicit references because iCode
     # filters inherited ones; the warning explains that a reference requires a nonempty value.
-    references = {} if stdio else {key.lower(): variable for key, variable in value.get("env_http_headers", {}).items()}
+    references = source_headers.env_headers
+    reference_fields = {key.lower(): f"env_http_headers.{key}" for key in value.get("env_http_headers", {})}
     for key, variable in references.items():
-        if key == "authorization" and "bearer_token_env_var" in value:
-            continue
         if not _VARIABLE.fullmatch(variable):
-            return unsupported(UnsupportedReason.VARIABLE_NAME)
+            return unsupported(UnsupportedReason.VARIABLE_NAME, field=reference_fields[key], variable=variable)
         headers[key] = render_template([TemplateVariable(variable)])
         warnings.append(ImportWarning(ImportWarningKind.OPTIONAL_VARIABLE, variable=variable, field=key))
     if "bearer_token_env_var" in value:
         variable = value["bearer_token_env_var"]
         if not _VARIABLE.fullmatch(variable):
-            return unsupported(UnsupportedReason.VARIABLE_NAME)
+            return unsupported(UnsupportedReason.VARIABLE_NAME, field="bearer_token_env_var", variable=variable)
         headers["authorization"] = render_template(["Bearer ", TemplateVariable(variable)])
     if not stdio:
-        warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
-    if value.get("auth", "oauth") != "oauth":
-        warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=value["auth"]))
+        if value.get("auth", "oauth") == "oauth":
+            warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
+        else:
+            warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=value["auth"]))
+    if braces_escaped:
+        warnings.append(ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED))
     if "http_headers_helper" in value:
         # Helper arguments may contain credentials; expose the setting name, not the command.
         warnings.append(ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED))
@@ -389,13 +415,17 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
         warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=value["cwd"]))
     if entry.sources:
         warnings.append(ImportWarning(ImportWarningKind.MERGED, original=", ".join(entry.sources)))
-    permission_fields = value.keys() & {"tools", "default_tools_approval_mode"}
-    ignored = sorted(value.keys() - _CARRIED_FIELDS - permission_fields)
+    permission_fields, output_fields, ignored_tool_fields = _omitted_tool_fields(value)
+    ignored = sorted((value.keys() - _CARRIED_FIELDS - {"tools", "default_tools_approval_mode"}) | ignored_tool_fields)
     if ignored:
         warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=", ".join(ignored)))
     if permission_fields:
         warnings.append(
             ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original=", ".join(sorted(permission_fields)))
+        )
+    if output_fields:
+        warnings.append(
+            ImportWarning(ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED, original=", ".join(sorted(output_fields)))
         )
     allowed = value.get("enabled_tools")
     denied = value.get("disabled_tools", [])
@@ -406,7 +436,8 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
         warnings.append(ImportWarning(ImportWarningKind.DENY_LIST, original=", ".join(denied)))
     timeout = value.get("tool_timeout_sec", 300)
     if timeout == 0:
-        warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="tool_timeout_sec = 0"))
+        warnings.append(ImportWarning(ImportWarningKind.ZERO_TIMEOUT_IGNORED))
+    request_timeout = request_timeout_seconds(timeout) if timeout else None
     server = MCPServerConfig(
         name=name,
         transport=transport,
@@ -417,7 +448,7 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
         headers=headers,
         enabled=value.get("enabled", True),
         allowed_tools=allowed,
-        request_timeout=request_timeout_seconds(timeout) if timeout else None,
+        request_timeout=request_timeout,
     )
     return McpImportCandidate(
         name,
@@ -427,4 +458,29 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
         warnings=tuple(warnings),
         transport=transport,
         scope_path=entry.folder,
+        timeout_source_seconds=timeout if timeout and timeout != request_timeout else None,
     )
+
+
+def _omitted_tool_fields(value: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    permissions = {"default_tools_approval_mode"} if "default_tools_approval_mode" in value else set()
+    output_limits: set[str] = set()
+    ignored: set[str] = set()
+    if "tools" in value:
+        tools = value["tools"]
+        if not isinstance(tools, dict):
+            ignored.add("tools")
+        else:
+            for name, settings in tools.items():
+                if not isinstance(settings, dict):
+                    ignored.add(f"tools.{name}")
+                    continue
+                for key in settings:
+                    field = f"tools.{name}.{key}"
+                    if key == "approval_mode":
+                        permissions.add(field)
+                    elif key == "output_token_limit":
+                        output_limits.add(field)
+                    else:
+                        ignored.add(field)
+    return permissions, output_limits, ignored

@@ -23,7 +23,9 @@ from chrys.service.mcp.importers import (
 )
 from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS
 from chrys.service.mcp.importers.opencode import OpenCodeSource
-from chrys.service.profiles.agents.schema import MCPServerConfig
+from chrys.service.profiles.agents.loader import load_profile_from_yaml
+from chrys.service.profiles.agents.schema import AgentProfile, MCPServerConfig, ToolsConfig
+from chrys.service.profiles.agents.serializer import save_profile
 
 
 @pytest.fixture
@@ -122,13 +124,18 @@ def test_local_and_remote_servers_are_converted(home: Path, managed: Path) -> No
         command="npx",
         args=["-y", "server-files"],
         env={"TOKEN": "{{FILES_TOKEN}}", "MODE": "{{{{literal}}}}"},
+        request_timeout=60,
     )
     assert candidates["files"].scope == "global"
     assert candidates["files"].scope_path == ""
     assert candidates["files"].transport == "stdio"
-    assert candidates["files"].warnings == ()
+    assert candidates["files"].warnings == (ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED),)
     assert candidates["docs"].config == MCPServerConfig(
-        name="docs", transport="http", url="https://docs.test/mcp", headers={"Authorization": "Bearer {{DOCS_TOKEN}}"}
+        name="docs",
+        transport="http",
+        url="https://docs.test/mcp",
+        headers={"Authorization": "Bearer {{DOCS_TOKEN}}"},
+        request_timeout=60,
     )
     assert candidates["docs"].transport == "http"
 
@@ -222,6 +229,38 @@ def test_experimental_mcp_timeout_is_the_fallback_timeout(home: Path, managed: P
 
 
 @pytest.mark.parametrize(
+    ("global_timeout", "server_timeout", "expected"),
+    [(None, None, 60), (4500, None, 5), (4500, 1501, 2), (None, 1000, 1)],
+)
+def test_default_timeout_and_server_global_precedence_survive_profile_roundtrip(
+    home: Path,
+    managed: Path,
+    tmp_path: Path,
+    global_timeout: int | None,
+    server_timeout: int | None,
+    expected: int,
+) -> None:
+    entry = _local("cmd") if server_timeout is None else _local("cmd", timeout=server_timeout)
+    document: dict[str, Any] = {"mcp": {"s": entry}}
+    if global_timeout is not None:
+        document["experimental"] = {"mcp_timeout": global_timeout}
+    _global(home, document)
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None
+    assert candidate.config.request_timeout == expected
+    if global_timeout is None and server_timeout is None:
+        assert candidate.timeout_source_ms is None
+    path = save_profile(
+        AgentProfile(name="OpenCode Import", tools=ToolsConfig(mcp=[candidate.config])),
+        target_dir=tmp_path / "profiles",
+    )
+    (loaded,) = load_profile_from_yaml(path).tools.mcp
+    assert loaded.request_timeout == expected
+
+
+@pytest.mark.parametrize(
     ("entry", "reason"),
     [
         (_local("cmd", environment={"KEY": "{file:~/.secrets/key}"}), UnsupportedReason.FILE_REFERENCE),
@@ -279,6 +318,7 @@ def test_url_references_are_listed_with_a_reason_instead_of_skipped(
             unsupported=reason,
             entry={"url": url, "headers": {"X-Team": "docs"}},
             transport="http",
+            unsupported_field="mcp.api.url",
         ),
     )
 
@@ -354,7 +394,7 @@ def test_a_project_file_opencode_rejects_is_reported_and_the_rest_still_listed(
     result = OpenCodeSource().discover(_context(home, managed, workspace))
 
     assert [candidate.name for candidate in result.candidates] == ["kept"]
-    assert result.source_errors == (McpSourceError(str(bad), kind),)
+    assert [(error.path, error.kind) for error in result.source_errors] == [(str(bad), kind)]
 
 
 def test_an_empty_file_is_an_empty_config(home: Path, managed: Path) -> None:
@@ -372,7 +412,7 @@ def test_one_bad_global_file_drops_every_global_file(home: Path, workspace: Path
     result = OpenCodeSource().discover(_context(home, managed, workspace))
 
     assert [candidate.name for candidate in result.candidates] == ["project"]
-    assert result.source_errors == (McpSourceError(str(bad), SourceErrorKind.INVALID_JSON),)
+    assert result.source_errors == (McpSourceError(str(bad), SourceErrorKind.INVALID_JSON, line=1, column=3),)
 
 
 def test_a_malformed_server_with_a_boolean_enabled_reads_as_a_switch(home: Path, managed: Path) -> None:
@@ -634,3 +674,265 @@ def test_a_timeout_longer_than_icode_can_wait_is_capped(home: Path, managed: Pat
 
     assert candidate.config is not None
     assert candidate.config.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("  https://x.test/mcp  ", "https://x.test/mcp"),
+        ("\x00\thttps://x.test/mcp\r\n", "https://x.test/mcp"),
+        ("https://x.test/path name?label=a b", "https://x.test/path name?label=a b"),
+        ("https://x.te\tst/mcp", "https://x.test/mcp"),
+    ],
+)
+def test_urls_keep_source_whitespace_normalization_without_losing_path_or_query_spaces(
+    home: Path, managed: Path, url: str, expected: str
+) -> None:
+    _global(home, {"mcp": {"api": _remote(url, oauth=False)}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None
+    assert candidate.config.url == expected
+
+
+@pytest.mark.parametrize("url", ["https://bad host.test/mcp", "https://bad\x01host.test/mcp"])
+def test_url_host_whitespace_and_controls_are_not_accepted(home: Path, managed: Path, url: str) -> None:
+    _global(home, {"mcp": {"api": _remote(url, oauth=False)}})
+
+    assert _discover(home, managed) == ()
+
+
+def test_header_case_aliases_follow_web_headers_order_and_keep_dynamic_references(home: Path, managed: Path) -> None:
+    _global(
+        home,
+        {
+            "mcp": {
+                "api": _remote(
+                    "https://x.test/mcp",
+                    oauth=False,
+                    headers={"X-Test": " upper ", "x-test": "{env:LOWER}", "X-TEST": " last "},
+                )
+            }
+        },
+    )
+
+    (candidate,) = _discover(home, managed, LOWER="never-copy-this-value")
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"X-Test": "upper, {{LOWER}}, last"}
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"X-Test": "first", "x-test": ""}, "first,"),
+        ({"X-Test": "first", "x-test": "", "X-TEST": "last"}, "first, , last"),
+        ({"X-Test": "", "x-test": "last"}, ", last"),
+        ({"X-Test": "", "x-test": ""}, ","),
+    ],
+)
+def test_empty_header_alias_values_preserve_source_wire_value(
+    home: Path, managed: Path, headers: dict[str, str], expected: str
+) -> None:
+    _global(home, {"mcp": {"api": _remote("https://x.test/mcp", oauth=False, headers=headers)}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"X-Test": expected}
+
+
+@pytest.mark.parametrize(
+    ("timeout", "seconds", "source_ms"),
+    [(1000, 1, None), (1501, 2, 1501), (10**300, MAX_REQUEST_TIMEOUT_SECONDS, 10**300)],
+)
+def test_preview_keeps_timeout_source_only_when_rounding_or_capping_changes_it(
+    home: Path, managed: Path, timeout: int, seconds: int, source_ms: int | None
+) -> None:
+    _global(home, {"mcp": {"api": _local("cmd", timeout=timeout)}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None
+    assert candidate.config.request_timeout == seconds
+    assert candidate.timeout_source_ms == source_ms
+
+
+def test_preview_uses_the_effective_global_timeout_source(home: Path, managed: Path) -> None:
+    _global(home, {"experimental": {"mcp_timeout": 4501}, "mcp": {"api": _local("cmd")}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None
+    assert candidate.config.request_timeout == 5
+    assert candidate.timeout_source_ms == 4501
+
+
+def test_relative_working_directory_warning_records_its_source_base(home: Path, workspace: Path, managed: Path) -> None:
+    _global(home, {"mcp": {"relative": _local("cmd", cwd="../tools"), "absolute": _local("cmd", cwd=str(home))}})
+
+    candidates = _by_name(_discover(home, managed, workspace))
+
+    assert candidates["relative"].warnings == (
+        ImportWarning(ImportWarningKind.CWD_IGNORED, field=str(workspace), original="../tools"),
+    )
+    assert candidates["absolute"].warnings == (ImportWarning(ImportWarningKind.CWD_IGNORED, original=str(home)),)
+
+
+@pytest.mark.parametrize(
+    ("entry", "field", "variable"),
+    [
+        (_local("cmd", environment={"TOKEN": "{env:BAD-NAME}"}), "mcp.s.environment.TOKEN", "BAD-NAME"),
+        (_remote("https://x.test", headers={"X-Test": "{{env:A}"}), "mcp.s.headers.X-Test", ""),
+        (_local("cmd", "{env:ARG}"), "mcp.s.command[1]", ""),
+        (_local("cmd", environment={"TOKEN": "{file:secret}"}), "mcp.s.environment.TOKEN", ""),
+        (_remote("{file:url}"), "mcp.s.url", ""),
+    ],
+)
+def test_unsupported_metadata_locates_the_setting_without_copying_its_value(
+    home: Path, managed: Path, entry: dict[str, Any], field: str, variable: str
+) -> None:
+    _global(home, {"mcp": {"s": entry}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is None
+    assert (candidate.unsupported_field, candidate.unsupported_variable) == (field, variable)
+
+
+def test_only_escaped_literal_values_get_the_brace_notice(home: Path, managed: Path) -> None:
+    _global(
+        home,
+        {
+            "mcp": {
+                "literal": _local("cmd", environment={"VALUE": "{{literal}} {env:NAME}"}),
+                "variable": _local("cmd", environment={"VALUE": "{env:NAME}"}),
+                "command": _local("cmd", "{{literal}}"),
+            }
+        },
+    )
+
+    candidates = _by_name(_discover(home, managed))
+
+    assert candidates["literal"].warnings == (ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED),)
+    assert candidates["variable"].warnings == candidates["command"].warnings == ()
+
+
+def test_jsonc_error_position_matches_the_original_comments(home: Path, managed: Path) -> None:
+    text = '{\n  /* comment\n     on two lines */\n  // another comment\n  "mcp": [,]\n}'
+    config_file = _global(home, text, name="opencode.jsonc")
+
+    result = OpenCodeSource().discover(_context(home, managed))
+
+    assert result.source_errors == (McpSourceError(str(config_file), SourceErrorKind.INVALID_JSON, line=5, column=11),)
+
+
+@pytest.mark.parametrize(
+    ("document", "field"),
+    [
+        ({"mcp": []}, "mcp"),
+        ({"mcp": {"broken": {"type": "local", "command": "private-value"}}}, "mcp.broken"),
+        ({"experimental": {"mcp_timeout": None}}, "experimental.mcp_timeout"),
+    ],
+)
+def test_invalid_configuration_errors_locate_fields_without_values(
+    home: Path, managed: Path, document: dict[str, Any], field: str
+) -> None:
+    config_file = _global(home, document)
+
+    result = OpenCodeSource().discover(_context(home, managed))
+
+    assert result.source_errors == (McpSourceError(str(config_file), SourceErrorKind.INVALID_CONFIG, field=field),)
+
+
+@pytest.mark.parametrize(
+    ("name", "entry", "field"),
+    [
+        ("{env:SERVER}", _local("cmd"), "mcp.{env:SERVER}"),
+        ("s", _local("cmd", environment={"{env:ENV_NAME}": "value"}), "mcp.s.environment.{env:ENV_NAME}"),
+        ("s", _remote("https://x.test", headers={"{env:HEADER}": "value"}), "mcp.s.headers.{env:HEADER}"),
+        ("s", {"type": "local", "{env:COMMAND}": ["cmd"]}, "mcp.s.{env:COMMAND}"),
+        ("s", {"{env:TYPE}": "local", "command": ["cmd"]}, "mcp.s.{env:TYPE}"),
+        ("s", _remote("https://x.test", oauth={"{env:CLIENT}": "id"}), "mcp.s.oauth.{env:CLIENT}"),
+        (
+            "s",
+            _remote("https://x.test", disabled=True, oauth={"{env:CLIENT}": "id"}),
+            "mcp.s.oauth.{env:CLIENT}",
+        ),
+    ],
+)
+def test_dynamic_names_are_unsupported_before_static_schema_validation(
+    home: Path, managed: Path, name: str, entry: dict[str, Any], field: str
+) -> None:
+    _global(home, {"mcp": {name: entry}})
+
+    result = OpenCodeSource().discover(_context(home, managed, SERVER="private-secret-server", HEADER="X-Test"))
+
+    assert result.source_errors == ()
+    (candidate,) = result.candidates
+    assert candidate.config is None
+    assert candidate.unsupported is UnsupportedReason.TEMPLATE_IN_FIELD_NAME
+    assert candidate.name == name
+    assert candidate.unsupported_field == field
+    assert "private-secret-server" not in repr(candidate)
+
+
+def test_file_references_in_names_are_not_read(home: Path, managed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from chrys.service.mcp.importers import opencode as importer
+
+    secret_file = home / "private-name.txt"
+    secret_file.write_text("private-secret-header", encoding="utf-8")
+    field = "{file:" + str(secret_file) + "}"
+    _global(home, {"mcp": {"s": _remote("https://x.test", headers={field: "value"})}})
+    read_source = importer.read_source_bytes
+
+    def guarded_read(path: Path) -> bytes | None:
+        assert path != secret_file
+        return read_source(path)
+
+    monkeypatch.setattr(importer, "read_source_bytes", guarded_read)
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.unsupported is UnsupportedReason.TEMPLATE_IN_FIELD_NAME
+    assert candidate.unsupported_field == "mcp.s.headers." + field
+    assert "private-secret-header" not in repr(candidate)
+
+
+def test_overwritten_dynamic_names_do_not_block_the_effective_configuration(
+    home: Path, managed: Path, workspace: Path
+) -> None:
+    _global(
+        home,
+        {"mcp": {"s": _remote("https://x.test", disabled=True, oauth={"{env:CLIENT}": "id"})}},
+    )
+    _write(workspace / "opencode.json", {"mcp": {"s": {"type": "remote", "url": "https://x.test", "oauth": False}}})
+
+    result = OpenCodeSource().discover(_context(home, managed, workspace))
+
+    assert result.source_errors == ()
+    (candidate,) = result.candidates
+    assert candidate.unsupported is None
+    assert candidate.config is not None
+    assert candidate.config.enabled is False
+
+
+def test_effective_dynamic_name_uses_the_layer_that_still_contributes_it(
+    home: Path, managed: Path, workspace: Path
+) -> None:
+    source = _global(home, {"mcp": {"s": _remote("https://x.test", oauth={"{env:CLIENT}": "id"})}})
+    _write(workspace / "opencode.json", {"mcp": {"s": {"type": "remote", "url": "https://project.test"}}})
+
+    (candidate,) = _discover(home, managed, workspace)
+
+    assert candidate.unsupported is UnsupportedReason.TEMPLATE_IN_FIELD_NAME
+    assert candidate.source_path == str(source)
+
+
+def test_dynamic_names_outside_mcp_do_not_affect_import(home: Path, managed: Path) -> None:
+    _global(home, {"unrelated": {"{env:OTHER}": "value"}, "mcp": {"s": _local("cmd")}})
+
+    (candidate,) = _discover(home, managed)
+
+    assert candidate.config is not None

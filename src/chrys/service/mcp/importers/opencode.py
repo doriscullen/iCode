@@ -72,7 +72,10 @@ other files changed it too, a warning names them. ``timeout`` (milliseconds,
 else ``experimental.mcp_timeout``) bounds each call [code: M/index.ts:661-684]
 and becomes iCode's request timeout in seconds, rounded up; iCode also waits
 at most that long to connect, where opencode waits 30 seconds unless the
-server sets ``timeout``. Global ``tools``, ``permission``, ``permissions`` and
+server sets ``timeout``. Without either request timeout setting, opencode's
+MCP SDK defaults tool calls to 60 seconds; import keeps that request limit,
+so iCode also uses 60 seconds for its connection. Global ``tools``,
+``permission``, ``permissions`` and
 ``$OPENCODE_PERMISSION`` settings are reported as omitted. Their rules and
 precedence are not reproduced; users configure tool access and approval in iCode.
 
@@ -129,6 +132,8 @@ SCOPE_GLOBAL = "global"
 SCOPE_PROJECT = "project"
 
 _APP = "opencode"
+# SDK 1.29.0's Protocol.request fallback when convertTool passes an undefined timeout.
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
 _CONFIG_DIR_NAME = ".opencode"
 # In each list, the order opencode merges the files in: the later one wins.
 _GLOBAL_FILES = ("config.json", "opencode.json", "opencode.jsonc")
@@ -160,6 +165,10 @@ _V2_OAUTH_FIELDS = {
 class _InvalidConfig(Exception):
     """A setting opencode rejects, so it rejects the whole file."""
 
+    def __init__(self, field: str = "") -> None:
+        super().__init__(field)
+        self.field = field
+
 
 @dataclass(frozen=True, slots=True)
 class _Layer:
@@ -190,6 +199,9 @@ class _Server:
     type_layer: _Layer | None = None
     connection_layer: _Layer | None = None
     value_layers: dict[tuple[str, str], _Layer] = field(default_factory=dict)
+    dynamic_field: str = ""
+    dynamic_layer: _Layer | None = None
+    dynamic_layers: dict[str, _Layer] = field(default_factory=dict)
 
 
 class OpenCodeSource:
@@ -223,7 +235,7 @@ class OpenCodeSource:
                 try:
                     settings = _read_layer(layer)
                 except SourceReadError as exc:
-                    errors.append(McpSourceError(layer.source, exc.kind))
+                    errors.append(McpSourceError(layer.source, exc.kind, exc.field, exc.line, exc.column))
                     failed = True
                     continue
                 if settings is not None:
@@ -372,6 +384,8 @@ def _read_layer(layer: _Layer) -> _Settings | None:
         return _Settings()
     try:
         document = json.loads(_strip_jsonc(text), parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        raise SourceReadError(SourceErrorKind.INVALID_JSON, line=exc.lineno, column=exc.colno) from exc
     except (ValueError, RecursionError) as exc:
         raise SourceReadError(SourceErrorKind.INVALID_JSON) from exc
     if not isinstance(document, dict):
@@ -379,7 +393,7 @@ def _read_layer(layer: _Layer) -> _Settings | None:
     try:
         return _decode_settings(document)
     except _InvalidConfig as exc:
-        raise SourceReadError(SourceErrorKind.INVALID_CONFIG) from exc
+        raise SourceReadError(SourceErrorKind.INVALID_CONFIG, field=exc.field) from exc
 
 
 def _reject_constant(name: str) -> Any:
@@ -408,13 +422,15 @@ def _strip_jsonc(text: str) -> str:
             continue
         if text.startswith("//", index):
             newline = text.find("\n", index)
-            index = length if newline == -1 else newline
+            end = length if newline == -1 else newline
+            out.append(" " * (end - index))
+            index = end
             continue
         if text.startswith("/*", index):
             end = text.find("*/", index + 2)
             if end == -1:
-                raise ValueError("unterminated comment")
-            out.append(" ")
+                raise json.JSONDecodeError("Unterminated comment", text, index)
+            out.append("".join(char if char in "\r\n" else " " for char in text[index : end + 2]))
             index = end + 2
             continue
         if char in "}]" and trailing_comma is not None:
@@ -439,15 +455,25 @@ def _decode_settings(document: dict[str, Any]) -> _Settings:
     # A key written as null is a wrong type to opencode, not a missing one.
     if "mcp" in document:
         if not isinstance(mcp, dict):
-            raise _InvalidConfig
+            raise _InvalidConfig("mcp")
         servers, lowered_timeout = _lower_v2(mcp)
-        settings.mcp = {name: _decode_server(entry) for name, entry in servers.items()}
+        for name, entry in servers.items():
+            dynamic_field = f"mcp.{name}" if _has_name_reference(name) else _dynamic_setting_key(entry, f"mcp.{name}")
+            if dynamic_field and isinstance(entry, dict):
+                # Text substitution can turn an unknown key into a required connection setting.
+                # Its source schema cannot be checked until that name has been expanded.
+                settings.mcp[name] = entry
+                continue
+            try:
+                settings.mcp[name] = _decode_server(entry)
+            except _InvalidConfig as exc:
+                raise _InvalidConfig(f"mcp.{name}") from exc
         # A timeout written in experimental is kept over one lowered from mcp [code: C/v2-compat.ts:425-437].
         if not timeout_set:
             mcp_timeout = lowered_timeout
     if timeout_set or mcp_timeout is not None:
         if not isinstance(mcp_timeout, int | float) or not _is_positive_int(mcp_timeout):
-            raise _InvalidConfig
+            raise _InvalidConfig("experimental.mcp_timeout" if timeout_set else "mcp.timeout")
         settings.mcp_timeout = int(mcp_timeout)
     settings.permission_fields = tuple(key for key in ("tools", "permission", "permissions") if key in document)
     return settings
@@ -543,7 +569,9 @@ def _lower_v2_server(value: object) -> dict[str, Any] | None:
             if oauth is False
             else {_V2_OAUTH_FIELDS[key]: item for key, item in oauth.items() if key in _V2_OAUTH_FIELDS}
         )
-    return lowered
+    # Keep dynamic names for the unsupported preview even when V2 lowering drops unknown keys.
+    preserved = _merge_deep(lowered, _dynamic_key_shape(value))
+    return preserved if isinstance(preserved, dict) else lowered
 
 
 def _is_v2_oauth(value: object) -> bool:
@@ -658,6 +686,11 @@ def _merge_servers(loaded: list[tuple[_Layer, _Settings]]) -> dict[str, _Server]
             merged = _merge_deep(server.entry, entry)
             server.entry = merged if isinstance(merged, dict) else {}
             server.layers.append(layer)
+            dynamic_paths = (
+                (f"mcp.{name}",) if _has_name_reference(name) else _dynamic_setting_keys(entry, f"mcp.{name}")
+            )
+            for dynamic_path in dynamic_paths:
+                server.dynamic_layers[dynamic_path] = layer
             if "type" in entry:
                 server.type_layer = layer
             if "command" in entry or "url" in entry:
@@ -667,6 +700,11 @@ def _merge_servers(loaded: list[tuple[_Layer, _Settings]]) -> dict[str, _Server]
                 if isinstance(values, dict):
                     for key in values:
                         server.value_layers[(group, key)] = layer
+    for name, server in servers.items():
+        server.dynamic_field = (
+            f"mcp.{name}" if _has_name_reference(name) else _dynamic_setting_key(server.entry, f"mcp.{name}")
+        )
+        server.dynamic_layer = server.dynamic_layers.get(server.dynamic_field)
     return servers
 
 
@@ -693,16 +731,36 @@ def _result(
     merged = _Merged(tuple(sorted(permission_fields)), mcp_timeout)
     candidates = []
     for name, server in _merge_servers(loaded).items():
-        candidate = _candidate(name, server, merged)
+        candidate = _candidate(name, server, merged, ctx.workspace_cwd)
         if candidate is not None:
             candidates.append(candidate)
     return McpImportResult(candidates=tuple(candidates), source_errors=tuple(errors))
 
 
-def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidate | None:
+def _candidate(name: str, server: _Server, merged: _Merged, workspace_cwd: str | None) -> McpImportCandidate | None:
     entry = server.entry
     layer = server.type_layer
     kind = entry.get("type")
+    if server.dynamic_layer is not None:
+        layer = server.dynamic_layer
+        shown: dict[str, Any] = {}
+        command = entry.get("command")
+        if _is_str_list(command) and command:
+            shown.update(command=command[0], args=command[1:])
+        for source_key, preview_key in (("environment", "env"), ("url", "url"), ("headers", "headers")):
+            if source_key in entry:
+                shown[preview_key] = entry[source_key]
+        return McpImportCandidate(
+            name,
+            layer.scope,
+            layer.source,
+            None,
+            unsupported=UnsupportedReason.TEMPLATE_IN_FIELD_NAME,
+            entry=shown,
+            transport="stdio" if kind == "local" else "http" if kind == "remote" else "",
+            scope_path=layer.scope_path,
+            unsupported_field=server.dynamic_field,
+        )
     if layer is None or kind not in {"local", "remote"}:
         # opencode ignores a server no file gave a type [code: M/index.ts:509-511].
         return None
@@ -722,7 +780,7 @@ def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidat
         transport = "http"
         shown = {"url": url, "headers": entry.get("headers", {})}
 
-    def unsupported(reason: UnsupportedReason) -> McpImportCandidate:
+    def unsupported(reason: UnsupportedReason, field: str, variable: str = "") -> McpImportCandidate:
         return McpImportCandidate(
             name,
             layer.scope,
@@ -732,36 +790,73 @@ def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidat
             entry=shown,
             transport=transport,
             scope_path=layer.scope_path,
+            unsupported_field=field,
+            unsupported_variable=variable,
         )
 
+    if _has_name_reference(name):
+        return unsupported(UnsupportedReason.TEMPLATE_IN_FIELD_NAME, f"mcp.{name}")
     if kind == "local":
-        connection = [*entry["command"]]
+        connection = [(f"command[{index}]", value) for index, value in enumerate(entry["command"])]
         values_key = "environment"
     else:
-        connection = [entry["url"]]
+        connection = [("url", entry["url"])]
         values_key = "headers"
     values: dict[str, str] = entry.get(values_key, {})
-    if any(_FILE_REFERENCE_RE.search(value) for value in (*connection, *values.values())):
-        return unsupported(UnsupportedReason.FILE_REFERENCE)
-    if any(_ENV_REFERENCE_RE.search(value) for value in connection):
-        return unsupported(
-            UnsupportedReason.TEMPLATE_IN_COMMAND if kind == "local" else UnsupportedReason.TEMPLATE_IN_URL
-        )
+    for key in values:
+        if _has_name_reference(key):
+            return unsupported(UnsupportedReason.TEMPLATE_IN_FIELD_NAME, f"mcp.{name}.{values_key}.{key}")
+    fields = [*connection, *((f"{values_key}.{key}", value) for key, value in values.items())]
+    for source_field, value in fields:
+        if _FILE_REFERENCE_RE.search(value):
+            return unsupported(UnsupportedReason.FILE_REFERENCE, f"mcp.{name}.{source_field}")
+    for source_field, value in connection:
+        if _ENV_REFERENCE_RE.search(value):
+            return unsupported(
+                UnsupportedReason.TEMPLATE_IN_COMMAND if kind == "local" else UnsupportedReason.TEMPLATE_IN_URL,
+                f"mcp.{name}.{source_field}",
+            )
     converted: dict[str, str] = {}
+    header_names: dict[str, str] = {}
+    escaped_braces = False
     for key, value in values.items():
+        source_field = f"mcp.{name}.{values_key}.{key}"
         parts = _env_parts(value)
         if parts is None:
-            return unsupported(UnsupportedReason.VARIABLE_NAME)
+            invalid = next(
+                match.group(1)
+                for match in _ENV_REFERENCE_RE.finditer(value)
+                if _VARIABLE_NAME_RE.fullmatch(match.group(1)) is None
+            )
+            return unsupported(UnsupportedReason.VARIABLE_NAME, source_field, invalid)
         if not templates_convertible(parts):
-            return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
+            return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE, source_field)
+        escaped_braces |= any(isinstance(part, str) and ("{{" in part or "}}" in part) for part in parts)
         rendered = render_template(parts)
         # opencode's fetch trims a header value; iCode's HTTP client refuses one it doesn't.
-        converted[key] = trim_header_value(rendered) if values_key == "headers" else rendered
+        if values_key == "headers":
+            rendered = trim_header_value(rendered)
+            first_name = header_names.setdefault(key.lower(), key)
+            # Web Headers combines case aliases in insertion order before sending them.
+            converted[first_name] = f"{converted[first_name]}, {rendered}" if first_name in converted else rendered
+        else:
+            converted[key] = rendered
+    if values_key == "headers":
+        # Fetch trims once more after joining aliases; intermediate empty values keep their spaces.
+        converted = {key: trim_header_value(value) for key, value in converted.items()}
 
     warnings: list[ImportWarning] = []
+    if escaped_braces:
+        warnings.append(ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED))
     cwd = entry.get("cwd") if kind == "local" else None
     if isinstance(cwd, str) and cwd not in {"", "."}:
-        warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=cwd))
+        warnings.append(
+            ImportWarning(
+                ImportWarningKind.CWD_IGNORED,
+                field=(workspace_cwd or "") if not Path(cwd).is_absolute() else "",
+                original=cwd,
+            )
+        )
     if kind == "remote" and entry.get("oauth") is not False:
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     warnings.extend(_merged_warning(server, values_key))
@@ -771,7 +866,7 @@ def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidat
         )
     enabled = entry.get("enabled") is not False
     timeout = entry.get("timeout") if _is_positive_int(entry.get("timeout")) else merged.mcp_timeout
-    request_timeout = None if timeout is None else request_timeout_seconds(timeout / 1000)
+    request_timeout = _DEFAULT_REQUEST_TIMEOUT_SECONDS if timeout is None else request_timeout_seconds(timeout / 1000)
     # The source's own config, no tool name prefix: the dialog gives every import one
     # (base.with_tool_name_prefix), the name opencode puts before its tools.
     if kind == "local":
@@ -788,7 +883,7 @@ def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidat
         config = MCPServerConfig(
             name=name,
             transport="http",
-            url=entry["url"],
+            url=_normalize_url(entry["url"]),
             headers=converted,
             enabled=enabled,
             request_timeout=request_timeout,
@@ -801,18 +896,57 @@ def _candidate(name: str, server: _Server, merged: _Merged) -> McpImportCandidat
         warnings=tuple(warnings),
         transport=transport,
         scope_path=layer.scope_path,
+        timeout_source_ms=timeout if timeout is not None and request_timeout * 1000 != timeout else None,
     )
 
 
+def _normalize_url(url: str) -> str:
+    """The common WHATWG whitespace cleanup also applied by opencode's URL constructor."""
+    return url.strip("".join(chr(code) for code in range(33))).replace("\t", "").replace("\r", "").replace("\n", "")
+
+
+def _has_name_reference(value: str) -> bool:
+    return bool(_ENV_REFERENCE_RE.search(value) or _FILE_REFERENCE_RE.search(value))
+
+
+def _dynamic_setting_key(value: object, path: str) -> str:
+    return next(iter(_dynamic_setting_keys(value, path)), "")
+
+
+def _dynamic_setting_keys(value: object, path: str) -> Iterable[str]:
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        field = f"{path}.{key}"
+        if _has_name_reference(key):
+            yield field
+        else:
+            yield from _dynamic_setting_keys(item, field)
+
+
+def _dynamic_key_shape(value: dict[str, Any]) -> dict[str, Any]:
+    kept: dict[str, Any] = {}
+    for key, item in value.items():
+        if _has_name_reference(key):
+            kept[key] = item
+        elif isinstance(item, dict) and (nested := _dynamic_key_shape(item)):
+            kept[key] = nested
+    return kept
+
+
 def _url_parses(url: str) -> bool:
-    """Close to ``URL.canParse``: a scheme, no blanks, and a host for http(s) [code: M/index.ts:123-125]."""
-    if _URL_SCHEME_RE.match(url) is None or any(char.isspace() for char in url.strip()):
+    """Recognize ordinary URLs opencode accepts, including spaces in paths and queries."""
+    url = _normalize_url(url)
+    if _URL_SCHEME_RE.match(url) is None:
         return False
     try:
-        parts = urlsplit(url.strip())
+        parts = urlsplit(url)
+        hostname = parts.hostname
     except ValueError:
         return False
-    return parts.scheme.lower() not in {"http", "https"} or bool(parts.hostname)
+    if parts.scheme.lower() not in {"http", "https"}:
+        return True
+    return bool(hostname) and not any(char.isspace() or ord(char) < 32 for char in hostname or "")
 
 
 def _env_parts(value: str) -> list[TemplatePart] | None:

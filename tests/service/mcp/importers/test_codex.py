@@ -84,7 +84,7 @@ enabled = false
     )
     assert candidate.scope == "user"
     assert candidate.scope_path == ""
-    assert candidate.warnings == ()
+    assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.LITERAL_BRACES_ESCAPED]
 
 
 def test_forwarded_variables_are_left_to_the_inherited_environment(ctx: ImportContext) -> None:
@@ -102,7 +102,7 @@ env = { OVERRIDE = "literal {{text}}" }
     (candidate,) = CodexSource().discover(ctx).candidates
     assert candidate.config is not None
     assert candidate.config.env == {"OVERRIDE": "literal {{{{text}}}}"}
-    assert candidate.warnings == ()
+    assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.LITERAL_BRACES_ESCAPED]
 
 
 @pytest.mark.parametrize("variable", ["PYTHONPATH", "PYTHONHOME"])
@@ -211,19 +211,21 @@ disabled_tools = ["delete"]
 
 
 @pytest.mark.parametrize(
-    "rules",
+    ("rules", "warning_kind"),
     [
-        "tools = {write = {output_token_limit = 0}}",
-        'tools = "not a policy table"',
-        'default_tools_approval_mode = "future-mode"',
+        ("tools = {write = {output_token_limit = 0}}", ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED),
+        ('tools = "not a policy table"', ImportWarningKind.UNKNOWN_FIELDS_IGNORED),
+        ('default_tools_approval_mode = "future-mode"', ImportWarningKind.TOOL_PERMISSIONS_IGNORED),
     ],
 )
-def test_source_tool_policies_do_not_gate_valid_server_settings(ctx: ImportContext, rules: str) -> None:
+def test_source_tool_policies_do_not_gate_valid_server_settings(
+    ctx: ImportContext, rules: str, warning_kind: ImportWarningKind
+) -> None:
     _user(ctx, '[mcp_servers.server]\ncommand = "server"\n' + rules)
     (candidate,) = CodexSource().discover(ctx).candidates
     assert candidate.config is not None and candidate.config.command == "server"
     assert candidate.config.allowed_tools is None
-    assert any(w.kind is ImportWarningKind.TOOL_PERMISSIONS_IGNORED for w in candidate.warnings)
+    assert any(w.kind is warning_kind for w in candidate.warnings)
 
 
 def test_dropped_settings_warn_without_copying_credentials_or_running_helpers(ctx: ImportContext) -> None:
@@ -249,7 +251,10 @@ output_token_limit = 500
     assert "secret-" not in repr(candidate)
     warnings = {warning.kind: warning.original for warning in candidate.warnings}
     assert ImportWarningKind.OAUTH_IGNORED in warnings
-    assert warnings[ImportWarningKind.TOOL_PERMISSIONS_IGNORED] == "default_tools_approval_mode, tools"
+    assert (
+        warnings[ImportWarningKind.TOOL_PERMISSIONS_IGNORED] == "default_tools_approval_mode, tools.write.approval_mode"
+    )
+    assert warnings[ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED] == "tools.write.output_token_limit"
     assert ImportWarningKind.HEADERS_HELPER_IGNORED in warnings
     assert "required" in warnings[ImportWarningKind.UNKNOWN_FIELDS_IGNORED]
 
@@ -336,19 +341,27 @@ def test_unrepresentable_variable_names_are_locked(ctx: ImportContext, entry: st
     assert candidate.unsupported == UnsupportedReason.VARIABLE_NAME
 
 
-@pytest.mark.parametrize("text", ["[mcp_servers", "\ufeff[mcp_servers]", 'mcp_servers = "oops"'])
-def test_source_errors_are_reported(ctx: ImportContext, text: str) -> None:
+@pytest.mark.parametrize(
+    ("text", "kind", "field", "line", "column"),
+    [
+        ("[mcp_servers", SourceErrorKind.INVALID_TOML, "", 1, 13),
+        ("\ufeff[mcp_servers]", SourceErrorKind.INVALID_TOML, "", 1, 1),
+        ('mcp_servers = "oops"', SourceErrorKind.INVALID_CONFIG, "mcp_servers", None, None),
+    ],
+)
+def test_source_errors_are_reported(
+    ctx: ImportContext, text: str, kind: SourceErrorKind, field: str, line: int | None, column: int | None
+) -> None:
     path = _user(ctx, text)
     result = CodexSource().discover(ctx)
-    kind = SourceErrorKind.INVALID_CONFIG if "oops" in text else SourceErrorKind.INVALID_TOML
     assert result.candidates == ()
-    assert result.source_errors == (McpSourceError(str(path), kind),)
+    assert result.source_errors == (McpSourceError(str(path), kind, field=field, line=line, column=column),)
 
 
-def test_invalid_encoding_is_toml_error(ctx: ImportContext) -> None:
+def test_invalid_encoding_is_reported_separately(ctx: ImportContext) -> None:
     path = _user(ctx, "")
     path.write_bytes(b"\xff")
-    assert CodexSource().discover(ctx).source_errors == (McpSourceError(str(path), SourceErrorKind.INVALID_TOML),)
+    assert CodexSource().discover(ctx).source_errors == (McpSourceError(str(path), SourceErrorKind.INVALID_ENCODING),)
 
 
 def test_codex_home_override_and_symlink(ctx: ImportContext, tmp_path: Path) -> None:
@@ -509,3 +522,184 @@ def test_a_timeout_longer_than_icode_can_wait_is_capped(ctx: ImportContext) -> N
 
     assert candidate.config is not None
     assert candidate.config.request_timeout == MAX_REQUEST_TIMEOUT_SECONDS
+    assert candidate.timeout_source_seconds == 1e18
+
+
+@pytest.mark.parametrize(
+    ("source", "converted", "preview_source"),
+    [("1.501", 2, 1.501), ("1.0", 1, None), ("300", 300, None)],
+)
+def test_timeout_preview_records_only_changed_source_seconds(
+    ctx: ImportContext, source: str, converted: int, preview_source: float | None
+) -> None:
+    _user(ctx, f'[mcp_servers.s]\ncommand = "server"\ntool_timeout_sec = {source}\n')
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None and candidate.config.request_timeout == converted
+    assert candidate.timeout_source_seconds == preview_source
+
+
+def test_zero_timeout_keeps_runtime_default_and_has_a_dedicated_warning(ctx: ImportContext) -> None:
+    _user(ctx, '[mcp_servers.s]\ncommand = "server"\ntool_timeout_sec = 0\n')
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None and candidate.config.request_timeout is None
+    assert candidate.timeout_source_seconds is None
+    assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.ZERO_TIMEOUT_IGNORED]
+
+
+@pytest.mark.parametrize(
+    ("settings", "field"),
+    [
+        ('env_http_headers = {"X-Key" = "BAD-NAME"}', "env_http_headers.X-Key"),
+        ('bearer_token_env_var = "BAD-NAME"', "bearer_token_env_var"),
+    ],
+)
+def test_unsupported_variable_metadata_identifies_the_source_reference(
+    ctx: ImportContext, settings: str, field: str
+) -> None:
+    _user(ctx, '[mcp_servers.s]\nurl = "https://example.test"\n' + settings)
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is None
+    assert candidate.unsupported is UnsupportedReason.VARIABLE_NAME
+    assert candidate.unsupported_field == field
+    assert candidate.unsupported_variable == "BAD-NAME"
+
+
+@pytest.mark.parametrize(
+    ("auth", "warning_kind"),
+    [
+        ("oauth", ImportWarningKind.OAUTH_IGNORED),
+        ("chatgpt", ImportWarningKind.AUTH_PROVIDER_IGNORED),
+        ("ema_auth", ImportWarningKind.AUTH_PROVIDER_IGNORED),
+    ],
+)
+def test_http_authentication_has_one_applicable_migration_warning(
+    ctx: ImportContext, auth: str, warning_kind: ImportWarningKind
+) -> None:
+    _user(ctx, f'[mcp_servers.s]\nurl = "https://example.test"\nauth = "{auth}"\n')
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert [warning.kind for warning in candidate.warnings] == [warning_kind]
+
+
+def test_tool_output_limits_are_not_reported_as_approval_permissions(ctx: ImportContext) -> None:
+    _user(
+        ctx,
+        '[mcp_servers.s]\ncommand = "server"\n'
+        'tools = {inspect = {output_token_limit = 600}, second = {future_setting = "private-sentinel"}}\n',
+    )
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+    warnings = {warning.kind: warning.original for warning in candidate.warnings}
+
+    assert warnings == {
+        ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED: "tools.inspect.output_token_limit",
+        ImportWarningKind.UNKNOWN_FIELDS_IGNORED: "tools.second.future_setting",
+    }
+    assert candidate.config is not None and candidate.config.allowed_tools is None
+    assert "private-sentinel" not in repr(candidate)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        'command = "server{{literal}}"\nargs = ["{{literal}}"]',
+        'command = "server"\nenv = {NODE_REPL_AUTH_TOKEN = "{{literal}}"}',
+        (
+            'url = "https://example.test"\nhttp_headers = {"X-Key" = "{{literal}}"}\n'
+            'env_http_headers = {"X-Key" = "TOKEN"}'
+        ),
+        'url = "https://example.test"\nhttp_headers = {Authorization = "{{literal}}"}\nbearer_token_env_var = "TOKEN"',
+    ],
+)
+def test_literal_brace_warning_only_describes_retained_values(ctx: ImportContext, settings: str) -> None:
+    _user(ctx, "[mcp_servers.s]\n" + settings)
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert all(warning.kind is not ImportWarningKind.LITERAL_BRACES_ESCAPED for warning in candidate.warnings)
+
+
+def test_invalid_header_values_are_omitted_before_trimming_without_disclosing_them(ctx: ImportContext) -> None:
+    _user(
+        ctx,
+        """
+[mcp_servers.s]
+url = "https://example.test"
+http_headers = { "Bad Header" = "secret-name-value", "X-Test" = "\\nsecret-newline\\n", "X-Control" = "\\u0001secret-control", "X-Good" = "kept", "X-Unicode" = "你好", "X-Empty" = "" }
+env_http_headers = { "Bad Env Header" = "TOKEN" }
+""",
+    )
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"x-good": "kept", "x-unicode": "你好", "x-empty": ""}
+    assert {
+        (warning.field, warning.original)
+        for warning in candidate.warnings
+        if warning.kind is ImportWarningKind.INVALID_HEADER_IGNORED
+    } == {
+        ("http_headers.Bad Header", "name"),
+        ("http_headers.X-Test", "value"),
+        ("http_headers.X-Control", "value"),
+        ("env_http_headers.Bad Env Header", "name"),
+    }
+    assert "secret-" not in repr(candidate)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        'http_headers = {"x-test" = "secret-lower", "X-Test" = "secret-upper"}',
+        'env_http_headers = {"x-test" = "LOWER_TOKEN", "X-Test" = "UPPER_TOKEN"}',
+    ],
+)
+def test_effective_header_alias_conflicts_are_not_silently_selected(ctx: ImportContext, settings: str) -> None:
+    _user(ctx, '[mcp_servers.s]\nurl = "https://example.test"\n' + settings)
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is None
+    assert candidate.unsupported is UnsupportedReason.HEADER_NAME_COLLISION
+    assert candidate.unsupported_field == "x-test"
+    assert candidate.unsupported_variable == ""
+    assert candidate.warnings == ()
+
+
+def test_bearer_masks_header_alias_conflicts_and_invalid_authorization_variable(ctx: ImportContext) -> None:
+    _user(
+        ctx,
+        """
+[mcp_servers.s]
+url = "https://example.test"
+http_headers = {Authorization = "one", AUTHORIZATION = "two"}
+env_http_headers = {Authorization = "BAD-NAME", AUTHORIZATION = "OTHER"}
+bearer_token_env_var = "BEARER"
+""",
+    )
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"authorization": "Bearer {{BEARER}}"}
+    assert candidate.unsupported is None
+
+
+def test_source_error_metadata_does_not_include_the_source_line(ctx: ImportContext) -> None:
+    _user(ctx, '[mcp_servers.s]\nurl = "private-credential-sentinel" trailing\n')
+
+    result = CodexSource().discover(ctx)
+
+    assert result.candidates == ()
+    (error,) = result.source_errors
+    assert error.kind is SourceErrorKind.INVALID_TOML
+    assert error.line == 2
+    assert error.column is not None
+    assert "private-credential-sentinel" not in repr(result)

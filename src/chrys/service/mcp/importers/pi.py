@@ -41,7 +41,8 @@ it on start [code: CA/extensions/mcp/runtime.ts:89-121].
 
 Settings carried over: ``enabled`` (a server pi has turned off is imported
 turned off), ``timeout`` (seconds, rounded up), ``description``, and how its
-tools are offered. pi's default ``codemode`` and ``deferred`` keep tools out
+tools are offered. An omitted timeout keeps pi's default of 60 seconds
+[code: CA/extensions/mcp/runtime.ts:48,211]. pi's default ``codemode`` and ``deferred`` keep tools out
 of the model's tool list until something looks them up [code:
 CA/extensions/mcp/tools.ts:41-46], which is iCode's on-demand loading;
 ``direct`` is iCode's full loading; ``hidden`` offers no tools.
@@ -90,7 +91,6 @@ from chrys.service.mcp.importers.base import (
     TemplatePart,
     TemplateVariable,
     UnsupportedReason,
-    decode_source,
     json_number,
     read_source_bytes,
     render_template,
@@ -108,6 +108,7 @@ SCOPE_PROJECT = "project"
 
 _CONFIG_FILE_NAME = "mcp.json"
 _PROJECT_DIR_NAME = ".pi"
+_DEFAULT_TIMEOUT_SECONDS = 60
 
 _SERVER_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 _VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -199,13 +200,13 @@ def _read_file(state: _State, path: Path, scope: str, *, scope_path: str = "") -
     try:
         document = _read_json(path)
     except SourceReadError as exc:
-        state.errors.append(McpSourceError(str(path), exc.kind))
+        state.errors.append(McpSourceError(str(path), exc.kind, exc.field, exc.line, exc.column))
         return
     if document is None:
         return
     servers = document.get("mcpServers", {})
     if not isinstance(servers, dict):
-        state.errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_CONFIG))
+        state.errors.append(McpSourceError(str(path), SourceErrorKind.INVALID_CONFIG, field="mcpServers"))
         return
     for name, value in servers.items():
         _add_entry(state, name, value, str(path), scope, scope_path)
@@ -217,7 +218,13 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     if raw is None:
         return None
     try:
-        document = json.loads(decode_source(raw), parse_constant=_reject_constant)
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise SourceReadError(SourceErrorKind.INVALID_ENCODING) from exc
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        raise SourceReadError(SourceErrorKind.INVALID_JSON, line=exc.lineno, column=exc.colno) from exc
     except (ValueError, RecursionError) as exc:
         raise SourceReadError(SourceErrorKind.INVALID_JSON) from exc
     if not isinstance(document, dict):
@@ -367,14 +374,21 @@ def _stdio_valid(value: dict[str, Any]) -> bool:
 
 def _parse_url(value: str) -> Any:
     """*value* split as a URL with a host, close to ``URL.canParse``; None when it has neither."""
-    if any(char.isspace() for char in value.strip()):
-        return None
+    value = _normalize_url(value)
     try:
-        parts = urlsplit(value.strip())
+        parts = urlsplit(value)
         parts.port  # noqa: B018  # raises on a port that isn't a number
     except ValueError:
         return None
-    return parts if parts.scheme and parts.hostname else None
+    hostname = parts.hostname
+    if not parts.scheme or not hostname or any(char.isspace() or ord(char) < 32 for char in hostname):
+        return None
+    return parts
+
+
+def _normalize_url(value: str) -> str:
+    """The common WHATWG whitespace cleanup applied by pi's URL constructor."""
+    return value.strip("".join(chr(code) for code in range(33))).replace("\t", "").replace("\r", "").replace("\n", "")
 
 
 def _is_integral(value: object) -> bool:
@@ -415,7 +429,7 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
     config = entry.config
     transport = _transport(config)
 
-    def unsupported(reason: UnsupportedReason) -> McpImportCandidate:
+    def unsupported(reason: UnsupportedReason, field: str) -> McpImportCandidate:
         return McpImportCandidate(
             entry.name,
             entry.scope,
@@ -425,24 +439,50 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
             entry=_shown(config),
             transport=transport,
             scope_path=entry.scope_path,
+            unsupported_field=field,
         )
 
     values_key = "headers" if transport == "http" else "env"
     converted: dict[str, str] = {}
+    header_names: dict[str, str] = {}
+    escaped_braces = False
     for key, value in config.get(values_key, {}).items():
+        source_field = f"mcpServers.{entry.name}.{values_key}.{key}"
         parts = _value_parts(value)
         if parts is None:
-            return unsupported(UnsupportedReason.VALUE_FROM_COMMAND)
+            return unsupported(UnsupportedReason.VALUE_FROM_COMMAND, source_field)
         if not templates_convertible(parts):
-            return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
+            return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE, source_field)
+        if values_key == "headers" and any(not part.isascii() for part in parts if isinstance(part, str)):
+            return unsupported(UnsupportedReason.HEADER_VALUE_ENCODING, source_field)
         rendered = render_template(parts)
+        escaped_braces |= rendered != "".join(
+            part if isinstance(part, str) else "{{" + part.name + "}}" for part in parts
+        )
         # pi's fetch trims a header value; iCode's HTTP client refuses one it doesn't.
-        converted[key] = trim_header_value(rendered) if values_key == "headers" else rendered
+        if values_key == "headers":
+            rendered = trim_header_value(rendered)
+            first_name = header_names.setdefault(key.lower(), key)
+            # Web Headers combines case aliases before sending them.
+            converted[first_name] = f"{converted[first_name]}, {rendered}" if first_name in converted else rendered
+        else:
+            converted[key] = rendered
+    if values_key == "headers":
+        converted = {key: trim_header_value(value) for key, value in converted.items()}
 
     warnings: list[ImportWarning] = []
+    if escaped_braces:
+        warnings.append(ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED))
     cwd = config.get("cwd")
     if transport == "stdio" and isinstance(cwd, str) and cwd not in {"", "."}:
-        warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=cwd))
+        expanded = _expand_home(cwd, ctx.home)
+        warnings.append(
+            ImportWarning(
+                ImportWarningKind.CWD_IGNORED,
+                field=(ctx.workspace_cwd or "") if not Path(expanded).is_absolute() else "",
+                original=expanded,
+            )
+        )
     if transport == "http" and (
         "oauth" in config
         or ("auth" not in config and not any(key.lower() == "authorization" for key in config.get("headers", {})))
@@ -455,20 +495,22 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
     access = _tool_access(config)
     warnings.extend(access.warnings)
     enabled = _enabled(config)
-    timeout = config.get("timeout")
+    timeout = config.get("timeout", _DEFAULT_TIMEOUT_SECONDS)
+    request_timeout = request_timeout_seconds(timeout)
+    source_timeout = math.inf if json_number(timeout) == math.inf else timeout
     # The source's own config, no tool name prefix: the dialog gives every import one
     # (base.with_tool_name_prefix), as pi names tools mcp__<server>__<tool>.
     common: dict[str, Any] = {
         "name": entry.name,
         "enabled": enabled,
         "description": config.get("description", ""),
-        "request_timeout": None if timeout is None else request_timeout_seconds(timeout),
+        "request_timeout": request_timeout,
         "allowed_tools": access.allowed_tools,
         "use_progressive_disclosure": access.on_demand,
         "always_load": access.always_load,
     }
     if transport == "http":
-        server = MCPServerConfig(transport="http", url=config["url"], headers=converted, **common)
+        server = MCPServerConfig(transport="http", url=_normalize_url(config["url"]), headers=converted, **common)
     else:
         home = ctx.home
         server = MCPServerConfig(
@@ -486,6 +528,7 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
         warnings=tuple(warnings),
         transport=transport,
         scope_path=entry.scope_path,
+        timeout_source_seconds=source_timeout if request_timeout is not None and timeout != request_timeout else None,
     )
 
 

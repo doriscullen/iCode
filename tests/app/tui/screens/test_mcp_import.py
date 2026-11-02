@@ -20,6 +20,7 @@ from chrys.app.tui.i18n import LocaleController
 from chrys.app.tui.screens.agents.import_mcp_dialog import (
     _DESCRIPTION,
     _DESCRIPTION_SCOPED,
+    _EMPTY_SOURCE,
     _NO_AGENTS,
     _SCOPE,
     _SCOPE_EVERY_PROJECT,
@@ -313,6 +314,7 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
                     ("Command", format_mcp_command_line("npx", ["-y", "my server"])),
                     ("Environment Variables", [("API_KEY", "{{KEY}}"), ("MODE", "fast")]),
                     # The prefix the import gives it, below the settings, as the agent's MCP card shows it.
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("local"),
                 ],
                 True,
@@ -324,6 +326,7 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
                     _CLAUDE_USER,
                     ("URL", "https://x.test/mcp"),
                     ("Headers", [("Authorization", "Bearer abc123")]),
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("remote"),
                 ],
                 True,
@@ -493,13 +496,24 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
         project = _scope("Claude Code", f"project, used only in {workspace}")
         # The scope names the folder in the card's body, where a long path can wrap, not beside the name.
         assert _cards_in(dialog) == [
-            ("here", [_transport("HTTP"), local, ("URL", "https://x.test/mcp"), _prefix("here")], True),
+            (
+                "here",
+                [
+                    _transport("HTTP"),
+                    local,
+                    ("URL", "https://x.test/mcp"),
+                    ("Available Tool Scope", "All server tools"),
+                    _prefix("here"),
+                ],
+                True,
+            ),
             (
                 "here-too",
                 [
                     _transport("STDIO"),
                     local,
                     ("Command", format_mcp_command_line("uvx", ["here-too"])),
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("here-too"),
                 ],
                 True,
@@ -510,6 +524,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
                     _transport("STDIO"),
                     project,
                     ("Command", format_mcp_command_line("codegraph", ["serve", "--mcp"])),
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("codegraph"),
                 ],
                 True,
@@ -520,6 +535,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
                     _transport("STDIO"),
                     _CLAUDE_USER,
                     ("Command", format_mcp_command_line("uvx", ["everywhere"])),
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("everywhere"),
                 ],
                 True,
@@ -528,8 +544,8 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
         # What importing changes is said once, above the cards.
         (notice,) = dialog.query(".mcp-import-notice")
         assert str(notice.render()) == (
-            "Claude Code uses the servers whose scope is local or project only in the folder their card names. "
-            "Once imported, iCode uses them in every project."
+            "In Claude Code, servers with local or project scope are used only in the folder shown on each card. "
+            "After import, iCode uses them in every project."
         )
         assert dialog.query_one("#mcp-import-servers").children[0] is notice
 
@@ -590,8 +606,9 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         # The command may hold a credential: the warning, saved in the description, never names it.
         helper = (
             "The headers helper is not imported: it returns a set of headers, while iCode credential commands "
-            "supply one value. Add the headers under Headers yourself. For a value supplied by a command, "
-            "configure {{!command}} manually and review its working folder and refresh behavior."
+            "supply one value. After import, open this server's settings and add the required Headers. "
+            "For a value supplied by a command, configure {{!command}} manually and review its working folder "
+            "and refresh behavior."
         )
         credential = (
             "Authorization references ANTHROPIC_API_KEY, which Claude Code replaces with an empty string for remote servers. "
@@ -604,7 +621,7 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
             "refresh flow. If the server accepts a manually supplied valid token or supports another "
             "authentication method, configure authentication headers as it requires."
         )
-        unknown = "Not imported, iCode has no matching setting: future."
+        unknown = "These settings are not imported: future."
         warnings = _warning_texts(dialog)
         assert len(warnings) == 7
         assert all(warning.startswith("⚠ ") for warning in warnings)
@@ -851,7 +868,7 @@ async def test_claude_timeout_and_literal_braces_survive_preview_edit_and_save(
         assert text.count("MCP Request Timeout") == 1
         assert "Literal braces are escaped using iCode syntax; the text received by the server is unchanged." in text
         assert "Tool permissions from Claude Code are not imported (toolPermissions)." in text
-        assert "Not imported, iCode has no matching setting: tools." in text
+        assert "These settings are not imported: tools." in text
         converted.value = True
         await _import_ticked(dialog, pilot)
         await _cards(panel, pilot, 1)
@@ -1476,6 +1493,8 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                     ("Enabled", "No"),
                     ("Command", format_mcp_command_line("npx", ["server-files"])),
                     ("Environment Variables", [("T", "{{FILES_TOKEN}}")]),
+                    ("MCP Request Timeout", "60 s"),
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("files"),
                 ],
                 True,
@@ -1494,6 +1513,10 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                     ("Description", description),
                     _scope("pi", f"project, used only in {workspace}"),
                     ("URL", "https://docs.test/mcp"),
+                    ("MCP Request Timeout", "60 s"),
+                    ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "On demand — load tools as needed"),
+                    ("Initially Visible Tools (optional)", "No tools"),
                     _prefix("docs"),
                 ],
                 True,
@@ -1509,12 +1532,23 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
             "box" if widget.has_class("mcp-import-settings") else str(widget.render())
             for widget in card.query(".mcp-import-field-label, .mcp-import-settings")
         ]
-        assert order == ["Transport", "Description", "Scope in pi", "box", "URL", "Tool Name Prefix"]
+        assert order == [
+            "Transport",
+            "Description",
+            "Scope in pi",
+            "box",
+            "URL",
+            "MCP Request Timeout",
+            "Available Tool Scope",
+            "Loading Strategy",
+            "Initially Visible Tools (optional)",
+            "Tool Name Prefix",
+        ]
         assert str(card.query_one(".mcp-import-settings").border_title) == "HTTP Options"
         (notice,) = dialog.query(".mcp-import-notice")
         assert str(notice.render()) == (
-            "pi uses the servers whose scope is project only in the folder their card names. "
-            "Once imported, iCode uses them in every project."
+            "In pi, servers with project scope are used only in the folder shown on each card. "
+            "After import, iCode uses them in every project."
         )
         (docs,) = await _wait_for_rows(dialog, pilot, 1)
         docs.value = True
@@ -1708,10 +1742,10 @@ async def test_an_agent_with_no_servers_shows_the_hatched_empty_state_of_the_mcp
         )
         (empty,) = dialog.query(HatchedEmptyState)
 
-        # The highlighted agent in the sidebar says whose list it is, so the label is the MCP tab's own.
-        assert empty.label == "No MCP servers configured"
+        # Keep the hatch label short; the separate message can wrap the recovery action.
+        assert empty.label == Localizer("en").render(_EMPTY_SOURCE.bind())
         assert empty.has_class("mcp-import-empty")
-        assert not dialog.query(".mcp-import-message")
+        assert "then reopen import" in str(dialog.query_one(".mcp-import-message", Static).render())
         # It ends where the cards end, a line above the buttons.
         assert (empty.styles.margin.right, empty.styles.margin.bottom) == (1, 1)
 
@@ -1729,6 +1763,7 @@ async def test_a_server_whose_source_names_no_transport_has_no_transport_field(t
                 [
                     _scope("Plain Agent", "user, used in every project"),
                     ("Command", format_mcp_command_line("uvx", [])),
+                    ("Available Tool Scope", "All server tools"),
                     _prefix("untyped"),
                 ],
                 True,
@@ -1793,4 +1828,4 @@ async def test_cards_and_the_empty_state_follow_a_locale_switch(tmp_path: Path) 
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         sources.highlighted = sources.get_option_index("empty")
         await wait_for(lambda: bool(dialog.query(HatchedEmptyState)), pilot=pilot, description="the empty state")
-        assert dialog.query_one(HatchedEmptyState).label == "未配置 MCP 服务器"
+        assert dialog.query_one(HatchedEmptyState).label == chinese.render(_EMPTY_SOURCE.bind())

@@ -50,6 +50,9 @@ class UnsupportedReason(StrEnum):
     VALUE_FROM_COMMAND = "value_from_command"
     VARIABLE_NAME = "variable_name"
     REMOTE_ENVIRONMENT = "remote_environment"
+    HEADER_NAME_COLLISION = "header_name_collision"
+    TEMPLATE_IN_FIELD_NAME = "template_in_field_name"
+    HEADER_VALUE_ENCODING = "header_value_encoding"
 
 
 class ImportWarningKind(StrEnum):
@@ -70,6 +73,9 @@ class ImportWarningKind(StrEnum):
     OPTIONAL_VARIABLE = "optional_variable"
     DENY_LIST = "deny_list"
     LITERAL_BRACES_ESCAPED = "literal_braces_escaped"
+    INVALID_HEADER_IGNORED = "invalid_header_ignored"
+    ZERO_TIMEOUT_IGNORED = "zero_timeout_ignored"
+    TOOL_OUTPUT_LIMIT_IGNORED = "tool_output_limit_ignored"
 
 
 class SourceErrorKind(StrEnum):
@@ -81,6 +87,7 @@ class SourceErrorKind(StrEnum):
     INVALID_TOML = "invalid_toml"
     NOT_AN_OBJECT = "not_an_object"
     INVALID_CONFIG = "invalid_config"
+    INVALID_ENCODING = "invalid_encoding"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +104,9 @@ class ImportWarning:
     ``original`` is the helper command that was not imported, the
     comma-separated names of the fields, files or tool rules not imported,
     the working folder or sign-in provider that was dropped, or the tools
-    still offered.
+    still offered. For ``INVALID_HEADER_IGNORED``, ``field`` is the source
+    setting path and ``original`` is the reason code ``name`` or ``value``.
+    ``TOOL_OUTPUT_LIMIT_IGNORED`` names the omitted settings without their values.
     """
 
     kind: ImportWarningKind
@@ -108,8 +117,13 @@ class ImportWarning:
 
 @dataclass(frozen=True, slots=True)
 class McpSourceError:
+    """Safe source-location metadata without the source line or exception text."""
+
     path: str
     kind: SourceErrorKind
+    field: str = ""
+    line: int | None = None
+    column: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +142,8 @@ class McpImportCandidate:
     the entry names none the importer can read. ``scope_path`` is the folder
     the source uses the server in, as the source recorded it; empty when the
     source uses it in every folder, as iCode will once it is imported.
+    ``unsupported_field`` and ``unsupported_variable`` identify the source
+    setting and variable name behind a refusal; they never contain a value.
     """
 
     name: str
@@ -141,6 +157,9 @@ class McpImportCandidate:
     scope_path: str = ""
     # Preview metadata only; the connection uses config.request_timeout in seconds.
     timeout_source_ms: int | None = None
+    timeout_source_seconds: int | float | None = None
+    unsupported_field: str = ""
+    unsupported_variable: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,9 +202,19 @@ class McpImportSource(Protocol):
 
 
 class SourceReadError(Exception):
-    def __init__(self, kind: SourceErrorKind) -> None:
+    def __init__(
+        self,
+        kind: SourceErrorKind,
+        *,
+        field: str = "",
+        line: int | None = None,
+        column: int | None = None,
+    ) -> None:
         super().__init__(kind.value)
         self.kind = kind
+        self.field = field
+        self.line = line
+        self.column = column
 
 
 def read_source_bytes(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> bytes | None:
