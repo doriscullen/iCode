@@ -11,7 +11,6 @@ from xml.etree import ElementTree
 
 import pytest
 from textual.app import App
-from textual.widgets import Static
 
 from chrys.app.tui.i18n import LocaleController
 from chrys.app.tui.screens.agents.import_mcp_dialog import ImportMcpServersDialog, _ImportCard
@@ -20,6 +19,7 @@ from chrys.app.tui.widgets import HatchedEmptyState
 from chrys.foundation.config.settings import Settings
 from chrys.service.mcp.importers import ImportContext
 from chrys.service.mcp.importers.pi import PiSource
+from tests.app.tui.screens._mcp_import_support import _card_text
 from tests.support.pilot_barrier import screen_is_settled
 from tests.support.waiting import wait_for
 
@@ -52,10 +52,6 @@ def _source(tmp_path: Path, raw: str | bytes) -> ImportContext:
     return ImportContext(str(workspace), home, {})
 
 
-def _text(card: _ImportCard) -> str:
-    return "\n".join(str(widget.render()) for widget in card.query(Static))
-
-
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
 async def test_pi_preview_shows_final_loading_and_initial_tools(tmp_path: Path, locale: str) -> None:
     context = _source(
@@ -77,17 +73,17 @@ async def test_pi_preview_shows_final_loading_and_initial_tools(tmp_path: Path, 
             pilot=pilot,
             description="pi loading previews have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
-        on_demand = _text(cards["on-demand"])
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
+        on_demand = await _card_text(cards["on-demand"], pilot)
         assert ("60 s" if locale == "en" else "60 秒") in on_demand
         assert ("On demand" if locale == "en" else "按需加载") in on_demand
         assert ("Initially Visible Tools" if locale == "en" else "初始可见工具") in on_demand
         assert "inspect" in on_demand and "write_*" in on_demand
         assert ("this server's settings" if locale == "en" else "该服务器设置") in on_demand
-        full = _text(cards["full"])
+        full = await _card_text(cards["full"], pilot)
         assert ("Full — load all available tools" if locale == "en" else "全部加载") in full
         assert ("Initially Visible Tools" if locale == "en" else "初始可见工具") not in full
-        none = _text(cards["none"])
+        none = await _card_text(cards["none"], pilot)
         assert ("No tools" if locale == "en" else "无工具") in none
         assert "write_*" in none
         assert ("if shown" if locale == "en" else "如有显示") in none
@@ -121,13 +117,13 @@ async def test_pi_literal_timeout_and_cwd_repairs_are_visible(tmp_path: Path, lo
             pilot=pilot,
             description="pi conversion previews have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
-        relative = _text(cards["relative"])
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
+        relative = await _card_text(cards["relative"], pilot)
         assert "server-folder" in relative and context.workspace_cwd in relative
         assert ("Literal braces are escaped" if locale == "en" else "字面花括号已按 iCode 写法转义") in relative
         assert ("2 s (source: 1.501 s)" if locale == "en" else "2 秒（源配置：1.501 秒）") in relative  # noqa: RUF001
-        assert str(context.home / "server-home") in _text(cards["home"])
-        unlimited = _text(cards["unlimited"])
+        assert str(context.home / "server-home") in await _card_text(cards["home"], pilot)
+        unlimited = await _card_text(cards["unlimited"], pilot)
         assert ("source: no timeout limit" if locale == "en" else "源配置：无超时上限") in unlimited  # noqa: RUF001
         assert "source: inf" not in unlimited
 
@@ -153,23 +149,21 @@ async def test_pi_non_ascii_header_refusal_has_safe_actionable_field(tmp_path: P
             pilot=pilot,
             description="pi unsupported previews have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
         for name in ("encoding", "command"):
             cards[name].set_collapsed(False, scroll_visible=False)
             assert cards[name].row.disabled
         await pilot.pause()
-        encoding = _text(cards["encoding"])
+        encoding = await _card_text(cards["encoding"], pilot)
         assert "mcpServers.encoding.headers.X-Test" in encoding
         assert (
             "ASCII representation accepted by the server" if locale == "en" else "服务器接受的 ASCII 表示"
         ) in encoding
-        assert ("continue using the source application" if locale == "en" else "继续使用源应用") in encoding
-        assert "mcpServers.command.env.TOKEN" in _text(cards["command"])
+        assert ("then reopen import" if locale == "en" else "重新打开导入") in encoding
+        assert "mcpServers.command.env.TOKEN" in await _card_text(cards["command"], pilot)
         assert not cards["variable"].row.disabled
         diagnostics = "\n".join(
-            str(widget.render())
-            for card in cards.values()
-            for widget in card.query(".mcp-import-warning, .mcp-import-note")
+            str(widget.render()) for card in cards.values() for widget in card.query(".mcp-import-warning")
         )
         assert "private-secret-" not in diagnostics
 
@@ -212,7 +206,7 @@ async def test_pi_mcp_servers_container_error_names_required_object(tmp_path: Pa
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
 @pytest.mark.parametrize("width", [80, 120])
-async def test_empty_source_repair_action_is_visible_at_real_width(tmp_path: Path, locale: str, width: int) -> None:
+async def test_empty_source_shows_only_empty_state_at_real_width(tmp_path: Path, locale: str, width: int) -> None:
     app = _Preview(_source(tmp_path, '{"mcpServers":{}}'), locale)
     async with app.run_test(size=(width, 42)) as pilot:
         await wait_for(
@@ -220,12 +214,8 @@ async def test_empty_source_repair_action_is_visible_at_real_width(tmp_path: Pat
             pilot=pilot,
             description="empty source layout has settled",
         )
-        action = app.dialog.query_one(".mcp-import-message", Static)
-        visible_lines = "".join(action.render_line(y).text for y in range(action.size.height))
-        expected = "then reopen import." if locale == "en" else "然后重新打开导入。"
-        assert re.sub(r"\s+", "", expected) in re.sub(r"\s+", "", visible_lines)
-        assert "…" not in visible_lines
-        assert app.dialog.region.contains_region(action.region)
+        assert not app.dialog.query(".mcp-import-message")
+        expected = "No MCP servers found." if locale == "en" else "未找到 MCP 服务器。"
         svg = ElementTree.fromstring(app.export_screenshot())
         screen_text = "".join("".join(node.itertext()) for node in svg.iter("{http://www.w3.org/2000/svg}text"))
         assert re.sub(r"\s+", "", expected) in re.sub(r"[\s\u2500-\u259f]+", "", screen_text)

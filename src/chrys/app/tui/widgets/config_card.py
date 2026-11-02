@@ -127,6 +127,8 @@ class CollapsibleConfigCard(ConfigCard):
         padding: 0 1;
         color: $secondary;
         text-style: bold;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
     CollapsibleConfigCard CollapsibleTitle.config-card-title:hover {
         background: $block-hover-background;

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App
-from textual.widgets import Button, Static
+from textual.widgets import Button
 
 from chrys.app.tui.i18n import LocaleController
 from chrys.app.tui.screens.agents.import_mcp_dialog import ImportMcpServersDialog, _ImportCard
@@ -19,6 +19,7 @@ from chrys.service.mcp.importers.codex import CodexSource
 from chrys.service.profiles.agents.loader import load_profile_from_yaml
 from chrys.service.profiles.agents.schema import AgentProfile, MCPServerConfig, ToolsConfig
 from chrys.service.profiles.agents.serializer import save_profile
+from tests.app.tui.screens._mcp_import_support import _card_text
 from tests.support.pilot_barrier import screen_is_settled
 from tests.support.waiting import wait_for
 
@@ -53,10 +54,6 @@ def _source(tmp_path: Path, raw: str | bytes) -> ImportContext:
     return ImportContext(None, tmp_path / "home", {"CODEX_HOME": str(codex)})
 
 
-def _text(card: _ImportCard) -> str:
-    return "\n".join(str(widget.render()) for widget in card.query(Static))
-
-
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
 async def test_codex_tool_scope_and_timeout_preview_survive_import_and_save(tmp_path: Path, locale: str) -> None:
     context = _source(
@@ -74,12 +71,18 @@ async def test_codex_tool_scope_and_timeout_preview_survive_import_and_save(tmp_
             pilot=pilot,
             description="Codex previews have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
-        assert ("All server tools" if locale == "en" else "所有服务器工具") in _text(cards["all"])
-        assert ("Only these tools: inspect" if locale == "en" else "仅以下工具：inspect") in _text(cards["selected"])  # noqa: RUF001
-        assert ("No tools" if locale == "en" else "无工具") in _text(cards["none"])
-        assert ("2 s (source: 1.501 s)" if locale == "en" else "2 秒（源配置：1.501 秒）") in _text(cards["selected"])  # noqa: RUF001
-        assert ("Use iCode default" if locale == "en" else "使用 iCode 默认值") in _text(cards["zero"])
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
+        assert ("All server tools" if locale == "en" else "所有服务器工具") in await _card_text(cards["all"], pilot)
+        assert ("Only these tools: inspect" if locale == "en" else "仅以下工具：inspect") in await _card_text(  # noqa: RUF001
+            cards["selected"], pilot
+        )
+        assert ("No tools" if locale == "en" else "无工具") in await _card_text(cards["none"], pilot)
+        assert ("2 s (source: 1.501 s)" if locale == "en" else "2 秒（源配置：1.501 秒）") in await _card_text(  # noqa: RUF001
+            cards["selected"], pilot
+        )
+        assert ("Use iCode default" if locale == "en" else "使用 iCode 默认值") in await _card_text(
+            cards["zero"], pilot
+        )
         for card in cards.values():
             card.row.value = True
         await wait_for(
@@ -122,24 +125,22 @@ async def test_codex_repair_notices_name_fields_without_secret_values(tmp_path: 
             pilot=pilot,
             description="Codex repair notices have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
         for name in ("variable", "collision"):
             cards[name].set_collapsed(False, scroll_visible=False)
         await pilot.pause()
-        assert "bearer_token_env_var" in _text(cards["variable"])
-        assert "BAD-NAME" in _text(cards["variable"])
-        assert "x-test" in _text(cards["collision"])
-        assert ("Literal braces are escaped" if locale == "en" else "字面花括号已按 iCode 写法转义") in _text(
-            cards["literal"]
-        )
-        assert "http_headers.X-Test" in _text(cards["headers"])
-        assert "tools.inspect.output_token_limit" in _text(cards["budgets"])
-        assert "max_tool_result_tokens" in _text(cards["budgets"])
+        assert "bearer_token_env_var" in await _card_text(cards["variable"], pilot)
+        assert "BAD-NAME" in await _card_text(cards["variable"], pilot)
+        assert "x-test" in await _card_text(cards["collision"], pilot)
+        assert (
+            "Literal braces are escaped" if locale == "en" else "字面花括号已按 iCode 写法转义"
+        ) in await _card_text(cards["literal"], pilot)
+        assert "http_headers.X-Test" in await _card_text(cards["headers"], pilot)
+        assert "tools.inspect.output_token_limit" in await _card_text(cards["budgets"], pilot)
+        assert "max_tool_result_tokens" in await _card_text(cards["budgets"], pilot)
         assert cards["variable"].row.disabled and cards["collision"].row.disabled
         diagnostics = "\n".join(
-            str(widget.render())
-            for card in cards.values()
-            for widget in card.query(".mcp-import-warning, .mcp-import-note")
+            str(widget.render()) for card in cards.values() for widget in card.query(".mcp-import-warning")
         )
         assert "secret-" not in diagnostics
         for name in ("literal", "headers", "budgets"):

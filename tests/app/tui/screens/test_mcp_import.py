@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from textual.app import App, ComposeResult
 from textual.geometry import Region
 from textual.widgets import Button, Collapsible, OptionList, Static
 
@@ -29,12 +28,14 @@ from chrys.app.tui.screens.agents.import_mcp_dialog import (
     _UNSUPPORTED_TRANSPORT,
     ImportMcpServersDialog,
     _ImportCard,
+    _ImportItem,
+    _ImportRow,
     _source_error,
     is_already_added,
 )
-from chrys.app.tui.screens.agents.panels.mcp import MCPConfigPanel, MCPConnectionCard, format_mcp_command_line
+from chrys.app.tui.screens.agents.panels.mcp import MCPConfigPanel, format_mcp_command_line
 from chrys.app.tui.theme import CHRYS_THEME
-from chrys.app.tui.widgets import Checkbox, HatchedEmptyState
+from chrys.app.tui.widgets import HatchedEmptyState
 from chrys.foundation.config.settings import Settings
 from chrys.foundation.i18n import Localizer
 from chrys.foundation.i18n.formatting import format_message
@@ -56,6 +57,34 @@ from tests.app.tui.screens._agent_config_support import (
     press_and_answer_confirm,
     registry_with,
 )
+from tests.app.tui.screens._mcp_import_support import (
+    _CLAUDE_USER,
+    _candidate,
+    _cards,
+    _expand_cards,
+    _guidance,
+    _hints,
+    _import_ticked,
+    _ListedSource,
+    _new_dialog,
+    _open_dialog,
+    _open_with,
+    _pane_text,
+    _PanelApp,
+    _prefix,
+    _quiet_environ,
+    _read_cards,
+    _row,
+    _scope,
+    _source,
+    _stdio,
+    _titles,
+    _transport,
+    _wait_for_cards,
+    _wait_for_rows,
+    _warning_texts,
+    _write_claude_servers,
+)
 from tests.support.pilot_barrier import screen_is_settled
 from tests.support.tui_helpers import click_when_settled
 from tests.support.waiting import wait_for
@@ -75,32 +104,6 @@ _CLAUDE_SERVERS: dict[str, Any] = {
 }
 
 
-class _PanelApp(App):
-    locale_controller = LocaleController(Settings(locale="en"))
-
-    def __init__(self, panel: MCPConfigPanel) -> None:
-        super().__init__()
-        self._panel = panel
-        self.notifications: list[str] = []
-
-    def compose(self) -> ComposeResult:
-        yield Static("placeholder")
-        yield self._panel
-
-    def notify(self, message: str, **kwargs: Any) -> None:  # type: ignore[override]
-        self.notifications.append(message)
-
-
-def _quiet_environ(tmp_path: Path) -> dict[str, str]:
-    """An environment in which no agent's config outside *tmp_path* is found, system-wide ones included."""
-    return {
-        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
-        "OPENCODE_TEST_MANAGED_CONFIG_DIR": str(tmp_path / "opencode-managed"),
-        # Otherwise opencode's project search goes up past tmp_path, to the real home folder on Windows.
-        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-    }
-
-
 @pytest.fixture
 def claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point every agent's config dir (and home) at an empty temp dir."""
@@ -114,73 +117,6 @@ def claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "PI_CODING_AGENT_DIR"):
         monkeypatch.setenv(name, "")
     return home
-
-
-def _write_claude_servers(home: Path, servers: dict[str, Any]) -> None:
-    (home / ".claude.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
-
-
-def _stdio(name: str, command: str = "python", *args: str) -> MCPServerConfig:
-    return MCPServerConfig(name=name, transport="stdio", command=command, args=list(args))
-
-
-def _row(dialog: ImportMcpServersDialog, index: int) -> Checkbox:
-    return dialog.query_one(f"#mcp-import-row-{index}", Checkbox)
-
-
-def _pane_text(dialog: ImportMcpServersDialog) -> str:
-    return "\n".join(str(widget.render()) for widget in dialog.query("#mcp-import-servers Static"))
-
-
-def _warning_texts(widget: Widget) -> list[str]:
-    return [
-        " ".join(str(part.render()) for part in group.query(Static))
-        for group in widget.query(".mcp-import-warning-group")
-    ]
-
-
-async def _open_dialog(app: App, panel: MCPConfigPanel, pilot) -> ImportMcpServersDialog:
-    panel.query_one("#mcp-import-btn", Button).press()
-    await wait_for(
-        lambda: isinstance(app.screen, ImportMcpServersDialog) and app.screen.is_mounted,
-        pilot=pilot,
-        description="import dialog is open",
-    )
-    dialog = app.screen
-    if not isinstance(dialog, ImportMcpServersDialog):
-        raise AssertionError(f"unexpected screen {dialog!r}")
-    return dialog
-
-
-async def _wait_for_rows(dialog: ImportMcpServersDialog, pilot, count: int) -> list[Checkbox]:
-    await wait_for(
-        lambda: len(dialog.query(".mcp-import-row")) == count,
-        pilot=pilot,
-        description=f"{count} import rows are listed",
-    )
-    # A card's body and grids compose in later passes than its row appears: wait until nothing is pending.
-    await wait_for(
-        lambda: screen_is_settled(dialog.app, dialog),
-        pilot=pilot,
-        description="every card has composed its fields",
-    )
-    return list(dialog.query(".mcp-import-row").results(Checkbox))
-
-
-async def _import_ticked(dialog: ImportMcpServersDialog, pilot) -> None:
-    await pilot.pause()  # let every tick's Changed reach the dialog before Import reads the ticks
-    confirm = dialog.query_one("#mcp-import-confirm", Button)
-    await wait_for(lambda: not confirm.disabled, pilot=pilot, description="Import is enabled")
-    confirm.press()
-
-
-async def _cards(panel: MCPConfigPanel, pilot, count: int) -> list[MCPConnectionCard]:
-    await wait_for(
-        lambda: len(panel.query(MCPConnectionCard)) == count,
-        pilot=pilot,
-        description=f"{count} MCP cards are mounted",
-    )
-    return list(panel.query(MCPConnectionCard))
 
 
 def test_already_added_compares_connections_not_names() -> None:
@@ -211,7 +147,7 @@ def test_import_messages_keep_english_and_localize_chinese() -> None:
     described = chinese.render(_DESCRIPTION.bind(agent="Claude Code", scope="用户"))
     assert described == "从 Claude Code 导入。它在 Claude Code 中是“用户”服务器，在所有项目中使用。"  # noqa: RUF001
     unsupported = chinese.render(_UNSUPPORTED_TRANSPORT.bind(app="iCode"))
-    assert unsupported == "无法导入：iCode 仅支持 STDIO 和 HTTP MCP 服务器。"  # noqa: RUF001
+    assert unsupported == ("iCode 仅支持 STDIO 和 HTTP MCP 服务器。请改用受支持的连接方式。")
     assert Localizer("en").render(_DESCRIPTION.bind(agent="Claude Code", scope="user")) == _USER_ORIGIN
     scoped = _DESCRIPTION_SCOPED.bind(agent="Claude Code", scope="项目", path="/work/app")
     assert chinese.render(scoped) == (
@@ -241,53 +177,6 @@ async def test_import_button_sits_beside_add_and_is_hidden_when_read_only() -> N
             assert button.disabled is read_only
 
 
-type _FieldValue = str | list[tuple[str, str]]
-
-
-def _field_value(widget: Widget) -> _FieldValue:
-    """A single value's text, or the (name, value) rows of an env or headers grid."""
-    if widget.has_class("mcp-import-pairs"):
-        cells = [str(cell.render()) for cell in widget.children]
-        return list(zip(cells[::2], cells[1::2], strict=True))
-    return str(widget.render())
-
-
-def _cards_in(dialog: ImportMcpServersDialog) -> list[tuple[str, list[tuple[str, _FieldValue]], bool]]:
-    """Each card's name, its (field label, value) pairs and whether it can be ticked, in pane order."""
-    cards = []
-    for card in dialog.query(_ImportCard):
-        labels = [str(label.render()) for label in card.query(".mcp-import-field-label")]
-        values = [_field_value(value) for value in card.query(".mcp-import-field-value, .mcp-import-pairs")]
-        cards.append((str(card.row.label), list(zip(labels, values, strict=True)), not card.row.disabled))
-    return cards
-
-
-async def _wait_for_cards(dialog: ImportMcpServersDialog, pilot, names: list[str], description: str) -> None:
-    """Wait until the pane lists *names* and their cards have composed every field, as after an agent switch."""
-    await wait_for(
-        lambda: (
-            [name for name, _fields, _tickable in _cards_in(dialog)] == names and screen_is_settled(dialog.app, dialog)
-        ),
-        pilot=pilot,
-        description=description,
-    )
-
-
-def _transport(name: str) -> tuple[str, str]:
-    return ("Transport", name)
-
-
-def _scope(agent: str, value: str) -> tuple[str, str]:
-    return (f"Scope in {agent}", value)
-
-
-def _prefix(value: str) -> tuple[str, str]:
-    return ("Tool Name Prefix", value)
-
-
-_CLAUDE_USER = _scope("Claude Code", "user, used in every project")
-
-
 async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_home: Path) -> None:
     _write_claude_servers(
         claude_home,
@@ -305,16 +194,18 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
         dialog = await _open_dialog(app, panel, pilot)
         await _wait_for_rows(dialog, pilot, 5)
 
-        assert _cards_in(dialog) == [
+        assert await _read_cards(dialog, pilot) == [
             (
                 "local",
                 [
-                    _transport("STDIO"),
+                    _source(claude_home / ".claude.json"),
                     _CLAUDE_USER,
+                    _transport("STDIO"),
                     ("Command", format_mcp_command_line("npx", ["-y", "my server"])),
                     ("Environment Variables", [("API_KEY", "{{KEY}}"), ("MODE", "fast")]),
                     # The prefix the import gives it, below the settings, as the agent's MCP card shows it.
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("local"),
                 ],
                 True,
@@ -322,22 +213,47 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
             (
                 "remote",
                 [
-                    _transport("HTTP"),
+                    _source(claude_home / ".claude.json"),
                     _CLAUDE_USER,
+                    _transport("HTTP"),
                     ("URL", "https://x.test/mcp"),
                     ("Headers", [("Authorization", "Bearer abc123")]),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("remote"),
                 ],
                 True,
             ),
-            # Not importable, with no prefix, SSE included: shown as written, greyed out, with the reason the transport gives.
-            ("legacy", [_transport("SSE"), _CLAUDE_USER, ("URL", "https://x.test/sse")], False),
-            ("socket", [_transport("WS"), _CLAUDE_USER, ("URL", "wss://x.test/mcp")], False),
+            # Not importable: shown as written under its source settings, greyed out, with the reason the transport gives.
+            (
+                "legacy",
+                [
+                    _source(claude_home / ".claude.json"),
+                    _CLAUDE_USER,
+                    _transport("SSE"),
+                    ("URL", "https://x.test/sse"),
+                ],
+                False,
+            ),
+            (
+                "socket",
+                [
+                    _source(claude_home / ".claude.json"),
+                    _CLAUDE_USER,
+                    _transport("WS"),
+                    ("URL", "wss://x.test/mcp"),
+                ],
+                False,
+            ),
             # No type: STDIO, as Claude Code reads it, even though it can't be imported.
             (
                 "untyped",
-                [_transport("STDIO"), _CLAUDE_USER, ("Command", format_mcp_command_line("${HOME}/bin/server", []))],
+                [
+                    _source(claude_home / ".claude.json"),
+                    _CLAUDE_USER,
+                    _transport("STDIO"),
+                    ("Command", format_mcp_command_line("${HOME}/bin/server", [])),
+                ],
                 False,
             ),
         ]
@@ -348,12 +264,11 @@ async def test_each_server_is_a_card_showing_the_settings_it_will_import(claude_
             True,
             True,
         ]
-        assert _pane_text(dialog).count("Can't import: iCode supports only STDIO and HTTP") == 2
-        # The header holds the fold toggle and the ticked name only, as the agent's MCP card holds the name.
-        for card in dialog.query(_ImportCard):
-            fold, name = card.query_one(".mcp-import-card-header").children
-            assert fold.has_class("mcp-import-fold")
-            assert list(name.children) == [card.row]
+        # The tick sits outside the card, level with its title line; the title alone folds it.
+        for item in dialog.query(_ImportItem):
+            assert (item.row, item.card) == (item.query_one(_ImportRow), item.query_one(_ImportCard))
+            assert item.row.parent is item
+        assert _pane_text(dialog).count("iCode supports only STDIO and HTTP") == 2
         # Every server here is one Claude Code uses in every project, so there is nothing to point out.
         assert not dialog.query(".mcp-import-notice")
 
@@ -377,6 +292,9 @@ async def test_env_vars_headers_and_urls_show_one_line_each_in_equal_columns_lik
     async with app.run_test(size=(120, 60)) as pilot:
         dialog = await _open_dialog(app, panel, pilot)
         await _wait_for_rows(dialog, pilot, 2)
+        # The cards open folded; the pair grids and values below assert painted layout.
+        _expand_cards(dialog)
+        await pilot.pause()
         grids = list(dialog.query(".mcp-import-pairs"))
         (url,) = [field for field in dialog.query(".mcp-import-field-value") if str(field.render()) == long_url]
 
@@ -424,24 +342,48 @@ async def test_cards_that_cant_be_ticked_open_folded_and_a_rebuild_keeps_the_use
         def folds() -> list[tuple[str, bool, bool]]:
             """Each card's server name, whether it is folded and whether its body shows, in pane order."""
             return [
-                (str(card.row.label), card.collapsed, card.query_one(".config-card-body").display)
+                (card.row.server_name, card.collapsed, card.query_one(".config-card-body").display)
                 for card in dialog.query(_ImportCard)
             ]
 
-        # The server that can't be imported and the one already added open folded to their header.
-        assert folds() == [("new", False, True), ("legacy", True, False), ("fs", True, False)]
-        # The settings sit in a section titled like the agent's MCP card, whatever the transport.
-        titles = [str(section.border_title) for section in dialog.query(".mcp-import-settings")]
-        assert titles == ["STDIO Options", "SSE Options", "STDIO Options"]
+        # Every card opens folded to its title line, as on the agent's MCP card.
+        assert folds() == [("new", True, False), ("legacy", True, False), ("fs", True, False)]
+        # The title says what the server is: transport, then its program or URL host, right after the name.
+        titles = _titles(dialog)
+        assert titles[0] == "▶ new: STDIO · uvx"
+        assert titles[1].startswith("▶ legacy: SSE · x.test")
+        assert titles[1].endswith("Can't import")
+        assert titles[2] == "▶ fs: STDIO · uvx  Imported"
 
         new, legacy, _fs = dialog.query(_ImportCard)
-        await click_when_settled(pilot, legacy.query_one(".mcp-import-fold"))
-        new.query_one(".mcp-import-fold").scroll_visible(animate=False)
-        await click_when_settled(pilot, new.query_one(".mcp-import-fold"))
-        expected = [("new", True, False), ("legacy", False, True), ("fs", True, False)]
+        await click_when_settled(pilot, legacy.query_one(".mcp-import-title"))
+        new.query_one(".mcp-import-title").scroll_visible(animate=False)
+        await click_when_settled(pilot, new.query_one(".mcp-import-title"))
+        expected = [("new", False, True), ("legacy", False, True), ("fs", True, False)]
         await wait_for(lambda: folds() == expected, pilot=pilot, description="the clicked cards fold and unfold")
-        # The fold toggle is not the checkbox.
+        # The fold target is not the checkbox.
         assert new.row.value is False
+
+        _expand_cards(dialog)
+        await wait_for(
+            lambda: dialog.query(".mcp-import-section"),
+            pilot=pilot,
+            description="the unfolded cards compose their settings",
+        )
+        # The settings sit in a section titled like the agent's MCP card; the SSE server, which can't be
+        # imported, has no converted boxes — only what its source wrote, in its one box.
+        titles = [str(section.border_title) for section in dialog.query(".mcp-import-section")]
+        assert titles == [
+            "STDIO Options",
+            "Tool Access",
+            "Tool Loading",
+            "Naming & Limits",
+            "Connection Settings in Source",
+            "STDIO Options",
+            "Tool Access",
+            "Tool Loading",
+            "Naming & Limits",
+        ]
 
         # A pane rebuild (as after a locale switch) keeps the folds the user chose.
         dialog.refresh_localization()
@@ -450,6 +392,44 @@ async def test_cards_that_cant_be_ticked_open_folded_and_a_rebuild_keeps_the_use
             pilot=pilot,
             description="the rebuilt cards keep their folds",
         )
+
+
+async def test_the_title_line_folds_the_card_away_from_the_checkbox(claude_home: Path) -> None:
+    """The title line folds the card, arrow and all, and leaves its tick alone."""
+    _write_claude_servers(claude_home, {"fs": {"command": "uvx", "args": ["mcp-fs"]}})
+    panel = MCPConfigPanel([])
+    app = _PanelApp(panel)
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = await _open_dialog(app, panel, pilot)
+        (row,) = await _wait_for_rows(dialog, pilot, 1)
+        card = dialog.query_one(_ImportCard)
+        title = card.query_one(".mcp-import-title")
+        assert card.collapsed is True and card.query_one(".config-card-body").display is False
+        assert _titles(dialog) == ["▶ fs: STDIO · uvx"]
+
+        # Clicking the title line unfolds the card…
+        await click_when_settled(pilot, title)
+        await wait_for(
+            lambda: card.collapsed is False and card.query_one(".config-card-body").display is True,
+            pilot=pilot,
+            description="the title line unfolds the card",
+        )
+        # …its arrow now pointing the way back.
+        assert _titles(dialog) == ["▼ fs"]
+        await click_when_settled(pilot, title)
+        await wait_for(
+            lambda: card.collapsed is True and card.query_one(".config-card-body").display is False,
+            pilot=pilot,
+            description="the title line folds the card again",
+        )
+        # Enter and Space fold it too, and never tick it.
+        title.focus()
+        await pilot.press("enter")
+        await wait_for(lambda: card.collapsed is False, pilot=pilot, description="Enter unfolds the card")
+        await pilot.press("space")
+        await wait_for(lambda: card.collapsed is True, pilot=pilot, description="Space folds the card again")
+        # It is a fold target, never a tick: the checkbox keeps its own value.
+        assert row.value is False
 
 
 async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_description(tmp_path: Path) -> None:
@@ -494,15 +474,19 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
 
         local = _scope("Claude Code", f"local, used only in {workspace}")
         project = _scope("Claude Code", f"project, used only in {workspace}")
+        claude_json = _source(home / ".claude.json")
+        mcp_json = _source(workspace / ".mcp.json")
         # The scope names the folder in the card's body, where a long path can wrap, not beside the name.
-        assert _cards_in(dialog) == [
+        assert await _read_cards(dialog, pilot) == [
             (
                 "here",
                 [
-                    _transport("HTTP"),
+                    claude_json,
                     local,
+                    _transport("HTTP"),
                     ("URL", "https://x.test/mcp"),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("here"),
                 ],
                 True,
@@ -510,10 +494,12 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
             (
                 "here-too",
                 [
-                    _transport("STDIO"),
+                    claude_json,
                     local,
+                    _transport("STDIO"),
                     ("Command", format_mcp_command_line("uvx", ["here-too"])),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("here-too"),
                 ],
                 True,
@@ -521,10 +507,12 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
             (
                 "codegraph",
                 [
-                    _transport("STDIO"),
+                    mcp_json,
                     project,
+                    _transport("STDIO"),
                     ("Command", format_mcp_command_line("codegraph", ["serve", "--mcp"])),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("codegraph"),
                 ],
                 True,
@@ -532,10 +520,12 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
             (
                 "everywhere",
                 [
-                    _transport("STDIO"),
+                    claude_json,
                     _CLAUDE_USER,
+                    _transport("STDIO"),
                     ("Command", format_mcp_command_line("uvx", ["everywhere"])),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("everywhere"),
                 ],
                 True,
@@ -591,46 +581,47 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         dialog = await _open_dialog(app, panel, pilot)
         local, remote, signed_in = await _wait_for_rows(dialog, pilot, 3)
         dropped = (
-            "HOST gave API_HOST a default value. iCode variables can't have one, so it is now "
-            "{{API_HOST}}. Set API_HOST before starting iCode, or the connection fails."
+            "HOST now uses {{API_HOST}}; the default for API_HOST was not imported. "
+            "Set API_HOST to a nonempty value before starting iCode, or fill in a fixed value after import."
         )
         dropped_token = (
-            "Authorization gave TOKEN a default value. iCode variables can't have one, so it is now "
-            "{{TOKEN}}. Set TOKEN before starting iCode, or the connection fails."
+            "Authorization now uses {{TOKEN}}; the default for TOKEN was not imported. "
+            "Set TOKEN to a nonempty value before starting iCode, or fill in a fixed value after import."
         )
         project_dir = (
-            "ROOT references CLAUDE_PROJECT_DIR, which Claude Code sets for the servers it starts but doesn't fill "
-            "in here: the server gets the reference as written, or its default. iCode doesn't set CLAUDE_PROJECT_DIR "
-            "and fails the connection unless you set it before starting iCode. Write the folder path instead."
+            "ROOT references CLAUDE_PROJECT_DIR, which iCode does not set automatically. "
+            "After import, fill in the required project folder path in this field, "
+            "or set CLAUDE_PROJECT_DIR before starting iCode."
         )
         # The command may hold a credential: the warning, saved in the description, never names it.
         helper = (
-            "The headers helper is not imported: it returns a set of headers, while iCode credential commands "
-            "supply one value. After import, open this server's settings and add the required Headers. "
-            "For a value supplied by a command, configure {{!command}} manually and review its working folder "
-            "and refresh behavior."
+            "The headers helper is not imported. After import, add the required headers in this server's settings. "
+            "For a value supplied by a command, use {{!command}} with a command that outputs only that header's value. "
+            "In iCode, do not use a helper that outputs a JSON object of headers."
         )
         credential = (
-            "Authorization references ANTHROPIC_API_KEY, which Claude Code replaces with an empty string for remote servers. "
-            "iCode replaces that variable reference with an empty string too; other text in the value is kept. "
-            "A header is omitted only if this leaves its entire value empty after trimming. To send this credential, "
-            "copy it into a variable with another name and reference that."
+            "The reference to ANTHROPIC_API_KEY in Authorization is removed, as in Claude Code. "
+            "Other text is kept; a header left empty is omitted. To send this credential in iCode, "
+            "set an environment variable with another name before starting iCode, then reference it in this field."
         )
         oauth = (
-            "OAuth settings and sign-in state are not imported. iCode does not manage the OAuth login or token "
-            "refresh flow. If the server accepts a manually supplied valid token or supports another "
-            "authentication method, configure authentication headers as it requires."
+            "iCode doesn't support OAuth sign-in. After import, configure Headers if the server accepts "
+            "a token or another authentication method. Replace expired tokens yourself, or use a credential command."
         )
-        unknown = "These settings are not imported: future."
+        unknown = (
+            "These settings are not imported: future. If the server needs them, "
+            "configure the required options manually."
+        )
+        # Warnings sit in the card's body, which the card builds when it is unfolded.
+        await _read_cards(dialog, pilot)
         warnings = _warning_texts(dialog)
         assert len(warnings) == 7
-        assert all(warning.startswith("⚠ ") for warning in warnings)
         assert "Affected fields: HOST" in warnings[0]
         assert "Affected fields: ROOT" in warnings[1]
         assert "Affected fields: Authorization" in warnings[2]
-        assert warnings[3] == f"⚠ {helper}"
+        assert warnings[3] == helper
         assert "References to ANTHROPIC_API_KEY are replaced with an empty string" in warnings[4]
-        assert warnings[5:] == [f"⚠ {oauth}", f"⚠ {unknown}"]
+        assert warnings[5:] == [oauth, unknown]
 
         local.value = True
         remote.value = True
@@ -639,9 +630,9 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
 
         await _cards(panel, pilot, 3)
         assert [config.description for config in panel.get_config()] == [
-            f"{_USER_ORIGIN}\n- {dropped}\n- {project_dir}",
-            f"{_USER_ORIGIN}\n- {dropped_token}\n- {helper}",
-            f"{_USER_ORIGIN}\n- {credential}\n- {oauth}\n- {unknown}",
+            f"{_USER_ORIGIN}\n⚠ {dropped}\n⚠ {project_dir}",
+            f"{_USER_ORIGIN}\n⚠ {dropped_token}\n⚠ {helper}",
+            f"{_USER_ORIGIN}\n⚠ {credential}\n⚠ {oauth}\n⚠ {unknown}",
         ]
         # A dropped default may be a secret, and so may the helper command: the saved description repeats neither.
         assert not any(
@@ -673,8 +664,10 @@ async def test_project_directory_warnings_group_defaults_without_hiding_actions(
         dialog = await _open_dialog(app, panel, pilot)
         (row,) = await _wait_for_rows(dialog, pilot, 1)
         card = dialog.query_one(_ImportCard)
+        # Warnings sit in the card's body, which the card builds when it is unfolded.
+        await _read_cards(dialog, pilot)
         (text,) = _warning_texts(card)
-        assert text.startswith("⚠ ")
+        assert not text.startswith("⚠")
         assert "MCP_IMPORT_TEST, WITH_DEFAULT" in text
         assert (
             "The variable default in these fields will not be kept: WITH_DEFAULT."
@@ -686,15 +679,19 @@ async def test_project_directory_warnings_group_defaults_without_hiding_actions(
         assert not card.query(Collapsible)
         assert ("Impact:" if locale == "en" else "影响：") in text  # noqa: RUF001
         assert ("Action:" if locale == "en" else "处理方式：") in text  # noqa: RUF001
+        # Folded back, as it opened.
+        card.set_collapsed(True)
+        await wait_for(lambda: card.collapsed and not card.query_one(".config-card-body").display, pilot=pilot)
         row.value = True
         await pilot.pause()
-        assert card.collapsed is False
+        # Ticking leaves the card folded; only a server just covered unfolds.
+        assert card.collapsed is True
         assert row.value is True and row.disabled is False
         await _import_ticked(dialog, pilot)
         await _cards(panel, pilot, 1)
         (config,) = panel.get_config()
         assert config.env == {"MCP_IMPORT_TEST": "{{CLAUDE_PROJECT_DIR}}", "WITH_DEFAULT": "{{CLAUDE_PROJECT_DIR}}"}
-        assert config.description.count("\n- ") == 3
+        assert config.description.count("\n⚠ ") == 3
         assert "private-default-value" not in config.description
 
 
@@ -716,6 +713,8 @@ async def test_same_variable_warnings_group_fields_within_each_server(claude_hom
     async with app.run_test(size=(120, 60)) as pilot:
         dialog = await _open_dialog(app, panel, pilot)
         await _wait_for_rows(dialog, pilot, 3)
+        # Warnings sit in the card's body, which the card builds when it is unfolded.
+        await _read_cards(dialog, pilot)
         cards = list(dialog.query(_ImportCard))
         texts = []
         for card in cards:
@@ -741,6 +740,8 @@ async def test_warning_values_wrap_to_available_width(claude_home: Path, locale:
     async with app.run_test(size=(120, 42)) as pilot:
         dialog = await _open_dialog(app, app._panel, pilot)
         await _wait_for_rows(dialog, pilot, 1)
+        # The card opens folded; the wrapping assertions below need it laid out.
+        _expand_cards(dialog)
         await pilot.pause()
         title = dialog.query_one(".mcp-import-warning-title", Static)
         grid = dialog.query_one(".mcp-import-warning-fields")
@@ -774,7 +775,7 @@ async def test_import_lists_claude_servers_and_adds_ticked_ones_as_unsaved_cards
         assert [sources.get_option_at_index(i).id for i in range(sources.option_count)] == ["claude_code"]
         assert (github.disabled, remote.disabled, legacy.disabled, templated.disabled) == (False, False, True, True)
         text = _pane_text(dialog)
-        assert "doesn't resolve in URLs" in text
+        assert "doesn't support environment variable references in URLs" in text
         confirm = dialog.query_one("#mcp-import-confirm", Button)
         assert confirm.disabled is True
 
@@ -862,6 +863,8 @@ async def test_claude_timeout_and_literal_braces_survive_preview_edit_and_save(
     async with app.run_test(size=(120, 40)) as pilot:
         dialog = await _open_dialog(app, panel, pilot)
         converted, _plain = await _wait_for_rows(dialog, pilot, 2)
+        # The timeout, the escaped braces and the dropped settings sit in the card's body.
+        await _read_cards(dialog, pilot)
         text = _pane_text(dialog)
         assert preview in text
         assert "1 seconds" not in text
@@ -887,7 +890,7 @@ async def test_claude_timeout_and_literal_braces_survive_preview_edit_and_save(
 
 def _ticks(dialog: ImportMcpServersDialog) -> list[tuple[str, bool, bool]]:
     """Each card's server name, whether its checkbox is ticked and whether it can be changed, in pane order."""
-    return [(str(card.row.label), card.row.value, not card.row.disabled) for card in dialog.query(_ImportCard)]
+    return [(card.row.server_name, card.row.value, not card.row.disabled) for card in dialog.query(_ImportCard)]
 
 
 async def test_servers_already_in_the_agent_show_ticked_and_locked_at_the_bottom(claude_home: Path) -> None:
@@ -1079,46 +1082,6 @@ async def test_ticks_survive_switching_agents_and_import_collects_every_agent(tm
         ]
 
 
-@dataclass
-class _ListedSource:
-    """An agent with the given candidates; ``gate``, when set, holds ``discover`` until the test releases it."""
-
-    source_id: str
-    display_name: str
-    candidates: tuple[McpImportCandidate, ...]
-    gate: threading.Event | None = None
-
-    def detect(self, ctx: ImportContext) -> bool:
-        return True
-
-    def discover(self, ctx: ImportContext) -> McpImportResult:
-        if self.gate is not None and not self.gate.wait(timeout=_DEFAULT_WAIT_TIMEOUT):
-            raise TimeoutError("the test never released discover")
-        return McpImportResult(candidates=self.candidates)
-
-
-def _candidate(name: str, scope: str, config: MCPServerConfig) -> McpImportCandidate:
-    return McpImportCandidate(name, scope, f"/{scope}", config, transport=config.transport)
-
-
-def _new_dialog(app: _PanelApp, sources: list[Any], tmp_path: Path) -> ImportMcpServersDialog:
-    return ImportMcpServersDialog(
-        workspace_cwd=None,
-        existing=[],
-        locale_controller=app.locale_controller,
-        sources=sources,
-        context=ImportContext(workspace_cwd=None, home=tmp_path, environ=_quiet_environ(tmp_path)),
-    )
-
-
-def _open_with(
-    app: _PanelApp, sources: list[Any], tmp_path: Path, results: list[Any] | None = None
-) -> ImportMcpServersDialog:
-    dialog = _new_dialog(app, sources, tmp_path)
-    app.push_screen(dialog, callback=None if results is None else results.append)
-    return dialog
-
-
 async def test_a_ticked_server_locks_the_same_server_elsewhere_and_is_imported_once(tmp_path: Path) -> None:
     github = _stdio("github", "npx", "-y", "server-github")
     first = _ListedSource(
@@ -1137,19 +1100,22 @@ async def test_a_ticked_server_locks_the_same_server_elsewhere_and_is_imported_o
         dialog = _open_with(app, [first, second], tmp_path, results)
         await wait_for(lambda: dialog.is_mounted, pilot=pilot, description="import dialog is open")
         user, project, _fs = await _wait_for_rows(dialog, pilot, 3)
-        covered = "Same server as github (First Agent, user), which is ticked. It is imported once."
+        covered = "Same configuration as the selected github (First Agent, user). It will be imported once."
 
         user.value = True
         await wait_for(lambda: project.disabled, pilot=pilot, description="the same server in another scope is locked")
         assert _ticks(dialog) == [("github", True, True), ("github", False, False), ("fs", False, True)]
         assert [card.has_class("-unavailable") for card in dialog.query(_ImportCard)] == [False, True, False]
-        notes = [str(note.render()) for note in dialog.query(".mcp-import-note") if note.display]
-        assert notes == [covered]
+        # A folded duplicate shows a short status; its explanation appears on unfolding.
+        assert _hints(dialog) == []
+        assert _titles(dialog)[1].endswith("Duplicate")
+        dialog.query(_ImportCard)[1].set_collapsed(False)
+        assert _hints(dialog) == [covered]
 
         # Unticking frees it again.
         user.value = False
         await wait_for(lambda: not project.disabled, pilot=pilot, description="unticking unlocks the other scope")
-        assert not [note for note in dialog.query(".mcp-import-note") if note.display]
+        assert _hints(dialog) == []
 
         # The lock spans agents.
         user.value = True
@@ -1244,7 +1210,7 @@ async def test_imported_servers_are_named_after_their_server_so_their_tools_dont
         # Each card says the prefix it will get; one that can't be imported shows none.
         assert [
             (name, [value for label, value in fields if label == "Tool Name Prefix"])
-            for name, fields, _tickable in _cards_in(dialog)
+            for name, fields, _tickable in await _read_cards(dialog, pilot)
         ] == [
             ("lab-cc-helper", ["lab-cc-helper"]),
             ("my files.v2", ["my_files_v2"]),
@@ -1323,13 +1289,13 @@ async def _broken_detect() -> None:
         (
             "_pane_widgets",
             _broken_pane,
-            "Couldn't read the MCP servers of First Agent. Check file permissions and the log, then reopen import.",
+            "Couldn't load MCP configurations from First Agent. Reopen import to try again. If it still fails, check the log.",
             "Showing the MCP servers of First Agent failed",
         ),
         (
             "_list_sources",
             _broken_detect,
-            "Couldn't look for other agents. See the log for details.",
+            "Couldn't search for MCP configurations. Reopen import to try again. If it still fails, check the log.",
             "Listing agents to import MCP servers from failed",
         ),
     ],
@@ -1430,13 +1396,30 @@ def test_every_import_warning_has_a_message(warning: ImportWarning) -> None:
 
 
 @pytest.mark.parametrize("reason", list(UnsupportedReason))
-def test_every_unsupported_reason_has_a_message(reason: UnsupportedReason) -> None:
-    dialog = ImportMcpServersDialog(workspace_cwd=None, existing=[], locale_controller=None, sources=[])
-    candidate = McpImportCandidate("s", "project", "/p", None, unsupported=reason)
+@pytest.mark.parametrize("locale", ["en", "zh-Hans"])
+def test_every_unsupported_reason_has_a_message(reason: UnsupportedReason, locale: str) -> None:
+    dialog = ImportMcpServersDialog(
+        workspace_cwd=None, existing=[], locale_controller=LocaleController(Settings(locale=locale)), sources=[]
+    )
+    candidate = McpImportCandidate(
+        "s",
+        "project",
+        "/p",
+        None,
+        unsupported=reason,
+        unsupported_field="headers.X-Test",
+        unsupported_variable="BAD-NAME",
+    )
 
     text = dialog._unsupported_note(candidate, "pi")
 
-    assert text and text.startswith("Can't import:") and "{" not in text.replace("{{!command}}", "")
+    assert text and "{" not in text.replace("{{!command}}", "")
+    assert "headers.X-Test" in text
+    assert not text.startswith(("Can't import:", "无法导入："))  # noqa: RUF001
+    if locale == "zh-Hans":
+        assert "请" in text
+    else:
+        assert any(action in text for action in ("Add", "Use", "Keep", "Update", "To use"))
 
 
 @pytest.mark.parametrize("kind", list(SourceErrorKind))
@@ -1484,18 +1467,21 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
         (files,) = await _wait_for_rows(dialog, pilot, 1)
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         assert [str(sources.get_option_at_index(i).prompt) for i in range(sources.option_count)] == ["opencode", "pi"]
-        assert _cards_in(dialog) == [
+        opencode_path = _source(opencode_config)
+        assert await _read_cards(dialog, pilot) == [
             (
                 "files",
                 [
-                    _transport("STDIO"),
+                    opencode_path,
                     _scope("opencode", "global, used in every project"),
                     ("Enabled", "No"),
+                    _transport("STDIO"),
                     ("Command", format_mcp_command_line("npx", ["server-files"])),
                     ("Environment Variables", [("T", "{{FILES_TOKEN}}")]),
-                    ("MCP Request Timeout", "60 s"),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("files"),
+                    ("MCP Request Timeout", "60 s"),
                 ],
                 True,
             )
@@ -1505,46 +1491,53 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
 
         sources.highlighted = sources.get_option_index("pi")
         await _wait_for_cards(dialog, pilot, ["docs"], "pi's servers are shown")
-        assert _cards_in(dialog) == [
+        assert await _read_cards(dialog, pilot) == [
             (
                 "docs",
                 [
+                    _source(pi_project),
+                    _scope("pi", f"project, used only in {workspace}"),
                     _transport("HTTP"),
                     ("Description", description),
-                    _scope("pi", f"project, used only in {workspace}"),
                     ("URL", "https://docs.test/mcp"),
-                    ("MCP Request Timeout", "60 s"),
                     ("Available Tool Scope", "All server tools"),
                     ("Loading Strategy", "On demand — load tools as needed"),
                     ("Initially Visible Tools (optional)", "No tools"),
                     _prefix("docs"),
+                    ("MCP Request Timeout", "60 s"),
                 ],
                 True,
             )
         ]
         description_widget = dialog.query(".mcp-import-field-value")[1]
-        # The two lines wrap once the switched pane is laid out.
+        # The card opened folded; unfold it so the two lines wrap once the switched pane is laid out.
+        _expand_cards(dialog)
+        await pilot.pause()
         await wait_for(lambda: description_widget.region.height >= 2, pilot=pilot, description="the description wraps")
-        # Transport and description in the MCP card's order, then the scope, then the transport's options box,
-        # then the tool name prefix, below the options as on the MCP card.
+        # The source area, then the transport and description the MCP card shows, then its boxes: the
+        # transport's options, Tool Access, Naming & Limits.
         (card,) = dialog.query(_ImportCard)
         order = [
-            "box" if widget.has_class("mcp-import-settings") else str(widget.render())
-            for widget in card.query(".mcp-import-field-label, .mcp-import-settings")
+            "box" if widget.has_class("mcp-import-section") else str(widget.render())
+            for widget in card.query(".mcp-import-field-label, .mcp-import-section")
         ]
         assert order == [
+            "Configuration Source",
+            "Scope in pi",
             "Transport",
             "Description",
-            "Scope in pi",
             "box",
             "URL",
-            "MCP Request Timeout",
+            "box",
             "Available Tool Scope",
+            "box",
             "Loading Strategy",
             "Initially Visible Tools (optional)",
+            "box",
             "Tool Name Prefix",
+            "MCP Request Timeout",
         ]
-        assert str(card.query_one(".mcp-import-settings").border_title) == "HTTP Options"
+        assert str(card.query(".mcp-import-section")[0].border_title) == "HTTP Options"
         (notice,) = dialog.query(".mcp-import-notice")
         assert str(notice.render()) == (
             "In pi, servers with project scope are used only in the folder shown on each card. "
@@ -1570,9 +1563,8 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 "docs",
                 (
                     f"{description}\nImported from pi. There it is a project server, used only in {workspace}.\n"
-                    "- OAuth settings and sign-in state are not imported. iCode does not manage the OAuth login or token "
-                    "refresh flow. If the server accepts a manually supplied valid token or supports another "
-                    "authentication method, configure authentication headers as it requires."
+                    "⚠ iCode doesn't support OAuth sign-in. After import, configure Headers if the server accepts "
+                    "a token or another authentication method. Replace expired tokens yourself, or use a credential command."
                 ),
             ),
         ]
@@ -1651,16 +1643,22 @@ async def test_command_migration_guidance_is_shown_without_copying_the_command(t
         )
         app.push_screen(dialog, callback=results.append)
         (row,) = await _wait_for_rows(dialog, pilot, 1)
-        selector = ".mcp-import-note" if source_id == "pi" else ".mcp-import-warning"
-        guidance = " ".join(str(widget.render()) for widget in dialog.query(selector))
-        assert "configure {{!command}}" in guidance
-        assert "working folder" in guidance
-        assert command not in guidance and "private-command-argument" not in guidance
         assert row.disabled is (source_id == "pi")
+        # A refused server says why under its title; an imported one says what changed in its body.
+        await _read_cards(dialog, pilot)
+        guidance = _guidance(dialog)
+        assert "{{!command}}" in guidance
+        if source_id == "pi":
+            assert "home folder" in guidance
+            assert "one nonempty line of ASCII text" in guidance
+        else:
+            assert "outputs only that header's value" in guidance
+            assert "do not use a helper that outputs a JSON object" in guidance
+        assert command not in guidance and "private-command-argument" not in guidance
 
         app.locale_controller.switch_locale("zh-Hans")
         await wait_for(
-            lambda: "手动" in " ".join(str(widget.render()) for widget in dialog.query(selector)),
+            lambda: ("手动" if source_id == "pi" else "逐项添加所需请求头") in _guidance(dialog),
             pilot=pilot,
             description="the command migration guidance is translated",
         )
@@ -1742,10 +1740,10 @@ async def test_an_agent_with_no_servers_shows_the_hatched_empty_state_of_the_mcp
         )
         (empty,) = dialog.query(HatchedEmptyState)
 
-        # Keep the hatch label short; the separate message can wrap the recovery action.
+        # Empty sources need only the short hatch label.
         assert empty.label == Localizer("en").render(_EMPTY_SOURCE.bind())
         assert empty.has_class("mcp-import-empty")
-        assert "then reopen import" in str(dialog.query_one(".mcp-import-message", Static).render())
+        assert not dialog.query(".mcp-import-message")
         # It ends where the cards end, a line above the buttons.
         assert (empty.styles.margin.right, empty.styles.margin.bottom) == (1, 1)
 
@@ -1757,20 +1755,22 @@ async def test_a_server_whose_source_names_no_transport_has_no_transport_field(t
         dialog = _open_with(app, [_ListedSource("plain", "Plain Agent", (untyped,))], tmp_path)
         await _wait_for_rows(dialog, pilot, 1)
 
-        assert _cards_in(dialog) == [
+        assert await _read_cards(dialog, pilot) == [
             (
                 "untyped",
                 [
+                    _source("/user"),
                     _scope("Plain Agent", "user, used in every project"),
                     ("Command", format_mcp_command_line("uvx", [])),
                     ("Available Tool Scope", "All server tools"),
+                    ("Loading Strategy", "Full — load all available tools"),
                     _prefix("untyped"),
                 ],
                 True,
             )
         ]
         # Nor a transport in the options box's title.
-        assert not dialog.query_one(".mcp-import-settings").border_title
+        assert not dialog.query_one(".mcp-import-section").border_title
 
 
 @dataclass
@@ -1814,16 +1814,15 @@ async def test_cards_and_the_empty_state_follow_a_locale_switch(tmp_path: Path) 
         app.locale_controller.switch_locale("zh-Hans")
         chinese = Localizer("zh-Hans")
         scope = chinese.render(_SCOPE.bind(agent="Listed Agent"))
+        # The pane is rebuilt folded; unfold it again to read the fields it composes in Chinese.
         await wait_for(
-            lambda: (
-                [label for label, _value in _cards_in(dialog)[0][1]][:2] == ["传输方式", scope]
-                and screen_is_settled(app, dialog)
-            ),
+            lambda: bool(dialog.query(_ImportCard)) and screen_is_settled(app, dialog),
             pilot=pilot,
-            description="the card's fields are rendered again in Chinese",
+            description="the card is rebuilt after the locale switch",
         )
-        assert _cards_in(dialog)[0][1][1] == (scope, "用户，在所有项目中使用")  # noqa: RUF001
-        assert _cards_in(dialog)[0][1][2] == ("启用", "否")
+        fields = (await _read_cards(dialog, pilot))[0][1]
+        assert fields[1] == (scope, "用户，在所有项目中使用")  # noqa: RUF001
+        assert fields[2] == ("启用", "否")
 
         sources = dialog.query_one("#mcp-import-sources", OptionList)
         sources.highlighted = sources.get_option_index("empty")

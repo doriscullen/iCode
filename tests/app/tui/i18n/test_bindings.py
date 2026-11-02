@@ -385,6 +385,7 @@ def test_every_declared_binding_id_has_matching_registered_provenance() -> None:
         "tui.binding.shell_to_background",
         "tui.binding.sidebar",
         "tui.binding.themes",
+        "tui.binding.toggle_card",
         "tui.binding.toggle_change_list",
         "tui.binding.toggle_check",
         "tui.binding.toggle_graph",

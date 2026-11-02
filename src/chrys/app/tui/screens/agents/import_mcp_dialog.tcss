@@ -56,13 +56,15 @@ ImportMcpServersDialog {
     align: right top;
 }
 
-#mcp-import-servers .mcp-import-card {
-    padding: 0 1 1 1;
-    margin: 0 1 1 0;
+#mcp-import-servers .mcp-import-item {
+    height: auto;
+    align-horizontal: left;
 }
 
-#mcp-import-servers .mcp-import-card-header {
-    height: 1;
+#mcp-import-servers .mcp-import-card {
+    width: 1fr;
+    padding: 0 1 1 1;
+    margin: 0 1 1 0;
 }
 
 /* Folded to its header, the card keeps no blank line under it. */
@@ -70,24 +72,14 @@ ImportMcpServersDialog {
     padding: 0 1;
 }
 
-/* The ▶/▼ before the checkbox; it folds the card, as on the agent's MCP cards. */
-#mcp-import-servers .mcp-import-fold {
-    padding: 0 1 0 0;
-    color: $text-muted;
-}
-
-/* The checkbox, as Skills' "Workspace relative" one; its label is the server name */
-#mcp-import-servers .mcp-import-card-name {
-    width: 1fr;
-    height: 1;
-}
-
+/* The tick, outside the card: it sits level with the title line inside the card's top border. */
 #mcp-import-servers .mcp-import-row {
-    width: auto;
-    max-width: 100%;
+    width: 3;
     height: 1;
+    margin: 1 1 0 0;
     border: none;
     background: transparent;
+    background-tint: transparent;
     padding: 0;
 }
 
@@ -97,17 +89,56 @@ ImportMcpServersDialog {
 
 #mcp-import-servers .mcp-import-row > .toggle--button {
     color: $foreground 35%;
-    background: $foreground 6%;
+    background: transparent;
 }
 
 #mcp-import-servers .mcp-import-row.-on > .toggle--button {
     color: $success;
-    background: $secondary 12%;
+    background: transparent;
 }
 
-#mcp-import-servers .mcp-import-row > .toggle--label {
+/* The title line: the fold's target, and the name and summary the server is known by. */
+#mcp-import-servers .mcp-import-title {
+    width: 1fr;
+    height: 1;
+    padding: 0 1;
     color: $secondary;
     text-style: bold;
+    text-wrap: nowrap;
+    text-overflow: clip;
+}
+
+#mcp-import-servers .mcp-import-title:hover {
+    background: $block-hover-background;
+    color: $foreground;
+}
+
+#mcp-import-servers .mcp-import-title:focus {
+    background: $block-cursor-background;
+    color: $block-cursor-foreground;
+    text-style: $block-cursor-text-style;
+}
+
+/* The connection summary follows the title's hover and focus colours. */
+#mcp-import-servers .mcp-import-title > .cardtitle--summary {
+    color: $text-muted;
+    text-style: not bold;
+}
+
+#mcp-import-servers .mcp-import-title:hover > .cardtitle--summary {
+    color: $foreground;
+}
+
+#mcp-import-servers .mcp-import-title:focus > .cardtitle--summary {
+    color: $block-cursor-foreground;
+}
+
+/* Detailed refusal or duplicate reason, visible only when unfolded. */
+#mcp-import-servers .mcp-import-hint {
+    height: auto;
+    margin-top: 1;
+    color: $foreground;
+    text-wrap: wrap;
 }
 
 /* A card that can't be ticked: dashed and bare, its settings faded; the reason it can't be stays readable. */
@@ -116,7 +147,6 @@ ImportMcpServersDialog {
     background: transparent;
 }
 
-#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-row,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-label,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-field-value,
 #mcp-import-servers .mcp-import-card.-unavailable .mcp-import-pair-key,
@@ -124,11 +154,8 @@ ImportMcpServersDialog {
     text-opacity: 50%;
 }
 
-#mcp-import-servers .mcp-import-card.-unavailable .mcp-import-row > .toggle--label {
-    color: $text-muted;
-}
-
-#mcp-import-servers .mcp-import-settings {
+/* One titled box per group, titled as the agent's MCP card titles them. */
+#mcp-import-servers .mcp-import-section {
     height: auto;
     margin: 1 0 0 0;
     padding: 0 2 1 2;
@@ -168,30 +195,79 @@ ImportMcpServersDialog {
 
 #mcp-import-servers .mcp-import-pair-key,
 #mcp-import-servers .mcp-import-pair-value {
+    color: $foreground;
     background: $foreground 8%;
     padding: 0 1;
 }
 
-#mcp-import-servers .mcp-import-pair-key {
-    color: $text-muted;
-}
-
-#mcp-import-servers .mcp-import-note,
 #mcp-import-servers .mcp-import-warning {
     height: auto;
     margin: 1 0 0 0;
 }
 
-/* Why a server can't be imported: yellow like the import's other notices; red is kept for files that can't be read. */
-#mcp-import-servers .mcp-import-note {
-    color: $warning;
-    text-style: italic;
-}
-
 #mcp-import-servers .mcp-import-warning,
 #mcp-import-servers .mcp-import-warning-label,
 #mcp-import-servers .mcp-import-warning-value {
+    color: $foreground;
+}
+
+#mcp-import-servers .mcp-import-status {
+    dock: right;
+    width: auto;
+    height: 1;
+    padding-left: 2;
+    color: $text-muted;
+    text-style: not bold;
+    text-wrap: nowrap;
+}
+
+#mcp-import-servers .mcp-import-title.-attention .mcp-import-status {
     color: $warning;
+}
+
+#mcp-import-servers .mcp-import-title:hover .mcp-import-status {
+    color: $foreground;
+}
+
+#mcp-import-servers .mcp-import-title:focus .mcp-import-status {
+    color: $block-cursor-foreground;
+}
+
+#mcp-import-servers .mcp-import-notes {
+    height: auto;
+    background: $foreground 4%;
+    border-left: solid $tui-border-foreground 40%;
+    padding: 0 1 1 1;
+    margin: 1 0;
+}
+
+#mcp-import-servers .mcp-import-notes.-attention {
+    background: $warning 6%;
+    border-left: solid $tui-border-warning;
+}
+
+#mcp-import-servers .mcp-import-notes.-error {
+    background: $error 6%;
+    border-left: solid $tui-border-error;
+}
+
+#mcp-import-servers .mcp-import-notes-title {
+    height: auto;
+    margin-top: 1;
+    color: $text-muted;
+    text-style: bold;
+}
+
+#mcp-import-servers .mcp-import-notes.-attention .mcp-import-notes-title {
+    color: $warning;
+}
+
+#mcp-import-servers .mcp-import-notes.-error .mcp-import-notes-title {
+    color: $error;
+}
+
+#mcp-import-servers .mcp-import-warning-label {
+    color: $text-muted;
 }
 
 #mcp-import-servers .mcp-import-warning-group {

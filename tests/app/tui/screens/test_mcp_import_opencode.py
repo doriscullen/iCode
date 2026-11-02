@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 from textual.app import App
-from textual.widgets import Static
 
 from chrys.app.tui.i18n import LocaleController
 from chrys.app.tui.screens.agents.import_mcp_dialog import ImportMcpServersDialog, _ImportCard, _source_error
@@ -19,6 +18,7 @@ from chrys.foundation.i18n.formatting import format_message
 from chrys.service.mcp.importers import ImportContext
 from chrys.service.mcp.importers.base import McpSourceError, SourceErrorKind
 from chrys.service.mcp.importers.opencode import OpenCodeSource
+from tests.app.tui.screens._mcp_import_support import _card_text
 from tests.support.pilot_barrier import screen_is_settled
 from tests.support.waiting import wait_for
 
@@ -59,8 +59,33 @@ def _source(tmp_path: Path, raw: str, *, inline: str = "") -> ImportContext:
     )
 
 
-def _text(card: _ImportCard) -> str:
-    return "\n".join(str(widget.render()) for widget in card.query(Static))
+@pytest.mark.parametrize("locale", ["en", "zh-Hans"])
+@pytest.mark.parametrize("count", [1, 12])
+async def test_opencode_warning_is_painted_before_any_card_interaction(tmp_path: Path, locale: str, count: int) -> None:
+    context = _source(
+        tmp_path,
+        json.dumps(
+            {
+                "mcp": {
+                    f"remote-{index}": {"type": "remote", "url": f"https://mcp.example.test/{index}"}
+                    for index in range(count)
+                }
+            }
+        ),
+    )
+    app = _Preview(context, locale)
+    async with app.run_test(size=(120, 42)) as pilot:
+        await wait_for(
+            lambda: len(app.dialog.query(_ImportCard)) == count and screen_is_settled(app, app.dialog),
+            pilot=pilot,
+            description="the initial opencode card is painted",
+        )
+        card = app.dialog.query_one(_ImportCard)
+        assert card.collapsed
+        title = card.query_one(".mcp-import-title")
+        screen_line = app.screen._compositor.render_strips()[title.region.y].text
+        assert "⚠" in screen_line, screen_line
+        assert not card.query(".mcp-import-warning-group")
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
@@ -91,19 +116,19 @@ async def test_opencode_merged_sources_cwd_literal_and_timeout_are_visible(tmp_p
             pilot=pilot,
             description="opencode previews have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
-        merged = _text(cards["merged"])
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
+        merged = await _card_text(cards["merged"], pilot)
         assert ("Configuration Source" if locale == "en" else "配置来源") in merged
         assert "OPENCODE_CONFIG_CONTENT" in merged
         assert str(context.home / ".config" / "opencode" / "opencode.jsonc") in merged
         assert "INHERITED" in merged
         assert ("60 s" if locale == "en" else "60 秒") in merged
-        preview = _text(cards["preview"])
+        preview = await _card_text(cards["preview"], pilot)
         assert "server-folder" in preview
         assert context.workspace_cwd in preview
         assert ("Literal braces are escaped" if locale == "en" else "字面花括号已按 iCode 写法转义") in preview
         assert ("2 s (source: 1501 ms)" if locale == "en" else "2 秒（源配置：1501 毫秒）") in preview  # noqa: RUF001
-        assert ("1 s" if locale == "en" else "1 秒") in _text(cards["exact"])
+        assert ("1 s" if locale == "en" else "1 秒") in await _card_text(cards["exact"], pilot)
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
@@ -114,6 +139,7 @@ async def test_opencode_unsupported_settings_offer_repairs_without_secret_values
             {
                 "mcp": {
                     "command": {"type": "local", "command": ["{env:PROGRAM}"]},
+                    "url": {"type": "remote", "url": "{env:MCP_URL}"},
                     "file": {
                         "type": "local",
                         "command": ["server"],
@@ -131,26 +157,32 @@ async def test_opencode_unsupported_settings_offer_repairs_without_secret_values
     app = _Preview(context, locale)
     async with app.run_test(size=(120, 42)) as pilot:
         await wait_for(
-            lambda: len(app.dialog.query(_ImportCard)) == 3 and screen_is_settled(app, app.dialog),
+            lambda: len(app.dialog.query(_ImportCard)) == 4 and screen_is_settled(app, app.dialog),
             pilot=pilot,
             description="opencode unsupported previews have composed",
         )
-        cards = {str(card.row.label): card for card in app.dialog.query(_ImportCard)}
+        cards = {card.row.server_name: card for card in app.dialog.query(_ImportCard)}
         for card in cards.values():
             card.set_collapsed(False, scroll_visible=False)
             assert card.row.disabled
         await pilot.pause()
-        command = _text(cards["command"])
+        command = await _card_text(cards["command"], pilot)
         assert "command" in command
-        assert ("explicit command" if locale == "en" else "明确的命令") in command
-        file = _text(cards["file"])
+        assert ("replace each reference" if locale == "en" else "将变量引用替换为实际需要的值") in command
+        url = str(cards["url"].query_one(".mcp-import-hint").render())
+        assert url == (
+            "iCode doesn't support environment variable references in URLs. "
+            "Add the server manually and enter its full address in URL.\nSource setting: mcp.url.url"
+            if locale == "en"
+            else "iCode 不支持在 URL 中引用环境变量。请手动添加服务器，在“URL”中填写完整地址。\n"  # noqa: RUF001
+            "源配置项：mcp.url.url"  # noqa: RUF001
+        )
+        file = await _card_text(cards["file"], pilot)
         assert "environment.TOKEN" in file
         assert ("Add the server manually" if locale == "en" else "手动添加服务器") in file
-        assert "BAD-NAME" in _text(cards["variable"])
+        assert "BAD-NAME" in await _card_text(cards["variable"], pilot)
         diagnostics = "\n".join(
-            str(widget.render())
-            for card in cards.values()
-            for widget in card.query(".mcp-import-warning, .mcp-import-note")
+            str(widget.render()) for card in cards.values() for widget in card.query(".mcp-import-warning")
         )
         assert "secret-" not in diagnostics
 
@@ -252,11 +284,11 @@ async def test_opencode_dynamic_names_offer_fixed_name_repairs_without_resolving
             assert card.row.disabled
         await pilot.pause()
         for card in app.dialog.query(_ImportCard):
-            text = _text(card)
+            text = await _card_text(card, pilot)
             assert ("configuration field names" if locale == "en" else "配置字段名") in text
             assert (
                 "Use fixed names in the source configuration" if locale == "en" else "在源配置中改用固定名称"
             ) in text
-            assert ("Affected setting:" if locale == "en" else "涉及设置") in text
+            assert ("Source setting:" if locale == "en" else "源配置项") in text
             assert "private-secret-" not in text
         assert app.dialog._selected() == []
