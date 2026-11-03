@@ -139,6 +139,8 @@ iCode looks for opencode servers in these configuration locations. Review each s
 - "global": `opencode.json`, `opencode.jsonc` and `config.json` in `~/.config/opencode` (or in `opencode` under `XDG_CONFIG_HOME`), the file `OPENCODE_CONFIG` names, the `~/.opencode` folder, the folder `OPENCODE_CONFIG_DIR` names, the settings in `OPENCODE_CONFIG_CONTENT`, and the settings your administrator installed for all users.
 - "project": `opencode.json` and `opencode.jsonc` in the working folder and in each folder above it, and in their `.opencode` folders, up to the top folder of the Git repository (outside a repository, up to the top of the disk). They are skipped when `OPENCODE_DISABLE_PROJECT_CONFIG` is set, as opencode skips them.
 
+Relative `XDG_CONFIG_HOME` paths are resolved from the current working folder selected in iCode.
+
 If more than one configuration source changes a server, check "Configuration Source" and the additional sources named in its notice to locate the settings you need to review or fix. Also check any inherited environment variables or headers: they will be passed to the server shown on the card. Settings opencode gets from the internet, such as your organization's, are not read.
 
 For remote servers, check the final URL and request headers in the preview before testing the connection.

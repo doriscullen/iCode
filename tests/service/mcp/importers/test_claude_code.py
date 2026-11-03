@@ -1104,3 +1104,33 @@ def test_a_header_written_blank_is_kept_for_the_user_to_see(home: Path) -> None:
 
     assert candidate.config is not None
     assert candidate.config.headers == {"X-Blank": ""}
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"X-Test": "one", "x-test": "two"}, {"X-Test": "one, two"}),
+        (
+            {"X-Test": " upper ", "x-test": "${LOWER}", "X-TEST": " last "},
+            {"X-Test": "upper, {{LOWER}}, last"},
+        ),
+        ({"X-Test": "first", "x-test": ""}, {"X-Test": "first,"}),
+        ({"X-Test": "first", "x-test": "", "X-TEST": "last"}, {"X-Test": "first, , last"}),
+        ({"X-Test": "", "x-test": "last"}, {"X-Test": ", last"}),
+        ({"X-Test": "", "x-test": ""}, {"X-Test": ","}),
+        ({"X-Test": "first", "x-test": "${ANTHROPIC_API_KEY}"}, {"X-Test": "first"}),
+        ({"X-Test": "${ANTHROPIC_API_KEY}", "x-test": "last"}, {"x-test": "last"}),
+    ],
+)
+def test_header_case_aliases_keep_source_order_and_empty_value_semantics(
+    home: Path, headers: dict[str, str], expected: dict[str, str]
+) -> None:
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"remote": {"type": "http", "url": "https://x.test", "headers": headers}}},
+    )
+
+    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == expected

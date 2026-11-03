@@ -529,7 +529,17 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
     # Claude Code sends each value trimmed, so ``Bearer ${NPM_TOKEN}`` goes as ``Bearer`` [observed 2.1.303].
     # A header a credential left blank carries nothing, as Claude Code sends it; the MCP card can't hold one.
     trimmed = {key: trim_header_value(value) for key, value in converted_headers.items()}
-    converted_headers = {key: value for key, value in trimmed.items() if value.strip() or not headers[key].strip()}
+    converted_headers = {}
+    header_names: dict[str, str] = {}
+    for key, value in trimmed.items():
+        if not value.strip() and headers[key].strip():
+            continue
+        first_name = header_names.setdefault(key.lower(), key)
+        # Fetch joins case aliases in insertion order, then trims the combined value.
+        converted_headers[first_name] = (
+            f"{converted_headers[first_name]}, {value}" if first_name in converted_headers else value
+        )
+    converted_headers = {key: trim_header_value(value) for key, value in converted_headers.items()}
     warnings = (*warnings, *_credential_warnings(headers), *_project_dir_warnings(headers))
     if "headersHelper" in entry:
         # The command may hold a credential, and warnings are saved in the description: name the setting only.

@@ -576,6 +576,56 @@ def test_config_dir_and_xdg_config_home_are_followed(home: Path, tmp_path: Path,
     assert [(c.name, c.scope) for c in candidates] == [("xdg", "global"), ("dir", "global")]
 
 
+def test_relative_xdg_config_home_uses_workspace_instead_of_process_cwd(
+    home: Path, workspace: Path, managed: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    path = _write(
+        workspace / "relative-config" / "opencode" / "opencode.json",
+        {"mcp": {"workspace": _local("workspace-server")}},
+    )
+    context = _context(home, managed, workspace, XDG_CONFIG_HOME="relative-config")
+    source = OpenCodeSource()
+
+    assert source.detect(context) is True
+    _write(
+        launch / "relative-config" / "opencode" / "opencode.json",
+        {"mcp": {"launch": _local("launch-server")}},
+    )
+
+    result = source.discover(context)
+
+    assert result.source_errors == ()
+    assert [(c.name, c.source_path) for c in result.candidates] == [("workspace", str(path))]
+
+
+def test_relative_xdg_config_home_without_workspace_does_not_read_process_cwd(
+    home: Path, managed: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path / "relative-config" / "opencode" / "opencode.json", {"mcp": {"stray": _local("cmd")}})
+    context = _context(home, managed, XDG_CONFIG_HOME="relative-config")
+    source = OpenCodeSource()
+
+    assert source.detect(context) is False
+    assert source.discover(context).candidates == ()
+
+
+def test_relative_xdg_without_workspace_keeps_other_config_layers_independent(
+    home: Path, managed: Path, tmp_path: Path
+) -> None:
+    custom = _write(tmp_path / "custom.json", {"mcp": {"custom": _local("custom-server")}})
+    _write(managed / "opencode.json", "invalid json")
+    context = _context(home, managed, XDG_CONFIG_HOME="relative-config", OPENCODE_CONFIG=str(custom))
+
+    result = OpenCodeSource().discover(context)
+
+    assert len(result.source_errors) == 1
+    assert [c.name for c in result.candidates] == ["custom"]
+
+
 def test_opencode_2_forms_are_lowered(home: Path, managed: Path) -> None:
     _global(
         home,

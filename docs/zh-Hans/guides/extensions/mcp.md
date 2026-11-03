@@ -139,6 +139,8 @@ iCode 会在以下配置位置查找 opencode 服务器。导入前，请核对�
 - “全局”：`~/.config/opencode`（或 `XDG_CONFIG_HOME` 下的 `opencode`）中的 `opencode.json`、`opencode.jsonc` 和 `config.json`，`OPENCODE_CONFIG` 指定的文件，`~/.opencode` 文件夹，`OPENCODE_CONFIG_DIR` 指定的文件夹，`OPENCODE_CONFIG_CONTENT` 中的设置，以及管理员为所有用户安装的设置。
 - “项目”：工作文件夹及其各级上级文件夹中的 `opencode.json`、`opencode.jsonc`，以及这些文件夹的 `.opencode` 文件夹中的同名文件，一直到 Git 仓库的顶层文件夹（不在仓库中时，一直到磁盘根目录）。设置了 `OPENCODE_DISABLE_PROJECT_CONFIG` 时会跳过它们，与 opencode 一致。
 
+相对的 `XDG_CONFIG_HOME` 路径以 iCode 中选定的当前工作文件夹为基准。
+
 如果有多个配置来源修改同一个服务器，请查看“配置来源”和提示中的其他来源，定位需要核对或修正的设置。也请核对继承的环境变量或请求头，它们会传递给卡片中的服务器。opencode 从网上获取的设置（例如所在组织的设置）不会读取。
 
 对于远程服务器，测试连接前请核对预览中的最终 URL 和请求头。

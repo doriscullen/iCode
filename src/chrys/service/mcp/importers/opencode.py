@@ -226,7 +226,7 @@ class OpenCodeSource:
         errors: list[McpSourceError] = []
         loaded: list[tuple[_Layer, _Settings]] = []
         layers = _layers(ctx)
-        global_count = len(_GLOBAL_FILES)
+        global_count = len(_GLOBAL_FILES) if _global_dir(ctx) is not None else 0
         for group in (layers[:global_count], *[[layer] for layer in layers[global_count:]]):
             # The global files are one unit: opencode drops all of them when one fails.
             group_settings: list[tuple[_Layer, _Settings]] = []
@@ -245,11 +245,11 @@ class OpenCodeSource:
         return _result(ctx, loaded, errors)
 
 
-def _global_dir(ctx: ImportContext) -> Path:
+def _global_dir(ctx: ImportContext) -> Path | None:
     base = ctx.environ.get("XDG_CONFIG_HOME") or ""
     # xdg-basedir takes the variable as is when set, a relative path included.
-    root = Path(base) if base else ctx.home / ".config"
-    return root / "opencode"
+    root = _absolute(ctx, base) if base else ctx.home / ".config"
+    return None if root is None else root / "opencode"
 
 
 def _flag(ctx: ImportContext, name: str) -> bool:
@@ -278,9 +278,14 @@ def _managed_dir(ctx: ImportContext) -> Path:
 def _layers(ctx: ImportContext) -> list[_Layer]:
     """Every config opencode merges for the workspace, lowest precedence first; files may not exist.
 
-    The global folder's files come first, as many as :data:`_GLOBAL_FILES`.
+    When the global folder can be resolved, its files come first, as many as :data:`_GLOBAL_FILES`.
     """
-    layers = [_Layer(str(path), SCOPE_GLOBAL, path=path) for path in (_global_dir(ctx) / n for n in _GLOBAL_FILES)]
+    global_dir = _global_dir(ctx)
+    layers = (
+        [_Layer(str(path), SCOPE_GLOBAL, path=path) for path in (global_dir / n for n in _GLOBAL_FILES)]
+        if global_dir is not None
+        else []
+    )
     custom_file = ctx.environ.get("OPENCODE_CONFIG", "")
     custom_path = _absolute(ctx, custom_file) if custom_file else None
     if custom_path is not None:
@@ -339,7 +344,8 @@ def _directory_layers(
             for folder in _folders_up(workspace, worktree)
             if (folder / _CONFIG_DIR_NAME).exists()
         ]
-    candidates = [str(_global_dir(ctx)), *walked]
+    global_dir = _global_dir(ctx)
+    candidates = [*([str(global_dir)] if global_dir is not None else []), *walked]
     # opencode drops repeated spellings only. The walk here starts from the workspace's real path, so it
     # may reach the home folder's .opencode spelled another way than opencode's walk and home would.
     if Path(home_dir).exists() and _real(home_dir) not in {_real(directory) for directory in walked}:
