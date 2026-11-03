@@ -209,7 +209,7 @@ def test_settings_icode_lacks_are_reported(home: Path, managed: Path) -> None:
     assert worker.warnings == (ImportWarning(ImportWarningKind.CWD_IGNORED, original="tools"),)
     assert candidates["here"].warnings == ()
     assert candidates["signin"].warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
-    assert candidates["implicit"].warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
+    assert candidates["implicit"].warnings == ()
     assert candidates["plain"].warnings == ()
 
 
@@ -455,10 +455,7 @@ def test_files_merge_per_server_and_per_key_later_files_winning(home: Path, work
     # Headers merge per key: the one only the global file sets goes to the project's URL too.
     assert api.config.headers == {"Authorization": "Bearer {{T}}", "X-Team": "b"}
     assert (api.scope, api.source_path, api.scope_path) == ("project", str(project_file), str(workspace))
-    assert api.warnings == (
-        ImportWarning(ImportWarningKind.OAUTH_IGNORED),
-        ImportWarning(ImportWarningKind.MERGED, field="Authorization", original=str(global_file)),
-    )
+    assert api.warnings == (ImportWarning(ImportWarningKind.MERGED, field="Authorization", original=str(global_file)),)
     tool = candidates["tool"]
     assert tool.config is not None
     # Arrays are replaced, not merged.

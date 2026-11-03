@@ -863,7 +863,7 @@ def _candidate(name: str, server: _Server, merged: _Merged, workspace_cwd: str |
                 original=cwd,
             )
         )
-    if kind == "remote" and entry.get("oauth") is not False:
+    if kind == "remote" and "oauth" in entry and entry["oauth"] is not False:
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     warnings.extend(_merged_warning(server, values_key))
     if merged.permission_fields:

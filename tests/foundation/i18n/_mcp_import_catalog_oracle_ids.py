@@ -33,6 +33,7 @@ MCP_IMPORT_MESSAGE_IDS = frozenset(
         "tui.mcp.import.unsupported.header_name_collision",
         "tui.mcp.import.unsupported.variable_name_details",
         "tui.mcp.import.warning.codex_oauth_ignored",
+        "tui.mcp.import.warning.startup_timeout_ignored",
         "tui.mcp.import.warning.invalid_header_name_ignored",
         "tui.mcp.import.warning.invalid_header_value_ignored",
         "tui.mcp.import.warning.tool_output_limit_ignored",

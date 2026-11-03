@@ -67,7 +67,7 @@ async def test_opencode_warning_is_painted_before_any_card_interaction(tmp_path:
         json.dumps(
             {
                 "mcp": {
-                    f"remote-{index}": {"type": "remote", "url": f"https://mcp.example.test/{index}"}
+                    f"remote-{index}": {"type": "remote", "url": f"https://mcp.example.test/{index}", "oauth": {}}
                     for index in range(count)
                 }
             }

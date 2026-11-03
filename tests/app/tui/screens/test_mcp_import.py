@@ -581,11 +581,11 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         dialog = await _open_dialog(app, panel, pilot)
         local, remote, signed_in = await _wait_for_rows(dialog, pilot, 3)
         dropped = (
-            "HOST now uses {{API_HOST}}; the default for API_HOST was not imported. "
+            "HOST keeps the reference {{API_HOST}}; the default for API_HOST was not imported. "
             "Set API_HOST to a nonempty value before starting iCode, or fill in a fixed value after import."
         )
         dropped_token = (
-            "Authorization now uses {{TOKEN}}; the default for TOKEN was not imported. "
+            "Authorization keeps the reference {{TOKEN}}; the default for TOKEN was not imported. "
             "Set TOKEN to a nonempty value before starting iCode, or fill in a fixed value after import."
         )
         project_dir = (
@@ -609,8 +609,9 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
             "a token or another authentication method. Replace expired tokens yourself, or use a credential command."
         )
         unknown = (
-            "These settings are not imported: future. If the server needs them, "
-            "configure the required options manually."
+            "These source settings are not imported: future. "
+            "Check their purpose in Claude Code; they may have no equivalent in iCode. "
+            "Test the imported server before using it."
         )
         # Warnings sit in the card's body, which the card builds when it is unfolded.
         await _read_cards(dialog, pilot)
@@ -634,6 +635,7 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
             f"{_USER_ORIGIN}\n⚠ {dropped_token}\n⚠ {helper}",
             f"{_USER_ORIGIN}\n⚠ {credential}\n⚠ {oauth}\n⚠ {unknown}",
         ]
+        assert panel.get_config()[1].headers == {"Authorization": "Bearer {{TOKEN}}"}
         # A dropped default may be a secret, and so may the helper command: the saved description repeats neither.
         assert not any(
             "sk-live-abc" in config.description or "get-headers.sh" in config.description
@@ -871,7 +873,7 @@ async def test_claude_timeout_and_literal_braces_survive_preview_edit_and_save(
         assert text.count("MCP Request Timeout") == 1
         assert "Literal braces are escaped using iCode syntax; the text received by the server is unchanged." in text
         assert "Tool permissions from Claude Code are not imported (toolPermissions)." in text
-        assert "These settings are not imported: tools." in text
+        assert "These source settings are not imported: tools." in text
         converted.value = True
         await _import_ticked(dialog, pilot)
         await _cards(panel, pilot, 1)
@@ -1561,11 +1563,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 "docs",
                 True,
                 "docs",
-                (
-                    f"{description}\nImported from pi. There it is a project server, used only in {workspace}.\n"
-                    "⚠ iCode doesn't support OAuth sign-in. After import, configure Headers if the server accepts "
-                    "a token or another authentication method. Replace expired tokens yourself, or use a credential command."
-                ),
+                (f"{description}\nImported from pi. There it is a project server, used only in {workspace}."),
             ),
         ]
 

@@ -255,7 +255,7 @@ _COVERED = msg(
 _DEFAULT_DROPPED = msg(
     "tui.mcp.import.warning.default_dropped",
     fallback=(
-        "{field} now uses {converted}; the default for {variable} was not imported. "
+        "{field} keeps the reference {converted}; the default for {variable} was not imported. "
         "Set {variable} to a nonempty value before starting {app}, or fill in a fixed value after import."
     ),
 )
@@ -277,7 +277,7 @@ _OAUTH_IGNORED = msg(
 _CODEX_OAUTH_IGNORED = msg(
     "tui.mcp.import.warning.codex_oauth_ignored",
     fallback=(
-        "If this server uses OAuth sign-in in Codex, sign-in will not transfer to {app}. "
+        "This server explicitly configures OAuth in Codex. OAuth settings and sign-in will not transfer to {app}. "
         "After import, configure Headers if the server accepts a token or another authentication method."
     ),
 )
@@ -372,7 +372,11 @@ _DENY_LIST = msg(
 )
 _UNKNOWN_FIELDS_IGNORED = msg(
     "tui.mcp.import.warning.unknown_fields_ignored",
-    fallback="These settings are not imported: {fields}. If the server needs them, configure the required options manually.",
+    fallback=(
+        "These source settings are not imported: {fields}. "
+        "Check their purpose in {agent}; they may have no equivalent in {app}. "
+        "Test the imported server before using it."
+    ),
 )
 _INVALID_HEADER_NAME_IGNORED = msg(
     "tui.mcp.import.warning.invalid_header_name_ignored",
@@ -395,6 +399,14 @@ _ZERO_TIMEOUT_IGNORED = msg(
         "To change it, set MCP Request Timeout after import."
     ),
 )
+_STARTUP_TIMEOUT_IGNORED = msg(
+    "tui.mcp.import.warning.startup_timeout_ignored",
+    fallback=(
+        "startup_timeout_sec is not imported: {app} has no separate startup timeout. "
+        "Connection setup and tool requests use MCP Request Timeout (seconds). "
+        "After import, adjust that field in this server's settings if startup needs more time."
+    ),
+)
 _TOOL_OUTPUT_LIMIT_IGNORED = msg(
     "tui.mcp.import.warning.tool_output_limit_ignored",
     fallback=(
@@ -408,7 +420,7 @@ _LITERAL_BRACES_ESCAPED = msg(
 )
 _WARNING_TITLE = msg("tui.mcp.import.warning.title", fallback="Import Warnings")
 _WARNING_FIELDS = msg("tui.mcp.import.warning.fields", fallback="Affected fields:")
-_WARNING_RESULT = msg("tui.mcp.import.warning.result", fallback="Imported value:")
+_WARNING_RESULT = msg("tui.mcp.import.warning.result", fallback="Converted variable reference:")
 _WARNING_EFFECT = msg("tui.mcp.import.warning.effect", fallback="Impact:")
 _WARNING_ACTION = msg("tui.mcp.import.warning.action", fallback="Action:")
 _WARNING_NOTE = msg("tui.mcp.import.warning.note", fallback="Note:")
@@ -485,6 +497,7 @@ _HINT_ORDER = (
     ImportWarningKind.TOOL_PERMISSIONS_IGNORED,
     ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED,
     ImportWarningKind.ZERO_TIMEOUT_IGNORED,
+    ImportWarningKind.STARTUP_TIMEOUT_IGNORED,
     ImportWarningKind.INVALID_HEADER_IGNORED,
     # Nothing it receives or does changes; the line only records a difference.
     ImportWarningKind.LITERAL_BRACES_ESCAPED,
@@ -506,10 +519,12 @@ _HINT_KINDS = {
     ImportWarningKind.TOOL_PERMISSIONS_IGNORED: _HINT_TOOL_PERMISSIONS,
     ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED: _HINT_TOOL_OUTPUT_LIMIT,
     ImportWarningKind.ZERO_TIMEOUT_IGNORED: _HINT_ZERO_TIMEOUT,
+    ImportWarningKind.STARTUP_TIMEOUT_IGNORED: _HINT_UNKNOWN_FIELDS,
     ImportWarningKind.INVALID_HEADER_IGNORED: _HINT_INVALID_HEADER,
     ImportWarningKind.LITERAL_BRACES_ESCAPED: _HINT_LITERAL_BRACES,
     ImportWarningKind.MERGED: _HINT_MERGED,
 }
+_INFORMATIONAL_WARNING_KINDS = frozenset({ImportWarningKind.LITERAL_BRACES_ESCAPED, ImportWarningKind.MERGED})
 _UNREADABLE = msg(
     "tui.mcp.import.source_error.unreadable",
     fallback="Couldn't read {path}. Check that the file exists and your account has permission to read it, then reopen import.",
@@ -1281,10 +1296,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     self._render_message(_DUPLICATE.bind()),
                     self._render_message(_IMPORTED.bind()),
                 ),
-                needs_attention=any(
-                    warning.kind not in {ImportWarningKind.LITERAL_BRACES_ESCAPED, ImportWarningKind.MERGED}
-                    for warning in candidate.warnings
-                ),
+                needs_attention=any(warning.kind not in _INFORMATIONAL_WARNING_KINDS for warning in candidate.warnings),
             )
             widgets.append(_ImportItem(row, cards))
         # A file that couldn't be read already says why nothing is listed.
@@ -1623,7 +1635,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 groups.append(
                     _WarningGroup(
                         key,
-                        attention=kind not in {ImportWarningKind.LITERAL_BRACES_ESCAPED, ImportWarningKind.MERGED},
+                        attention=kind not in _INFORMATIONAL_WARNING_KINDS,
                     )
                 )
                 continue
@@ -1698,7 +1710,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             case ImportWarningKind.CLAUDE_PROJECT_DIR:
                 reference = _CLAUDE_PROJECT_DIR.bind(field=field, variable=variable, app=APP_DISPLAY_NAME)
             case ImportWarningKind.UNKNOWN_FIELDS_IGNORED:
-                reference = _UNKNOWN_FIELDS_IGNORED.bind(fields=original)
+                reference = _UNKNOWN_FIELDS_IGNORED.bind(fields=original, agent=agent, app=APP_DISPLAY_NAME)
             case ImportWarningKind.CWD_IGNORED:
                 reference = (
                     _RELATIVE_CWD_IGNORED.bind(agent=agent, folder=original, base=field, app=APP_DISPLAY_NAME)
@@ -1734,6 +1746,8 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 reference = message.bind(field=field, agent=agent)
             case ImportWarningKind.ZERO_TIMEOUT_IGNORED:
                 reference = _ZERO_TIMEOUT_IGNORED.bind(app=APP_DISPLAY_NAME)
+            case ImportWarningKind.STARTUP_TIMEOUT_IGNORED:
+                reference = _STARTUP_TIMEOUT_IGNORED.bind(app=APP_DISPLAY_NAME)
             case ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED:
                 reference = _TOOL_OUTPUT_LIMIT_IGNORED.bind(fields=original)
         return self._render_message(reference)
@@ -1786,7 +1800,14 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 config = with_tool_name_prefix(candidate.config)
                 origin = self._render_message(self._description(source.display_name, candidate))
                 # The import's warnings stay with the server: the dialog that showed them is about to close.
-                notes = [f"⚠ {self._warning_text(warning, source.display_name)}" for warning in candidate.warnings]
+                note_label = self._render_message(_WARNING_NOTE.bind())
+                notes = list(
+                    dict.fromkeys(
+                        f"{note_label if warning.kind in _INFORMATIONAL_WARNING_KINDS else '⚠'} "
+                        f"{self._warning_text(warning, source.display_name)}"
+                        for warning in candidate.warnings
+                    )
+                )
                 # The source's own description of the server comes first.
                 own = [config.description] if config.description else []
                 selected.append(replace(config, description="\n".join([*own, origin, *notes])))

@@ -115,7 +115,7 @@ async def test_codex_repair_notices_name_fields_without_secret_values(tmp_path: 
         '[mcp_servers.literal]\ncommand = "literal-server"\nenv = { LITERAL = "{{value}}" }\n'
         '[mcp_servers.headers]\nurl = "https://example.test/mcp"\n'
         'http_headers = { "X-Test" = "secret-invalid\\nvalue" }\n'
-        '[mcp_servers.budgets]\ncommand = "budget-server"\n'
+        '[mcp_servers.budgets]\ncommand = "budget-server"\nstartup_timeout_sec = 120\n'
         'tools = { inspect = { approval_mode = "prompt", output_token_limit = 600 } }\n',
     )
     app = _Preview(context, locale)
@@ -138,6 +138,10 @@ async def test_codex_repair_notices_name_fields_without_secret_values(tmp_path: 
         assert "http_headers.X-Test" in await _card_text(cards["headers"], pilot)
         assert "tools.inspect.output_token_limit" in await _card_text(cards["budgets"], pilot)
         assert "max_tool_result_tokens" in await _card_text(cards["budgets"], pilot)
+        budget_text = await _card_text(cards["budgets"], pilot)
+        assert "startup_timeout_sec" in budget_text
+        assert ("no separate startup timeout" if locale == "en" else "没有独立的启动超时设置") in budget_text
+        assert ("MCP Request Timeout (seconds)" if locale == "en" else "MCP 请求超时（秒）") in budget_text  # noqa: RUF001
         assert cards["variable"].row.disabled and cards["collision"].row.disabled
         diagnostics = "\n".join(
             str(widget.render()) for card in cards.values() for widget in card.query(".mcp-import-warning")

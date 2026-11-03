@@ -483,10 +483,7 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
                 original=expanded,
             )
         )
-    if transport == "http" and (
-        "oauth" in config
-        or ("auth" not in config and not any(key.lower() == "authorization" for key in config.get("headers", {})))
-    ):
+    if transport == "http" and "oauth" in config:
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     if transport == "http" and "auth" in config:
         warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=config["auth"]["provider"]))

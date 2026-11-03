@@ -85,7 +85,11 @@ _HTTP_FIELDS = {
 # The values Codex accepts for ``oauth.token_endpoint_auth_method``, set only with ``auth = "ema_auth"``
 # and ``oauth.client_secret``.
 _TOKEN_ENDPOINT_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
-_CARRIED_FIELDS = _STDIO_FIELDS | _HTTP_FIELDS | {"enabled", "tool_timeout_sec", "enabled_tools", "disabled_tools"}
+_CARRIED_FIELDS = (
+    _STDIO_FIELDS
+    | _HTTP_FIELDS
+    | {"enabled", "tool_timeout_sec", "startup_timeout_sec", "enabled_tools", "disabled_tools"}
+)
 # protocol/src/shell_environment.rs::NON_INHERITABLE_ENV_VARS, case-insensitive on every OS.
 _NON_INHERITABLE = frozenset(
     {
@@ -402,10 +406,14 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
             return unsupported(UnsupportedReason.VARIABLE_NAME, field="bearer_token_env_var", variable=variable)
         headers["authorization"] = render_template(["Bearer ", TemplateVariable(variable)])
     if not stdio:
-        if value.get("auth", "oauth") == "oauth":
-            warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
-        else:
+        # Automatic OAuth is a Codex capability, not evidence that this server uses it.
+        # Stored sign-in state is outside the local configuration import.
+        if value.get("auth") in {"chatgpt", "ema_auth"}:
             warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=value["auth"]))
+        elif value.get("auth") == "oauth" or "oauth" in value or "oauth_resource" in value:
+            warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
+    if "startup_timeout_sec" in value:
+        warnings.append(ImportWarning(ImportWarningKind.STARTUP_TIMEOUT_IGNORED))
     if braces_escaped:
         warnings.append(ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED))
     if "http_headers_helper" in value:

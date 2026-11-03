@@ -12,13 +12,16 @@ import pytest
 from textual.color import Color
 from textual.geometry import Region
 
+from chrys.app.tui.i18n import LocaleController
 from chrys.app.tui.screens.agents.import_mcp_dialog import ImportMcpServersDialog, _ImportCard
 from chrys.app.tui.screens.agents.panels.mcp import MCPConfigPanel
+from chrys.foundation.config.settings import Settings
 from chrys.service.mcp.importers import ImportWarning, ImportWarningKind, McpImportCandidate, UnsupportedReason
 from chrys.service.profiles.agents.schema import MCPServerConfig
 from tests.app.tui.screens._mcp_import_support import (
     _candidate,
     _hints,
+    _import_ticked,
     _ListedSource,
     _open_with,
     _PanelApp,
@@ -206,6 +209,38 @@ async def test_a_lock_stays_under_the_title_when_unfolded(tmp_path: Path) -> Non
         assert locked.query_one(".mcp-import-notes").has_class("-error") is False
 
 
+@pytest.mark.parametrize("locale", ["en", "zh-Hans"])
+async def test_imported_descriptions_keep_notes_separate_from_warnings(tmp_path: Path, locale: str) -> None:
+    literal = ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED)
+    candidate = replace(
+        _candidate("notes", "user", _stdio("notes")),
+        warnings=(
+            literal,
+            literal,
+            ImportWarning(ImportWarningKind.MERGED, original="/additional.json"),
+            ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="future"),
+        ),
+    )
+    app = _PanelApp(MCPConfigPanel([]))
+    app.locale_controller = LocaleController(Settings(locale=locale))
+    results: list[list[MCPServerConfig] | None] = []
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = _open_with(app, [_ListedSource("first", "First Agent", (candidate,))], tmp_path, results)
+        (row,) = await _wait_for_rows(dialog, pilot, 1)
+        row.value = True
+        await _import_ticked(dialog, pilot)
+        await wait_for(lambda: bool(results), pilot=pilot, description="import returned the selected configuration")
+        (configs,) = results
+        assert configs is not None
+        (config,) = configs
+        lines = config.description.splitlines()
+        assert len([line for line in lines if line.startswith("⚠ ")]) == 1
+        note_prefix = "Note: " if locale == "en" else "补充： "  # noqa: RUF001
+        assert len([line for line in lines if line.startswith(note_prefix)]) == 2
+        assert config.description.count("/additional.json") == 1
+        assert "future" in lines[-1]
+
+
 async def test_a_refusal_stays_under_the_title_when_unfolded(tmp_path: Path) -> None:
     """A server that can't be imported has its reason only under the title; its body shows what it wrote."""
     sse = McpImportCandidate(
@@ -341,6 +376,7 @@ _HINT_BANDS = (
         ImportWarningKind.TOOL_PERMISSIONS_IGNORED,
         ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED,
         ImportWarningKind.ZERO_TIMEOUT_IGNORED,
+        ImportWarningKind.STARTUP_TIMEOUT_IGNORED,
         ImportWarningKind.INVALID_HEADER_IGNORED,
     ),
     # Nothing it receives or does changes; the line only records a difference.

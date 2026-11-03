@@ -273,15 +273,13 @@ def test_entries_pi_rejects_are_not_listed(home: Path, entry: object) -> None:
 @pytest.mark.parametrize(
     "settings, warned",
     [
-        ({}, True),
+        ({}, False),
         ({"headers": {"authorization": "Bearer example"}}, False),
         ({"auth": {"provider": "example"}}, False),
         ({"oauth": {"clientId": "id"}}, True),
     ],
 )
-def test_default_oauth_is_reported_unless_headers_or_provider_auth_replace_it(
-    home: Path, settings: dict, warned: bool
-) -> None:
+def test_only_explicit_oauth_settings_have_a_migration_warning(home: Path, settings: dict, warned: bool) -> None:
     _global(home, {"server": {"url": "https://example.test/mcp", **settings}})
     (candidate,) = _discover(home)
     assert candidate.config is not None
@@ -628,7 +626,7 @@ def test_dynamic_header_values_are_not_read_at_import(home: Path, monkeypatch: p
 
     assert candidate.config is not None
     assert candidate.config.headers == {"X-Test": "{{TOKEN}}"}
-    assert candidate.warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
+    assert candidate.warnings == ()
 
 
 @pytest.mark.parametrize("value", ["{{literal}}", "${BAD-NAME}}", "{{!never-run}}"])

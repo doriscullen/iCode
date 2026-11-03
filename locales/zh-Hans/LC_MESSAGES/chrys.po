@@ -8907,13 +8907,13 @@ msgstr "{agent} 的 {provider} 凭据不会导入。导入后，请在该服务�
 msgid "tui.mcp.import.warning.claude_project_dir"
 msgstr "{field} 引用了 {variable}，{app} 不会自动设置该变量。请在导入后将此项改为实际需要的项目目录路径，或在启动 {app} 前设置 {variable}。"
 
-#. English: If this server uses OAuth sign-in in Codex, sign-in will not
-#. transfer to {app}. After import, configure Headers if the server accepts a
-#. token or another authentication method.
-#. chrys-meta={"fingerprint":"5fbe3f32e67051b66af209eb4519e17a90421d381440d382413ac620682a1792","multiline":false,"placeholders":["app"]}
+#. English: This server explicitly configures OAuth in Codex. OAuth settings
+#. and sign-in will not transfer to {app}. After import, configure Headers if
+#. the server accepts a token or another authentication method.
+#. chrys-meta={"fingerprint":"8fe9e743a1fedf834c7aab35f3f5a91126e4e32b7badd63ce404b4e3a84a2a61","multiline":false,"placeholders":["app"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.codex_oauth_ignored"
-msgstr "如果此服务器在 Codex 中使用 OAuth 登录，登录状态不会迁移到 {app}。如果服务器接受令牌或其他认证方式，请在导入后配置“请求头”。"
+msgstr "此服务器在 Codex 中显式配置了 OAuth。OAuth 设置和登录状态不会迁移到 {app}。如果服务器接受令牌或其他认证方式，请在导入后配置“请求头”。"
 
 #. English: To send this credential, set an environment variable with another
 #. name before starting the application, then reference it in these fields.
@@ -8971,13 +8971,13 @@ msgstr "以下字段中的变量默认值不会保留：{fields}。"
 msgid "tui.mcp.import.warning.default.title"
 msgstr "变量默认值不会保留"
 
-#. English: {field} now uses {converted}; the default for {variable} was not
-#. imported. Set {variable} to a nonempty value before starting {app}, or fill
-#. in a fixed value after import.
-#. chrys-meta={"fingerprint":"3c4d49cfb877cb4603ec84941ae4cd56f6577bd66ace93be7c64d8c589d7bc3e","multiline":false,"placeholders":["app","converted","field","variable"]}
+#. English: {field} keeps the reference {converted}; the default for {variable}
+#. was not imported. Set {variable} to a nonempty value before starting {app},
+#. or fill in a fixed value after import.
+#. chrys-meta={"fingerprint":"c140de1dbe4b42999b147ab1ce7b364a8bff819e16992de4aa4a1bd11d010445","multiline":false,"placeholders":["app","converted","field","variable"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.default_dropped"
-msgstr "{field} 已改为使用 {converted}，未保留 {variable} 的默认值。请在启动 {app} 前将 {variable} 设为非空值，或在导入后填写固定值。"
+msgstr "{field} 保留变量引用 {converted}，未保留 {variable} 的默认值。请在启动 {app} 前将 {variable} 设为非空值，或在导入后填写固定值。"
 
 #. English: {agent} blocks these tools: {tools}. {app} needs a list of allowed
 #. tools instead, so this server is imported with no tools. After import, open
@@ -9096,11 +9096,20 @@ msgstr "需要手动配置项目目录"
 msgid "tui.mcp.import.warning.relative_cwd_ignored"
 msgstr "{agent} 中的工作文件夹 {folder} 以 {base} 为基准，不会导入。测试前，请在 {base} 下找到该文件夹并从中启动 {app}，或将服务器使用的相对路径改为绝对路径。"
 
-#. English: Imported value:
-#. chrys-meta={"fingerprint":"7435f480d40d5a695477a8f6030a408cb4d6877afe9261bf6ed4a5782a12b8b6","multiline":false,"placeholders":[]}
+#. English: Converted variable reference:
+#. chrys-meta={"fingerprint":"7eff70d47271b9d009910c1c0ccf1078bbd5d98e79f6420680bf2576d5292f2f","multiline":false,"placeholders":[]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.result"
-msgstr "导入结果："
+msgstr "转换后的变量引用："
+
+#. English: startup_timeout_sec is not imported: {app} has no separate startup
+#. timeout. Connection setup and tool requests use MCP Request Timeout
+#. (seconds). After import, adjust that field in this server's settings if
+#. startup needs more time.
+#. chrys-meta={"fingerprint":"e8d46b63b0802b7d63f52107ec0e8a5049b1d60ed4edb7f00d12a4fa19bce00b","multiline":false,"placeholders":["app"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.warning.startup_timeout_ignored"
+msgstr "startup_timeout_sec 不会导入：{app} 没有独立的启动超时设置，连接建立和工具请求共用“MCP 请求超时（秒）”。如果启动需要更长时间，请在导入后的服务器设置中调大该值。"
 
 #. English: Import Warnings
 #. chrys-meta={"fingerprint":"34444ba6ab5e1d1bae0b49dae779ae9017c455467e52d406e3a1770b26034b16","multiline":false,"placeholders":[]}
@@ -9147,12 +9156,13 @@ msgstr "{agent} 按 {rule} 隐藏了全部工具。导入后，“可用工具�
 msgid "tui.mcp.import.warning.tools_limited.some"
 msgstr "{agent} 按 {rule} 仅提供这些工具：{tools}。如需调整，请在导入后修改“可用工具范围”。"
 
-#. English: These settings are not imported: {fields}. If the server needs
-#. them, configure the required options manually.
-#. chrys-meta={"fingerprint":"0dcaa8b9a7d9858183d6c3ee24848d26ea38874758d4668e0e943f186dbcaf4c","multiline":false,"placeholders":["fields"]}
+#. English: These source settings are not imported: {fields}. Check their
+#. purpose in {agent}; they may have no equivalent in {app}. Test the imported
+#. server before using it.
+#. chrys-meta={"fingerprint":"dc7d0fb53ef0112951be3ebdb6f27b5c21613e9942040fc5d1952f7162bc6102","multiline":false,"placeholders":["agent","app","fields"]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.warning.unknown_fields_ignored"
-msgstr "以下设置不会导入：{fields}。如果服务器依赖这些设置，请手动配置所需选项。"
+msgstr "以下源配置项不会导入：{fields}。请在 {agent} 中确认其用途，{app} 可能没有对应选项。使用前请测试导入后的服务器。"
 
 #. English: A timeout of 0 is not imported. {app} will use its default request
 #. timeout. To change it, set MCP Request Timeout after import.

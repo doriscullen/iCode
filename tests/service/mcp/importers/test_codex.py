@@ -257,6 +257,8 @@ output_token_limit = 500
     assert warnings[ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED] == "tools.write.output_token_limit"
     assert ImportWarningKind.HEADERS_HELPER_IGNORED in warnings
     assert "required" in warnings[ImportWarningKind.UNKNOWN_FIELDS_IGNORED]
+    assert "startup_timeout_sec" not in warnings[ImportWarningKind.UNKNOWN_FIELDS_IGNORED]
+    assert ImportWarningKind.STARTUP_TIMEOUT_IGNORED in warnings
 
 
 @pytest.mark.parametrize(
@@ -586,6 +588,34 @@ def test_http_authentication_has_one_applicable_migration_warning(
     (candidate,) = CodexSource().discover(ctx).candidates
 
     assert [warning.kind for warning in candidate.warnings] == [warning_kind]
+
+
+@pytest.mark.parametrize("settings", ["", 'http_headers = {Authorization = "Bearer token"}'])
+def test_http_without_explicit_oauth_has_no_sign_in_warning(ctx: ImportContext, settings: str) -> None:
+    _user(ctx, '[mcp_servers.s]\nurl = "https://example.test"\n' + settings)
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None
+    assert candidate.warnings == ()
+
+
+@pytest.mark.parametrize("settings", ['oauth = {client_id = "client"}', 'oauth_resource = "https://example.test"'])
+def test_explicit_oauth_settings_warn_without_auth_selector(ctx: ImportContext, settings: str) -> None:
+    _user(ctx, '[mcp_servers.s]\nurl = "https://example.test"\n' + settings)
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.OAUTH_IGNORED]
+
+
+def test_startup_timeout_warns_without_replacing_request_timeout(ctx: ImportContext) -> None:
+    _user(ctx, '[mcp_servers.s]\ncommand = "server"\nstartup_timeout_sec = 120\ntool_timeout_sec = 60\n')
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None and candidate.config.request_timeout == 60
+    assert [warning.kind for warning in candidate.warnings] == [ImportWarningKind.STARTUP_TIMEOUT_IGNORED]
 
 
 def test_tool_output_limits_are_not_reported_as_approval_permissions(ctx: ImportContext) -> None:

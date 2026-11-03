@@ -75,6 +75,7 @@ class ImportWarningKind(StrEnum):
     LITERAL_BRACES_ESCAPED = "literal_braces_escaped"
     INVALID_HEADER_IGNORED = "invalid_header_ignored"
     ZERO_TIMEOUT_IGNORED = "zero_timeout_ignored"
+    STARTUP_TIMEOUT_IGNORED = "startup_timeout_ignored"
     TOOL_OUTPUT_LIMIT_IGNORED = "tool_output_limit_ignored"
 
 
