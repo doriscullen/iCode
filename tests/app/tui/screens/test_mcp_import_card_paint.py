@@ -166,8 +166,7 @@ async def test_an_unfolded_card_drops_its_hint_and_puts_the_warning_first(tmp_pa
         (text,) = _warning_texts(card)
         assert "Tool permissions from First Agent are not imported" in text
         first = card.query_one(".mcp-import-notes.-attention")
-        assert first.styles.border_left[0] == "solid"
-        assert first.styles.border_left[1] == Color.parse(app.get_css_variables()["tui-border-warning"])
+        assert first.styles.border_left[0] == ""
         heading = first.query_one(".mcp-import-notes-title")
         assert str(heading.render()) == "⚠ Import Warnings"
         assert heading.styles.color == Color.parse(app.get_css_variables()["warning"])
@@ -273,6 +272,7 @@ async def test_a_refusal_stays_under_the_title_when_unfolded(tmp_path: Path) -> 
         assert not card.query(".mcp-import-full-name")
         panel = card.query_one(".mcp-import-notes")
         assert panel.has_class("-error")
+        assert str(panel.query_one(".mcp-import-notes-title").render()) == "✕ Can't import"
         assert panel.styles.background.a > 0
         assert panel.region.y < card.query_one(".mcp-import-field-value").region.y
 

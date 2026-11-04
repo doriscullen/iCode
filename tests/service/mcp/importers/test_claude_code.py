@@ -359,7 +359,8 @@ def test_an_empty_legacy_config_json_hides_claude_json_only_when_writable_and_al
 
     claude_json.unlink()
     result = ClaudeCodeSource().discover(_context(home))
-    assert result.source_errors == (McpSourceError(str(legacy), SourceErrorKind.INVALID_JSON),)
+    # An empty selected legacy file also starts with defaults [observed 2.1.318].
+    assert result == McpImportResult()
 
     legacy.chmod(0o444)
     try:
@@ -491,37 +492,12 @@ def test_http_server_converts_header_placeholders(home: Path) -> None:
         {"command": "cmd", "timeout": None},
         {"command": "cmd", "timeout": 2**53},  # beyond what a JavaScript number holds exactly
         {"command": "cmd", "timeout": 10**400},  # Infinity to JavaScript; too long for a Python float
-        {"command": "cmd", "alwaysLoad": "yes"},
-        {"command": "cmd", "bareElicitationCapability": "yes"},
         {"type": "http", "url": "https://x.test", "timeout": 0},
-        {"type": "http", "url": "https://x.test", "headersHelper": 5},
-        {"type": "http", "url": "https://x.test", "headersHelper": None},
-        {"type": "http", "url": "https://x.test", "discoveryCache": "yes"},
-        {"type": "http", "url": "https://x.test", "tools": "search"},
-        {"type": "http", "url": "https://x.test", "tools": [{"permission_policy": "always_allow"}]},
-        {"type": "http", "url": "https://x.test", "tools": [{"name": "search", "permission_policy": "sometimes"}]},
-        {"type": "http", "url": "https://x.test", "tools": [{"name": "search", "permission_policy": []}]},
-        {"type": "http", "url": "https://x.test", "toolPermissions": {"search": {}}},
-        {"type": "http", "url": "https://x.test", "toolPermissions": "allow"},
-        {"type": "http", "url": "https://x.test", "toolPermissions": {"search": "maybe"}},
-        {"type": "http", "url": "https://x.test", "oauth": "client"},
-        {"type": "http", "url": "https://x.test", "oauth": None},
-        {"type": "http", "url": "https://x.test", "oauth": {"clientId": 5}},
-        {"type": "http", "url": "https://x.test", "oauth": {"callbackPort": "8080"}},
-        {"type": "http", "url": "https://x.test", "oauth": {"callbackPort": 0}},
-        {"type": "http", "url": "https://x.test", "oauth": {"callbackPort": 10**400}},
-        {"type": "http", "url": "https://x.test", "oauth": {"authServerMetadataUrl": "http://auth.test"}},
-        {"type": "http", "url": "https://x.test", "oauth": {"authServerMetadataUrl": "HTTPS://auth.test"}},
-        {"type": "http", "url": "https://x.test", "oauth": {"authServerMetadataUrl": "https://"}},
-        {"type": "http", "url": "https://x.test", "oauth": {"authServerMetadataUrl": "https://au th.test"}},
-        {"type": "http", "url": "https://x.test", "oauth": {"scopes": ""}},
-        {"type": "http", "url": "https://x.test", "oauth": {"xaa": "yes"}},
         {"type": "sse", "url": "https://x.test/sse", "timeout": "600000"},
         {"type": "ws", "url": "wss://x.test", "timeout": "600000"},
-        {"type": "ws", "url": "wss://x.test", "headersHelper": 5},
     ],
 )
-def test_entries_claude_code_skips_are_not_listed(home: Path, entry: object) -> None:
+def test_invalid_migration_fields_are_not_listed(home: Path, entry: object) -> None:
     _write_json(home / ".claude.json", {"mcpServers": {"skipped": entry, "kept": {"command": "cmd"}}})
 
     result = ClaudeCodeSource().discover(_context(home))
@@ -546,19 +522,51 @@ def test_entries_claude_code_skips_are_not_listed(home: Path, entry: object) -> 
         {"type": "ws", "url": "wss://x.test", "oauth": "client"},  # a WebSocket server has no oauth to check
     ],
 )
-def test_well_typed_settings_keep_the_entry(home: Path, entry: dict[str, Any]) -> None:
+def test_supported_migration_fields_keep_the_entry(home: Path, entry: dict[str, Any]) -> None:
     _write_json(home / ".claude.json", {"mcpServers": {"server": entry}})
 
     assert [candidate.name for candidate in ClaudeCodeSource().discover(_context(home)).candidates] == ["server"]
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "oauth",
+        "headersHelper",
+        "alwaysLoad",
+        "bareElicitationCapability",
+        "discoveryCache",
+        "tools",
+        "toolPermissions",
+        "future",
+    ],
+)
+@pytest.mark.parametrize("value", [None, [], {"credential": "omitted-secret"}, "future-value"])
+def test_omitted_settings_do_not_gate_migration(home: Path, field: str, value: object) -> None:
+    _write_json(
+        home / ".claude.json",
+        {"mcpServers": {"server": {"type": "http", "url": "https://x.test/mcp", field: value}}},
+    )
+
+    result = ClaudeCodeSource().discover(_context(home))
+    (candidate,) = result.candidates
+    assert result.source_errors == ()
+    assert candidate.config == MCPServerConfig(name="server", transport="http", url="https://x.test/mcp")
+    kind = {
+        "oauth": ImportWarningKind.OAUTH_IGNORED,
+        "headersHelper": ImportWarningKind.HEADERS_HELPER_IGNORED,
+        "toolPermissions": ImportWarningKind.TOOL_PERMISSIONS_IGNORED,
+        "tools": ImportWarningKind.UNKNOWN_FIELDS_IGNORED,
+        "future": ImportWarningKind.UNKNOWN_FIELDS_IGNORED,
+    }.get(field)
+    if kind is not None:
+        assert any(warning.kind is kind for warning in candidate.warnings)
+    assert "omitted-secret" not in repr(result)
+
+
 def _url(units: int, prefix: str = "https://x.test/") -> str:
     """A URL *units* UTF-16 code units long, ending in a character beyond U+FFFF, which is two of them."""
     return prefix + "a" * (units - len(prefix) - 2) + "\U0001f600"
-
-
-def _metadata_url(value: str) -> dict[str, Any]:
-    return {"type": "http", "url": "https://x.test", "oauth": {"authServerMetadataUrl": value}}
 
 
 # Claude Code counts a URL in UTF-16 code units, before trimming it [observed 2.1.316].
@@ -572,9 +580,6 @@ def _metadata_url(value: str) -> dict[str, Any]:
         ({"type": "sse", "url": _url(65_537)}, False),
         ({"type": "ws", "url": _url(65_536, "wss://x.test/")}, True),
         ({"type": "ws", "url": _url(65_537, "wss://x.test/")}, False),
-        (_metadata_url(_url(4_096, "https://auth.test/")), True),
-        (_metadata_url(_url(4_097, "https://auth.test/")), False),
-        (_metadata_url(" " + _url(4_096, "https://auth.test/")), False),
     ],
     ids=[
         "http-at-limit",
@@ -584,9 +589,6 @@ def _metadata_url(value: str) -> dict[str, Any]:
         "sse-over-limit",
         "ws-at-limit",
         "ws-over-limit",
-        "metadata-at-limit",
-        "metadata-over-limit",
-        "metadata-over-limit-untrimmed",
     ],
 )
 def test_a_url_longer_than_claude_code_reads_is_not_listed(home: Path, entry: dict[str, Any], listed: bool) -> None:
@@ -936,6 +938,8 @@ def test_unsupported_servers_are_listed_with_a_reason(home: Path, entry: object,
 
     assert candidate.config is None
     assert candidate.unsupported is reason
+    if reason is UnsupportedReason.TEMPLATE_NEXT_TO_BRACE:
+        assert candidate.unsupported_field in {"mcpServers.server.env.JSON", "mcpServers.server.headers.X-Data"}
 
 
 def test_unreadable_files_are_reported_and_other_files_still_listed(home: Path, tmp_path: Path) -> None:
@@ -968,14 +972,67 @@ def test_a_blank_project_file_holds_no_servers(home: Path, workspace: Path, text
     assert result.source_errors == ()
 
 
-def test_a_blank_claude_json_is_still_unreadable(home: Path) -> None:
-    # Claude Code reports a blank global config as corrupted [observed 2.1.302].
+@pytest.mark.parametrize("text", ["", "  \n", "\ufeff", "\u3000\u2028"])
+def test_a_blank_claude_json_holds_no_servers(home: Path, text: str) -> None:
+    # Claude Code starts with defaults when no backup holds anything [observed 2.1.318].
     config = home / ".claude.json"
-    config.write_text("  \n", encoding="utf-8")
+    config.write_text(text, encoding="utf-8")
 
     result = ClaudeCodeSource().discover(_context(home))
 
-    assert result.source_errors == (McpSourceError(str(config), SourceErrorKind.INVALID_JSON),)
+    assert result.source_errors == ()
+    assert result.candidates == ()
+
+
+@pytest.mark.parametrize("text", ["{broken", "\x1c", "[]"])
+def test_a_nonblank_invalid_global_file_still_reports_an_error(home: Path, text: str) -> None:
+    (home / ".claude.json").write_text(text, encoding="utf-8")
+
+    result = ClaudeCodeSource().discover(_context(home))
+
+    assert len(result.source_errors) == 1
+    assert result.source_errors[0].kind in {SourceErrorKind.INVALID_JSON, SourceErrorKind.NOT_AN_OBJECT}
+
+
+@pytest.mark.parametrize(
+    "value, reason",
+    [("", UnsupportedReason.EMPTY_ENV_VALUE), (" ", UnsupportedReason.EMPTY_ENV_VALUE), ("token", None)],
+)
+def test_aws_bearer_uses_the_same_environment_value_rules(
+    home: Path, value: str, reason: UnsupportedReason | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+    env = {"AWS_BEARER_TOKEN_BEDROCK": value}
+    _write_json(home / ".claude.json", {"mcpServers": {"aws": {"command": "server", "env": env}}})
+
+    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
+
+    assert candidate.unsupported is reason
+    assert candidate.warnings == ()
+    if reason is None:
+        assert candidate.config is not None
+        assert candidate.config.env == env
+    else:
+        assert candidate.config is None
+        assert candidate.unsupported_field == "mcpServers.aws.env.AWS_BEARER_TOKEN_BEDROCK"
+        assert candidate.entry is not None and candidate.entry["env"] == env
+
+
+def test_empty_aws_http_header_is_not_subject_to_stdio_environment_rules(home: Path) -> None:
+    _write_json(
+        home / ".claude.json",
+        {
+            "mcpServers": {
+                "http": {"type": "http", "url": "https://example.com", "headers": {"AWS_BEARER_TOKEN_BEDROCK": ""}}
+            }
+        },
+    )
+
+    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {"AWS_BEARER_TOKEN_BEDROCK": ""}
+    assert candidate.warnings == ()
 
 
 def test_a_project_file_holding_more_than_whitespace_must_be_json(home: Path, workspace: Path) -> None:
@@ -1088,9 +1145,8 @@ def test_header_values_are_imported_trimmed_as_claude_code_sends_them(home: Path
     remote = candidates["remote"].config
     assert remote is not None
     assert remote.headers == {"Authorization": "Bearer", "X-Pad": "padded {{MY_TOKEN}}"}
-    # Environment values are passed to the process as written.
-    local = candidates["local"].config
-    assert local is not None and local.env == {"PAD": " kept "}
+    assert candidates["local"].config is None
+    assert candidates["local"].unsupported is UnsupportedReason.ENV_VALUE_WHITESPACE
 
 
 def test_a_header_written_blank_is_kept_for_the_user_to_see(home: Path) -> None:

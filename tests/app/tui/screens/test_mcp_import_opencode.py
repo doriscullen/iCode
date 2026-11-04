@@ -126,7 +126,7 @@ async def test_opencode_merged_sources_cwd_literal_and_timeout_are_visible(tmp_p
         preview = await _card_text(cards["preview"], pilot)
         assert "server-folder" in preview
         assert context.workspace_cwd in preview
-        assert ("Literal braces are escaped" if locale == "en" else "字面花括号已按 iCode 写法转义") in preview
+        assert ("Braces look different in the preview" if locale == "en" else "预览中的花括号写法有所变化") in preview
         assert ("2 s (source: 1501 ms)" if locale == "en" else "2 秒（源配置：1501 毫秒）") in preview  # noqa: RUF001
         assert ("1 s" if locale == "en" else "1 秒") in await _card_text(cards["exact"], pilot)
 
@@ -206,16 +206,17 @@ async def test_opencode_source_errors_locate_repairs_without_source_values(
         )
         text = "\n".join(str(widget.render()) for widget in app.dialog.query(".mcp-import-error"))
         assert expected in text
-        assert "reopen import" in text
+        assert "reopen import" not in text
         assert "secret-" not in text
 
 
-def test_opencode_source_error_without_location_retains_repair_action() -> None:
+def test_opencode_source_error_without_location_explains_the_failure() -> None:
     text = format_message(
         _source_error(McpSourceError("/config/opencode.json", SourceErrorKind.INVALID_CONFIG), "opencode")
     )
     assert "/config/opencode.json" in text
-    assert "Fix the file, then reopen import" in text
+    assert "has settings opencode rejects" in text
+    assert "reopen import" not in text
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
@@ -229,8 +230,37 @@ async def test_opencode_invalid_mcp_timeout_offers_setting_repair(tmp_path: Path
         )
         text = "\n".join(str(widget.render()) for widget in app.dialog.query(".mcp-import-error"))
         assert "mcp.timeout" in text
-        assert ("Check its type and value" if locale == "en" else "检查其类型和值") in text
+        assert ("must be a positive integer" if locale == "en" else "必须为正整数") in text
         assert "local" not in text and "remote" not in text
+
+
+@pytest.mark.parametrize("locale", ["en", "zh-Hans"])
+@pytest.mark.parametrize(
+    ("raw", "field", "english", "chinese"),
+    [
+        ('{"mcp":{"s":{"type":"local","command":"secret-value"}}}', "mcp.s.command", "array of strings", "字符串数组"),
+        ('{"mcp":{"s":{"type":"remote","url":1}}}', "mcp.s.url", "must be a string", "必须为字符串"),
+        (
+            '{"mcp":{"s":{"type":"remote","url":"https://x.test","headers":{"X-Test":1}}}}',
+            "mcp.s.headers",
+            "values are strings",
+            "值均为字符串",
+        ),
+    ],
+)
+async def test_opencode_invalid_fields_show_expected_values_without_rejected_content(
+    tmp_path: Path, locale: str, raw: str, field: str, english: str, chinese: str
+) -> None:
+    app = _Preview(_source(tmp_path, raw), locale)
+    async with app.run_test(size=(120, 42)) as pilot:
+        await wait_for(
+            lambda: bool(app.dialog.query(".mcp-import-error")),
+            pilot=pilot,
+            description="the invalid setting's requirement is shown",
+        )
+        text = "\n".join(str(widget.render()) for widget in app.dialog.query(".mcp-import-error"))
+        assert field in text and (english if locale == "en" else chinese) in text
+        assert "secret-value" not in text
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
@@ -286,9 +316,7 @@ async def test_opencode_dynamic_names_offer_fixed_name_repairs_without_resolving
         for card in app.dialog.query(_ImportCard):
             text = await _card_text(card, pilot)
             assert ("configuration field names" if locale == "en" else "配置字段名") in text
-            assert (
-                "Use fixed names in the source configuration" if locale == "en" else "在源配置中改用固定名称"
-            ) in text
+            assert ("requires fixed server names" if locale == "en" else "要求服务器名称") in text
             assert ("Source setting:" if locale == "en" else "源配置项") in text
             assert "private-secret-" not in text
         assert app.dialog._selected() == []

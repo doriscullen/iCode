@@ -21,7 +21,7 @@ from chrys.service.mcp.importers import (
     SourceErrorKind,
     UnsupportedReason,
 )
-from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS
+from chrys.service.mcp.importers.base import MAX_REQUEST_TIMEOUT_SECONDS, ConfigValueKind
 from chrys.service.mcp.importers.opencode import OpenCodeSource
 from chrys.service.profiles.agents.loader import load_profile_from_yaml
 from chrys.service.profiles.agents.schema import AgentProfile, MCPServerConfig, ToolsConfig
@@ -157,11 +157,11 @@ def test_header_values_are_imported_trimmed_as_opencode_sends_them(home: Path, m
 
     candidates = _by_name(_discover(home, managed, T="t"))
 
-    docs, files = candidates["docs"].config, candidates["files"].config
-    assert docs is not None and files is not None
+    docs = candidates["docs"].config
+    assert docs is not None
     assert docs.headers == {"Authorization": "Bearer", "X-Pad": "padded {{T}}"}
-    # Environment values are passed to the process as written.
-    assert files.env == {"PAD": " kept "}
+    assert candidates["files"].config is None
+    assert candidates["files"].unsupported is UnsupportedReason.ENV_VALUE_WHITESPACE
 
 
 def test_converted_values_resolve_as_opencode_substitutes_them(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -329,6 +329,49 @@ def test_a_file_reference_in_a_setting_not_imported_doesnt_block_the_import(home
     (candidate,) = _discover(home, managed)
 
     assert candidate.config is not None
+
+
+@pytest.mark.parametrize("layout", ["v1", "v2-flat", "v2-nested"])
+@pytest.mark.parametrize(
+    "oauth",
+    [
+        None,
+        ["omitted-secret"],
+        {"callbackPort": [], "clientSecret": "omitted-secret"},
+        {"callback_port": "future-port", "client_secret": "omitted-secret"},
+    ],
+)
+def test_omitted_oauth_does_not_hide_a_server_or_its_siblings(
+    home: Path, managed: Path, layout: str, oauth: object
+) -> None:
+    server = _remote("https://x.test/mcp", oauth=oauth)
+    if layout != "v1":
+        server["disabled"] = True
+    mcp = {"remote": server, "sibling": _local("server")}
+    _global(home, {"mcp": {"servers": mcp} if layout == "v2-nested" else mcp})
+
+    result = OpenCodeSource().discover(_context(home, managed))
+    assert result.source_errors == ()
+    remote, sibling = result.candidates
+    assert remote.config == MCPServerConfig(
+        name="remote", transport="http", url="https://x.test/mcp", enabled=layout == "v1", request_timeout=60
+    )
+    assert remote.warnings == (ImportWarning(ImportWarningKind.OAUTH_IGNORED),)
+    assert sibling.config is not None and sibling.config.command == "server"
+    assert "omitted-secret" not in repr(result)
+
+
+@pytest.mark.parametrize("value", [None, ["omitted-secret"], {"secret": "omitted-secret"}, 42])
+def test_omitted_local_settings_do_not_gate_migration(home: Path, managed: Path, value: object) -> None:
+    _global(home, {"mcp": {"s": _local("server", disabled=True, codemode=value, cwd=value, future_setting=value)}})
+
+    result = OpenCodeSource().discover(_context(home, managed))
+    (candidate,) = result.candidates
+    assert result.source_errors == ()
+    assert candidate.config is not None and candidate.config.command == "server"
+    assert candidate.config.enabled is False
+    assert candidate.warnings == (ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="cwd"),)
+    assert "omitted-secret" not in repr(result)
 
 
 @pytest.mark.parametrize(
@@ -876,21 +919,57 @@ def test_jsonc_error_position_matches_the_original_comments(home: Path, managed:
 
 
 @pytest.mark.parametrize(
-    ("document", "field"),
+    ("document", "field", "expected"),
     [
-        ({"mcp": []}, "mcp"),
-        ({"mcp": {"broken": {"type": "local", "command": "private-value"}}}, "mcp.broken"),
-        ({"experimental": {"mcp_timeout": None}}, "experimental.mcp_timeout"),
+        ({"mcp": []}, "mcp", ConfigValueKind.OBJECT),
+        ({"mcp": {"broken": "private-value"}}, "mcp.broken", ConfigValueKind.OBJECT),
+        (
+            {"mcp": {"broken": {"type": "local", "command": "private-value"}}},
+            "mcp.broken.command",
+            ConfigValueKind.STRING_ARRAY,
+        ),
+        ({"mcp": {"broken": {"type": "remote", "url": 1}}}, "mcp.broken.url", ConfigValueKind.STRING),
+        (
+            {"mcp": {"broken": {"type": "remote", "url": "https://x.test", "headers": {"X-Test": 1}}}},
+            "mcp.broken.headers",
+            ConfigValueKind.STRING_MAP,
+        ),
+        (
+            {"mcp": {"broken": {"type": "local", "command": ["server"], "environment": {"TOKEN": False}}}},
+            "mcp.broken.environment",
+            ConfigValueKind.STRING_MAP,
+        ),
+        (
+            {"mcp": {"broken": {"type": "local", "command": ["server"], "enabled": "private-value"}}},
+            "mcp.broken.enabled",
+            ConfigValueKind.BOOLEAN,
+        ),
+        (
+            {"mcp": {"broken": {"type": "local", "command": ["server"], "timeout": -1}}},
+            "mcp.broken.timeout",
+            ConfigValueKind.POSITIVE_INTEGER,
+        ),
+        ({"mcp": {"broken": {"type": "private-value"}}}, "mcp.broken.type", ConfigValueKind.SERVER_TYPE),
+        ({"experimental": {"mcp_timeout": None}}, "experimental.mcp_timeout", ConfigValueKind.POSITIVE_INTEGER),
+        ({"mcp": {"timeout": {"catalog": 0, "execution": 0}}}, "mcp.timeout.catalog", ConfigValueKind.POSITIVE_INTEGER),
+        (
+            {"mcp": {"broken": {"type": "local", "command": ["server"], "timeout": {"execution": 0}}}},
+            "mcp.broken.timeout.execution",
+            ConfigValueKind.POSITIVE_INTEGER,
+        ),
     ],
 )
 def test_invalid_configuration_errors_locate_fields_without_values(
-    home: Path, managed: Path, document: dict[str, Any], field: str
+    home: Path, managed: Path, document: dict[str, Any], field: str, expected: ConfigValueKind
 ) -> None:
     config_file = _global(home, document)
 
     result = OpenCodeSource().discover(_context(home, managed))
 
-    assert result.source_errors == (McpSourceError(str(config_file), SourceErrorKind.INVALID_CONFIG, field=field),)
+    assert result.source_errors == (
+        McpSourceError(str(config_file), SourceErrorKind.INVALID_CONFIG, field=field, expected=expected),
+    )
+    assert "private-value" not in repr(result.source_errors)
 
 
 @pytest.mark.parametrize(

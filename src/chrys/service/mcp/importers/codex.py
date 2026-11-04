@@ -6,6 +6,9 @@ Baseline: https://github.com/openai/codex, tag ``rust-v0.166.0`` (0.166.0),
 commit ``6ff1e1ca3b30fc8b914720681fcf5fe62e95f856``. Source paths below are
 relative to ``codex-rs`` at that commit; the release source is available at
 https://github.com/openai/codex/tree/rust-v0.166.0/codex-rs.
+Rechecked 2026-11-04: still the latest stable release. Main at
+``021fccb046508938c4754982efccfb51d6e8356e`` and 0.168.0-alpha.1 leave the
+migrated connection schema, merge, environment and header contracts unchanged.
 
 Read ``$CODEX_HOME/config.toml`` (default ``~/.codex/config.toml``), then
 ``.codex/config.toml`` from the nearest project root down to the workspace.
@@ -14,7 +17,10 @@ marker, only the workspace is searched [config/src/loader/mod.rs:discover_projec
 Source project trust does not gate this user-selected import. Tables merge
 recursively; arrays and scalars replace [config/src/merge.rs].
 
-Transport inference and validation follow config/src/mcp_types.rs. Values
+Transport inference follows config/src/mcp_types.rs. Only settings used by
+migration are validated; omitted runtime and authentication settings do not
+gate import. The baseline records verified conversion rules, not a version
+requirement for the source application. Values
 in ``env`` and ``http_headers`` are literal; header references to environment
 variables become iCode templates, never captured secrets. A stdio server's
 ``env_vars``, which Codex forwards only while set, are generally inherited.
@@ -37,7 +43,7 @@ Explicit variables on Codex's non-inheritable list are omitted with a warning
 [protocol/src/shell_environment.rs::NON_INHERITABLE_ENV_VARS].
 
 When updating the baseline, re-check these files and their tests, especially
-the raw config shape, transport validation, trust and merge rules.
+the connection fields, variable handling, discovery and merge rules.
 """
 
 from __future__ import annotations
@@ -66,6 +72,7 @@ from chrys.service.mcp.importers.base import (
     read_source_bytes,
     render_template,
     request_timeout_seconds,
+    unsupported_env_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -82,9 +89,6 @@ _HTTP_FIELDS = {
     "oauth_resource",
     "auth",
 }
-# The values Codex accepts for ``oauth.token_endpoint_auth_method``, set only with ``auth = "ema_auth"``
-# and ``oauth.client_secret``.
-_TOKEN_ENDPOINT_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
 _CARRIED_FIELDS = (
     _STDIO_FIELDS
     | _HTTP_FIELDS
@@ -250,51 +254,21 @@ def _valid(name: str, value: dict[str, Any]) -> bool:
     stdio = "command" in value
     if (stdio and value.keys() & _HTTP_FIELDS) or (not stdio and ("url" not in value or value.keys() & _STDIO_FIELDS)):
         return False
-    for key in (
-        "command",
-        "url",
-        "cwd",
-        "bearer_token_env_var",
-        "http_headers_helper",
-        "environment_id",
-        "oauth_resource",
-        "name",
-    ):
+    for key in ("command", "url", "bearer_token_env_var", "environment_id"):
         if key in value and not isinstance(value[key], str):
             return False
-    for key in ("args", "enabled_tools", "disabled_tools", "scopes", "omit_tools_from"):
+    for key in ("args", "enabled_tools", "disabled_tools"):
         if key in value and not _strings(value[key]):
             return False
-    if any(surface not in ("code_mode", "deferred", "direct") for surface in value.get("omit_tools_from", [])):
-        return False
     for key in ("env", "http_headers", "env_http_headers"):
         if key in value and not _string_map(value[key]):
             return False
-    for key in ("enabled", "required", "supports_parallel_tool_calls"):
-        if key in value and not isinstance(value[key], bool):
-            return False
-    for key in ("tool_timeout_sec", "startup_timeout_sec"):
-        if key in value and not _duration(value[key]):
-            return False
-    if "startup_timeout_ms" in value and (
-        type(value["startup_timeout_ms"]) is not int or not 0 <= value["startup_timeout_ms"] < 2**64
-    ):
+    if "enabled" in value and not isinstance(value["enabled"], bool):
         return False
-    if "tool_input_schema_max_bytes" in value and (
-        type(value["tool_input_schema_max_bytes"]) is not int or value["tool_input_schema_max_bytes"] <= 0
-    ):
-        return False
-    if value.get("auth", "oauth") not in ("oauth", "chatgpt", "ema_auth"):
-        return False
-    if value.get("startup_readiness", "connection") not in ("connection", "catalog"):
-        return False
-    helper = value.get("http_headers_helper")
-    if helper is not None and (not helper.strip() or value.get("environment_id", "local") != "local"):
+    if "tool_timeout_sec" in value and not _duration(value["tool_timeout_sec"]):
         return False
     variables = value.get("env_vars", [])
-    if not isinstance(variables, list) or not all(_env_var_valid(item) for item in variables):
-        return False
-    return _oauth_valid(value)
+    return isinstance(variables, list) and all(_env_var_valid(item) for item in variables)
 
 
 def _env_var_valid(item: object) -> bool:
@@ -306,36 +280,15 @@ def _env_var_valid(item: object) -> bool:
     )
 
 
-def _oauth_valid(value: dict[str, Any]) -> bool:
-    oauth = value.get("oauth", {})
-    if not isinstance(oauth, dict):
-        return False
-    for key in ("client_id", "client_secret", "callback_url", "authorization_server_issuer"):
-        if key in oauth and not isinstance(oauth[key], str):
-            return False
-    if "callback_port" in oauth and (
-        type(oauth["callback_port"]) is not int or not 0 <= oauth["callback_port"] <= 65535
-    ):
-        return False
-    if "client_secret" in oauth and (not oauth["client_secret"].strip() or not oauth.get("client_id", "").strip()):
-        return False
-    # [config/src/mcp_types.rs:McpServerOAuthConfig, config/src/mcp_ema.rs:McpEmaTokenEndpointAuthMethod]
-    if "token_endpoint_auth_method" in oauth and (
-        oauth["token_endpoint_auth_method"] not in _TOKEN_ENDPOINT_AUTH_METHODS
-        or value.get("auth") != "ema_auth"
-        or "client_secret" not in oauth
-    ):
-        return False
-    return "authorization_server_issuer" not in oauth or value.get("auth") == "ema_auth"
-
-
 def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
     value = entry.value
     stdio = "command" in value
     transport = "stdio" if stdio else "http"
     shown = {key: value[key] for key in ("command", "args", "env", "url") if key in value}
+    omitted: set[str] = set()
     if not stdio:
         shown["headers"] = value.get("http_headers", {})
+        shown["env_http_headers"] = value.get("env_http_headers", {})
 
     def unsupported(reason: UnsupportedReason, *, field: str = "", variable: str = "") -> McpImportCandidate:
         return McpImportCandidate(
@@ -370,6 +323,9 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
             continue
         env[variable] = render_template([TemplateVariable(variable)])
         warnings.append(ImportWarning(ImportWarningKind.OPTIONAL_VARIABLE, variable=variable, field=variable))
+    if transport == "stdio" and (invalid_env := unsupported_env_value(env)) is not None:
+        reason, field = invalid_env
+        return unsupported(reason, field=f"mcp_servers.{name}.env.{field}")
     source_headers = normalize_codex_headers(
         value.get("http_headers", {}),
         value.get("env_http_headers", {}),
@@ -408,10 +364,13 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
     if not stdio:
         # Automatic OAuth is a Codex capability, not evidence that this server uses it.
         # Stored sign-in state is outside the local configuration import.
-        if value.get("auth") in {"chatgpt", "ema_auth"}:
-            warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=value["auth"]))
+        auth = value.get("auth")
+        if isinstance(auth, str) and auth in {"chatgpt", "ema_auth"}:
+            warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=auth))
         elif value.get("auth") == "oauth" or "oauth" in value or "oauth_resource" in value:
             warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
+        if "auth" in value and auth not in ("oauth", "chatgpt", "ema_auth"):
+            omitted.add("auth")
     if "startup_timeout_sec" in value:
         warnings.append(ImportWarning(ImportWarningKind.STARTUP_TIMEOUT_IGNORED))
     if braces_escaped:
@@ -419,12 +378,19 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
     if "http_headers_helper" in value:
         # Helper arguments may contain credentials; expose the setting name, not the command.
         warnings.append(ImportWarning(ImportWarningKind.HEADERS_HELPER_IGNORED))
-    if stdio and value.get("cwd"):
-        warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=value["cwd"]))
+    if stdio and "cwd" in value:
+        cwd = value["cwd"]
+        if isinstance(cwd, str):
+            if cwd:
+                warnings.append(ImportWarning(ImportWarningKind.CWD_IGNORED, original=cwd))
+        else:
+            omitted.add("cwd")
     if entry.sources:
         warnings.append(ImportWarning(ImportWarningKind.MERGED, original=", ".join(entry.sources)))
     permission_fields, output_fields, ignored_tool_fields = _omitted_tool_fields(value)
-    ignored = sorted((value.keys() - _CARRIED_FIELDS - {"tools", "default_tools_approval_mode"}) | ignored_tool_fields)
+    ignored = sorted(
+        (value.keys() - _CARRIED_FIELDS - {"tools", "default_tools_approval_mode"}) | ignored_tool_fields | omitted
+    )
     if ignored:
         warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original=", ".join(ignored)))
     if permission_fields:

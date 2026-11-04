@@ -176,6 +176,10 @@ ImportMcpServersDialog {
     padding: 0 1;
 }
 
+#mcp-import-servers .mcp-import-field-value > .mcp-import-value--annotation {
+    color: $text-muted;
+}
+
 /* One line, cut at the edge, as in the card's one-line inputs (URL, env vars, headers). */
 #mcp-import-servers .mcp-import-field-value.-single-line,
 #mcp-import-servers .mcp-import-pair-key,
@@ -205,9 +209,7 @@ ImportMcpServersDialog {
     margin: 1 0 0 0;
 }
 
-#mcp-import-servers .mcp-import-warning,
-#mcp-import-servers .mcp-import-warning-label,
-#mcp-import-servers .mcp-import-warning-value {
+#mcp-import-servers .mcp-import-warning {
     color: $foreground;
 }
 
@@ -236,19 +238,16 @@ ImportMcpServersDialog {
 #mcp-import-servers .mcp-import-notes {
     height: auto;
     background: $foreground 4%;
-    border-left: solid $tui-border-foreground 40%;
     padding: 0 1 1 1;
     margin: 1 0;
 }
 
 #mcp-import-servers .mcp-import-notes.-attention {
     background: $warning 6%;
-    border-left: solid $tui-border-warning;
 }
 
 #mcp-import-servers .mcp-import-notes.-error {
     background: $error 6%;
-    border-left: solid $tui-border-error;
 }
 
 #mcp-import-servers .mcp-import-notes-title {
@@ -266,38 +265,8 @@ ImportMcpServersDialog {
     color: $error;
 }
 
-#mcp-import-servers .mcp-import-warning-label {
-    color: $text-muted;
-}
-
 #mcp-import-servers .mcp-import-warning-group {
     height: auto;
-}
-
-#mcp-import-servers .mcp-import-warning-title {
-    text-style: bold;
-}
-
-#mcp-import-servers .mcp-import-warning-fields {
-    grid-size: 2;
-    grid-columns: auto 1fr;
-    grid-rows: auto;
-    grid-gutter: 0 1;
-    height: auto;
-    padding: 0 0 0 2;
-}
-
-#mcp-import-servers .mcp-import-warning-label,
-#mcp-import-servers .mcp-import-warning-value {
-    height: auto;
-    min-width: 0;
-}
-
-/* Said once above the cards: what importing a folder-only server changes. */
-#mcp-import-servers .mcp-import-notice {
-    height: auto;
-    color: $warning;
-    margin: 0 1 1 0;
 }
 
 #mcp-import-servers .mcp-import-error {

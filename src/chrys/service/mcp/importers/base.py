@@ -6,6 +6,8 @@ An importer reads another agent's own config files and turns each MCP server
 it finds into a candidate :class:`MCPServerConfig`. Importers only read: the
 user picks candidates in the UI, and nothing is written until the agent
 profile is saved. Results carry codes, never prose, so the UI localizes them.
+STDIO environment values must survive the configuration editor: empty values
+and values with surrounding whitespace cannot be imported unchanged.
 """
 
 from __future__ import annotations
@@ -53,6 +55,8 @@ class UnsupportedReason(StrEnum):
     HEADER_NAME_COLLISION = "header_name_collision"
     TEMPLATE_IN_FIELD_NAME = "template_in_field_name"
     HEADER_VALUE_ENCODING = "header_value_encoding"
+    EMPTY_ENV_VALUE = "empty_env_value"
+    ENV_VALUE_WHITESPACE = "env_value_whitespace"
 
 
 class ImportWarningKind(StrEnum):
@@ -91,6 +95,18 @@ class SourceErrorKind(StrEnum):
     INVALID_ENCODING = "invalid_encoding"
 
 
+class ConfigValueKind(StrEnum):
+    """The source setting's expected value, without including its rejected content."""
+
+    OBJECT = "object"
+    STRING = "string"
+    STRING_ARRAY = "string_array"
+    STRING_MAP = "string_map"
+    BOOLEAN = "boolean"
+    POSITIVE_INTEGER = "positive_integer"
+    SERVER_TYPE = "server_type"
+
+
 @dataclass(frozen=True, slots=True)
 class ImportWarning:
     """What changed, and where: the setting (env or header name), never its value.
@@ -98,8 +114,8 @@ class ImportWarning:
     The UI saves warnings in the imported server's description, and an env or
     header value may hold a secret. ``variable`` names the placeholder whose
     default was dropped or that is unset, the credential variable a header
-    references, or the variable the source sets for its servers that iCode
-    doesn't. ``field`` names the env or header setting; for ``MERGED`` it lists
+    references, or a variable the source sets differently from iCode.
+    ``field`` names the env or header setting; for ``MERGED`` it lists
     the env and header names that came from another file than the command or
     URL, and for ``TOOLS_LIMITED`` the source setting that hides the tools.
     ``original`` is the helper command that was not imported, the
@@ -125,19 +141,22 @@ class McpSourceError:
     field: str = ""
     line: int | None = None
     column: int | None = None
+    expected: ConfigValueKind | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class McpImportCandidate:
     """One server another agent runs, found in its config.
 
-    Entries with invalid server settings are not candidates. Source application
+    Entries with invalid migration fields are not candidates; omitted metadata
+    is not checked against the source application's schema. Source application
     permissions and project trust do not gate import. ``config`` is set
     exactly when the server can be imported; otherwise ``unsupported`` says why
     not, and ``entry`` keeps the server's settings as the source wrote them so
     the UI can show them, in the keys ``command`` (the program), ``args``,
-    ``env``, ``url`` and ``headers``. A ``config.description`` set here is the
-    source's own description of the server.
+    ``env``, ``url`` and ``headers``. Codex's ``env_http_headers`` keeps original
+    header names and referenced variable names separately from literal headers.
+    A ``config.description`` set here is the source's own description of the server.
     ``transport`` is the connection type the source declares, or infers when it
     declares none, for importable and unsupported servers alike; empty when
     the entry names none the importer can read. ``scope_path`` is the folder
@@ -210,12 +229,14 @@ class SourceReadError(Exception):
         field: str = "",
         line: int | None = None,
         column: int | None = None,
+        expected: ConfigValueKind | None = None,
     ) -> None:
         super().__init__(kind.value)
         self.kind = kind
         self.field = field
         self.line = line
         self.column = column
+        self.expected = expected
 
 
 def read_source_bytes(path: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> bytes | None:
@@ -280,6 +301,16 @@ def request_timeout_seconds(seconds: float) -> int:
     if seconds == math.inf:
         return MAX_REQUEST_TIMEOUT_SECONDS
     return min(math.ceil(seconds), MAX_REQUEST_TIMEOUT_SECONDS)
+
+
+def unsupported_env_value(values: Mapping[str, str]) -> tuple[UnsupportedReason, str] | None:
+    """Name the first converted value the TUI rejects or changes when saving."""
+    for key, value in values.items():
+        if not value.strip():
+            return UnsupportedReason.EMPTY_ENV_VALUE, key
+        if value != value.strip():
+            return UnsupportedReason.ENV_VALUE_WHITESPACE, key
+    return None
 
 
 # HTTP whitespace, which fetch strips from both ends of a header value before sending it: Claude Code,

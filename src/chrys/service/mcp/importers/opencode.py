@@ -3,7 +3,8 @@
 """Import MCP servers configured in opencode.
 
 Baseline: opencode 1.19.5 (tag ``v1.19.5`` of anomalyco/opencode, commit
-810c0eba1a, 2026-10-28), the release ``npm install opencode-ai`` installs and
+810c0eba1a, 2026-10-28), rechecked 2026-11-04; still the latest v1 tag.
+This is the release ``npm install opencode-ai`` installs and
 the one the repository marks as latest. opencode 2, a rewrite released from
 the same repository as the npm package ``@opencode/cli`` (``v2.x`` tags), is
 not followed. Each rule is
@@ -48,9 +49,11 @@ remote and bare ``{"enabled": ...}`` forms, in that order, unknown keys dropped
 [code: K/v1/config/config.ts:113, K/v1/config/mcp.ts]. A file with a server
 of none of these forms is rejected whole by opencode, which then doesn't start
 (or, for a global file, starts without the global folder); its servers are not
-listed, the other files' still are. Only MCP settings and
-``experimental.mcp_timeout`` are validated. Permissions and agent policies are
-not validated or migrated; global permission setting names are reported.
+listed, the other files' still are. Here only migrated connection settings and
+``experimental.mcp_timeout`` are validated. OAuth metadata, permissions and
+agent policies are not validated or migrated; global permission setting names
+are reported. The baseline records verified discovery and conversion rules,
+not a source version gate.
 
 opencode replaces ``{env:NAME}`` and ``{file:path}`` in a file's text before
 parsing it [code: C/variable.ts:34-91]. Here a server's values are read after
@@ -86,7 +89,7 @@ Streamable HTTP, and signs in with OAuth when the server asks, iCode does
 neither; opencode advertises the folder as a root, iCode advertises none.
 
 When opencode updates: read the release notes after the baseline for ``mcp``,
-config loading or variables; re-check the rules here against the cited files
+config loading or variables; re-check discovery and migrated fields against the cited files
 at the new tag, then update the code, the tests and the baseline above.
 """
 
@@ -103,6 +106,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from chrys.service.mcp.importers.base import (
+    ConfigValueKind,
     ImportContext,
     ImportWarning,
     ImportWarningKind,
@@ -122,6 +126,7 @@ from chrys.service.mcp.importers.base import (
     request_timeout_seconds,
     templates_convertible,
     trim_header_value,
+    unsupported_env_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -147,27 +152,15 @@ _FILE_REFERENCE_RE = re.compile(r"\{file:[^}]+\}")
 # The variable names iCode's ``{{NAME}}`` can hold.
 _VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
-_OAUTH_FIELDS = {
-    "clientId": str,
-    "clientSecret": str,
-    "scope": str,
-    "redirectUri": str,
-}
-_V2_OAUTH_FIELDS = {
-    "client_id": "clientId",
-    "client_secret": "clientSecret",
-    "scope": "scope",
-    "callback_port": "callbackPort",
-    "redirect_uri": "redirectUri",
-}
 
 
 class _InvalidConfig(Exception):
     """A setting opencode rejects, so it rejects the whole file."""
 
-    def __init__(self, field: str = "") -> None:
+    def __init__(self, field: str = "", expected: ConfigValueKind | None = None) -> None:
         super().__init__(field)
         self.field = field
+        self.expected = expected
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,7 +228,9 @@ class OpenCodeSource:
                 try:
                     settings = _read_layer(layer)
                 except SourceReadError as exc:
-                    errors.append(McpSourceError(layer.source, exc.kind, exc.field, exc.line, exc.column))
+                    errors.append(
+                        McpSourceError(layer.source, exc.kind, exc.field, exc.line, exc.column, expected=exc.expected)
+                    )
                     failed = True
                     continue
                 if settings is not None:
@@ -399,7 +394,7 @@ def _read_layer(layer: _Layer) -> _Settings | None:
     try:
         return _decode_settings(document)
     except _InvalidConfig as exc:
-        raise SourceReadError(SourceErrorKind.INVALID_CONFIG, field=exc.field) from exc
+        raise SourceReadError(SourceErrorKind.INVALID_CONFIG, field=exc.field, expected=exc.expected) from exc
 
 
 def _reject_constant(name: str) -> Any:
@@ -461,7 +456,7 @@ def _decode_settings(document: dict[str, Any]) -> _Settings:
     # A key written as null is a wrong type to opencode, not a missing one.
     if "mcp" in document:
         if not isinstance(mcp, dict):
-            raise _InvalidConfig("mcp")
+            raise _InvalidConfig("mcp", ConfigValueKind.OBJECT)
         servers, lowered_timeout = _lower_v2(mcp)
         for name, entry in servers.items():
             dynamic_field = f"mcp.{name}" if _has_name_reference(name) else _dynamic_setting_key(entry, f"mcp.{name}")
@@ -473,13 +468,24 @@ def _decode_settings(document: dict[str, Any]) -> _Settings:
             try:
                 settings.mcp[name] = _decode_server(entry)
             except _InvalidConfig as exc:
-                raise _InvalidConfig(f"mcp.{name}") from exc
+                field = f"mcp.{name}.{exc.field}" if exc.field else f"mcp.{name}"
+                timeout = entry.get("timeout") if isinstance(entry, dict) else None
+                if name == "timeout" and isinstance(entry, dict) and not _is_direct_server(entry):
+                    timeout = entry
+                if isinstance(timeout, dict):
+                    for phase in ("startup", "catalog", "execution"):
+                        if phase in timeout and not _is_positive_int(timeout[phase]):
+                            prefix = "mcp.timeout" if timeout is entry else f"mcp.{name}.timeout"
+                            raise _InvalidConfig(f"{prefix}.{phase}", ConfigValueKind.POSITIVE_INTEGER) from exc
+                raise _InvalidConfig(field, exc.expected) from exc
         # A timeout written in experimental is kept over one lowered from mcp [code: C/v2-compat.ts:425-437].
         if not timeout_set:
             mcp_timeout = lowered_timeout
     if timeout_set or mcp_timeout is not None:
         if not isinstance(mcp_timeout, int | float) or not _is_positive_int(mcp_timeout):
-            raise _InvalidConfig("experimental.mcp_timeout" if timeout_set else "mcp.timeout")
+            raise _InvalidConfig(
+                "experimental.mcp_timeout" if timeout_set else "mcp.timeout", ConfigValueKind.POSITIVE_INTEGER
+            )
         settings.mcp_timeout = int(mcp_timeout)
     settings.permission_fields = tuple(key for key in ("tools", "permission", "permissions") if key in document)
     return settings
@@ -544,7 +550,7 @@ def _lower_v2_server(value: object) -> dict[str, Any] | None:
         return None
     kind = value.get("type")
     if kind == "local":
-        if not _is_str_list(value.get("command")) or not _optional(value, "cwd", str):
+        if not _is_str_list(value.get("command")):
             return None
         if "environment" in value and not _is_str_mapping(value["environment"]):
             return None
@@ -553,12 +559,9 @@ def _lower_v2_server(value: object) -> dict[str, Any] | None:
             return None
         if "headers" in value and not _is_str_mapping(value["headers"]):
             return None
-        oauth = value.get("oauth")
-        if "oauth" in value and oauth is not False and not _is_v2_oauth(oauth):
-            return None
     else:
         return None
-    if not _optional(value, "disabled", bool) or not _optional(value, "codemode", bool):
+    if not _optional(value, "disabled", bool):
         return None
     timeout = value.get("timeout")
     if "timeout" in value and not (isinstance(timeout, dict) and _is_v2_timeout(timeout)):
@@ -569,24 +572,11 @@ def _lower_v2_server(value: object) -> dict[str, Any] | None:
     if isinstance(timeout, dict) and (seconds := _lower_timeout(timeout)) is not None:
         lowered["timeout"] = seconds
     if kind == "remote" and "oauth" in value:
-        oauth = value["oauth"]
-        lowered["oauth"] = (
-            False
-            if oauth is False
-            else {_V2_OAUTH_FIELDS[key]: item for key, item in oauth.items() if key in _V2_OAUTH_FIELDS}
-        )
+        # Auth is omitted, so its version-specific structure is irrelevant to migration.
+        lowered["oauth"] = value["oauth"]
     # Keep dynamic names for the unsupported preview even when V2 lowering drops unknown keys.
     preserved = _merge_deep(lowered, _dynamic_key_shape(value))
     return preserved if isinstance(preserved, dict) else lowered
-
-
-def _is_v2_oauth(value: object) -> bool:
-    if not isinstance(value, dict):
-        return False
-    for key, kind in (("client_id", str), ("client_secret", str), ("scope", str), ("redirect_uri", str)):
-        if key in value and not isinstance(value[key], kind):
-            return False
-    return "callback_port" not in value or _is_port(value["callback_port"])
 
 
 def _is_v2_timeout(value: dict[str, Any]) -> bool:
@@ -601,22 +591,37 @@ def _lower_timeout(value: dict[str, Any]) -> int | None:
 
 
 def _decode_server(entry: object) -> dict[str, Any]:
-    """The server as opencode decodes it: local, remote, else a bare on/off switch; known keys only."""
+    """Decode migration fields: local, remote, else a bare on/off switch; known keys only."""
     if not isinstance(entry, dict):
-        raise _InvalidConfig
+        raise _InvalidConfig(expected=ConfigValueKind.OBJECT)
     for decode in (_decode_local, _decode_remote):
         decoded = decode(entry)
         if decoded is not None:
             return decoded
     if isinstance(entry.get("enabled"), bool):
         return {"enabled": entry["enabled"]}
-    raise _InvalidConfig
+    # Diagnose only rejected entries; the source's permissive enabled-only branch still wins.
+    kind = entry.get("type")
+    if kind not in ("local", "remote"):
+        if "enabled" in entry:
+            raise _InvalidConfig("enabled", ConfigValueKind.BOOLEAN)
+        raise _InvalidConfig("type", ConfigValueKind.SERVER_TYPE)
+    if kind == "local" and not _is_str_list(entry.get("command")):
+        raise _InvalidConfig("command", ConfigValueKind.STRING_ARRAY)
+    if kind == "remote" and not isinstance(entry.get("url"), str):
+        raise _InvalidConfig("url", ConfigValueKind.STRING)
+    if not _optional(entry, "enabled", bool):
+        raise _InvalidConfig("enabled", ConfigValueKind.BOOLEAN)
+    if "timeout" in entry and not _is_positive_int(entry["timeout"]):
+        raise _InvalidConfig("timeout", ConfigValueKind.POSITIVE_INTEGER)
+    values_key = "environment" if kind == "local" else "headers"
+    raise _InvalidConfig(values_key, ConfigValueKind.STRING_MAP)
 
 
 def _decode_local(entry: dict[str, Any]) -> dict[str, Any] | None:
     if entry.get("type") != "local" or not _is_str_list(entry.get("command")):
         return None
-    if not _optional(entry, "cwd", str) or not _common_valid(entry):
+    if not _common_valid(entry):
         return None
     if "environment" in entry and not _is_str_mapping(entry["environment"]):
         return None
@@ -628,20 +633,11 @@ def _decode_remote(entry: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if "headers" in entry and not _is_str_mapping(entry["headers"]):
         return None
-    oauth = entry.get("oauth")
-    if "oauth" in entry and oauth is not False and (not isinstance(oauth, dict) or not _oauth_valid(oauth)):
-        return None
     return _pick(entry, ("type", "url", "headers", "oauth", "enabled", "timeout"))
 
 
 def _common_valid(entry: dict[str, Any]) -> bool:
     return _optional(entry, "enabled", bool) and ("timeout" not in entry or _is_positive_int(entry["timeout"]))
-
-
-def _oauth_valid(oauth: dict[str, Any]) -> bool:
-    if any(key in oauth and not isinstance(oauth[key], kind) for key, kind in _OAUTH_FIELDS.items()):
-        return False
-    return "callbackPort" not in oauth or _is_port(oauth["callbackPort"])
 
 
 def _pick(entry: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
@@ -657,10 +653,6 @@ def _optional(entry: dict[str, Any], key: str, kind: type) -> bool:
 def _is_positive_int(value: object) -> bool:
     number = json_number(value)
     return number is not None and math.isfinite(number) and number.is_integer() and number > 0
-
-
-def _is_port(value: object) -> bool:
-    return _is_positive_int(value) and isinstance(value, int | float) and value <= 65535
 
 
 def _is_str_list(value: object) -> bool:
@@ -847,6 +839,9 @@ def _candidate(name: str, server: _Server, merged: _Merged, workspace_cwd: str |
             converted[first_name] = f"{converted[first_name]}, {rendered}" if first_name in converted else rendered
         else:
             converted[key] = rendered
+    if kind == "local" and (invalid_env := unsupported_env_value(converted)) is not None:
+        reason, field = invalid_env
+        return unsupported(reason, f"mcp.{name}.environment.{field}")
     if values_key == "headers":
         # Fetch trims once more after joining aliases; intermediate empty values keep their spaces.
         converted = {key: trim_header_value(value) for key, value in converted.items()}
@@ -863,6 +858,8 @@ def _candidate(name: str, server: _Server, merged: _Merged, workspace_cwd: str |
                 original=cwd,
             )
         )
+    elif kind == "local" and "cwd" in entry and not isinstance(cwd, str):
+        warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="cwd"))
     if kind == "remote" and "oauth" in entry and entry["oauth"] is not False:
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     warnings.extend(_merged_warning(server, values_key))

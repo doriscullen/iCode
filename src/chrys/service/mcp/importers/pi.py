@@ -2,16 +2,18 @@
 
 """Import MCP servers configured in pi, the coding agent.
 
-Baseline: pi 1.4.0 (tag ``v1.4.0`` of earendil-works/pi, commit 4a080252f,
-2026-10-22). Each rule is tagged with the source it was read from:
-``[code: CA/core/mcp-servers.ts:248]`` with ``CA`` =
+Baseline: pi 1.5.0 (tag ``v1.5.0`` of earendil-works/pi, commit f9a263655,
+2026-11-02), rechecked 2026-11-04. Connection, discovery, variable and exposure
+rules are unchanged from 1.4.0; OAuth's new ``clientRegistration: "auto"``
+remains deliberately unmigrated. Each rule is tagged with the source it was read from:
+``[code: CA/core/mcp-servers.ts:260]`` with ``CA`` =
 ``packages/coding-agent/src``.
 
 What is read [code: CA/extensions/mcp/config.ts:92-157]:
 
 - ``global``: ``mcp.json`` in pi's agent folder, ``$PI_CODING_AGENT_DIR``
   when set (``~`` expanded; relative to the folder pi starts in, for which the
-  workspace stands in), else ``~/.pi/agent`` on every OS [code: CA/config.ts:581-611].
+  workspace stands in), else ``~/.pi/agent`` on every OS [code: CA/config.ts:606-636].
 - ``project``: ``.pi/mcp.json`` in the workspace itself, no folder above it.
   Its servers replace global ones of
   the same name; an entry with none of ``command``, ``url`` and ``type`` only
@@ -23,10 +25,11 @@ to import. Import does not start servers or change pi's trust settings.
 
 Both files are strict JSON after one leading byte-order mark, which pi drops
 [code: CA/extensions/mcp/config.ts:97]: a comment or a trailing comma makes
-pi skip the whole file. Each server is checked as pi checks it
-[code: CA/core/mcp-servers.ts:248-305]; one pi rejects is left out, as are a
-second name differing from another only in ``-`` versus ``_``, and a project
-server with ``auth``. Only ``env`` and ``headers`` values hold variables
+pi skip the whole file. Migrated connection and tool exposure settings follow
+the source forms [code: CA/core/mcp-servers.ts:260-317]; omitted OAuth and auth
+settings are not validated. A second name differing from another only in
+``-`` versus ``_`` is left out. The baseline records verified conversion
+rules, not a source version gate. Only ``env`` and ``headers`` values hold variables
 [code: CA/core/resolve-config-value.ts]: ``${NAME}`` and ``$NAME`` become
 iCode's ``{{NAME}}``, ``$$`` and ``$!`` a literal ``$`` and ``!``; a value
 starting with ``!`` runs a command. It is not converted to iCode's
@@ -50,7 +53,7 @@ CA/extensions/mcp/tools.ts:41-46], which is iCode's on-demand loading;
 can; patterns and the rest are named in a warning.
 
 pi accepts a ``timeout`` too long for a JavaScript number, which it reads as
-Infinity [code: CA/core/mcp-servers.ts:267]. That one, and one whose
+Infinity [code: CA/core/mcp-servers.ts:279]. That one, and one whose
 milliseconds overflow to Infinity, set no time limit [code:
 CA/extensions/mcp/runtime.ts:210-212; packages/mcp/src/client.ts:553-559],
 and are imported as the longest iCode waits. A finite timeout above
@@ -64,7 +67,7 @@ in the workspace; pi signs in to an HTTP server with OAuth, or with the token
 of a provider pi is logged in to (``auth``); iCode only sends the headers.
 
 When pi updates: read the CHANGELOG.md entries after the baseline that
-mention MCP, ``mcp.json`` or trust; re-check the rules here against the cited
+mention MCP, config loading or variables; re-check discovery and migrated fields against the cited
 files at the new tag, then update the code, the tests and the baseline above.
 """
 
@@ -97,6 +100,7 @@ from chrys.service.mcp.importers.base import (
     request_timeout_seconds,
     templates_convertible,
     trim_header_value,
+    unsupported_env_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -115,7 +119,6 @@ _VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OVERRIDE_KEYS = frozenset({"enabled", "exposure", "toolExposure"})
 _EXPOSURES = frozenset({"codemode", "deferred", "direct", "hidden"})
 _EXPOSURE_ALIASES = {"codemode-deferred": "codemode"}
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 # How iCode offers a server's tools for each of pi's exposures.
 _FULL = "full"
@@ -252,8 +255,6 @@ def _add_entry(state: _State, name: str, value: object, source: str, scope: str,
     # Names differing only in "-" and "_" would share one tool namespace.
     if any(other != name and _namespace(other) == _namespace(name) for other in state.entries):
         return
-    if scope == SCOPE_PROJECT and "url" in config and "auth" in config:
-        return
     state.entries[name] = _Entry(name, config, source, scope, scope_path)
 
 
@@ -262,7 +263,7 @@ def _namespace(name: str) -> str:
 
 
 def _validate(name: str, raw: object) -> dict[str, Any] | None:
-    """The entry as pi accepts it, exposure aliases resolved; None when pi rejects it."""
+    """Validate migration fields and resolve exposure aliases, without validating omitted auth."""
     if _SERVER_NAME_RE.fullmatch(name) is None or not isinstance(raw, dict):
         return None
     value = dict(raw)
@@ -313,63 +314,13 @@ def _http_valid(value: dict[str, Any]) -> bool:
     url = _parse_url(value["url"])
     if url is None or url.scheme not in {"http", "https"}:
         return False
-    if "headers" in value and not _is_str_mapping(value["headers"]):
-        return False
-    if "oauth" in value and not _oauth_valid(value["oauth"]):
-        return False
-    if "auth" in value:
-        auth = value["auth"]
-        if not isinstance(auth, dict) or not isinstance(auth.get("provider"), str) or not auth["provider"]:
-            return False
-        if url.scheme != "https" and url.hostname not in _LOOPBACK_HOSTS:
-            return False
-    return True
-
-
-def _oauth_valid(oauth: object) -> bool:
-    """pi's checks on ``oauth`` [code: CA/core/mcp-servers.ts:167-209]."""
-    if not isinstance(oauth, dict):
-        return False
-    for key in ("clientId", "clientSecret", "scope"):
-        if key in oauth and not isinstance(oauth[key], str):
-            return False
-    port = oauth.get("callbackPort")
-    if "callbackPort" in oauth and not (isinstance(port, int | float) and _is_integral(port) and 1 <= port <= 65535):
-        return False
-    callback = None
-    if "callbackUrl" in oauth:
-        callback = _parse_url(oauth["callbackUrl"]) if isinstance(oauth["callbackUrl"], str) else None
-        if callback is None or callback.scheme != "http" or callback.hostname not in _LOOPBACK_HOSTS:
-            return False
-        if callback.query or callback.fragment:
-            return False
-        if callback.port is not None and port is not None and callback.port != port:
-            return False
-    if "clientName" in oauth and not (isinstance(oauth["clientName"], str) and oauth["clientName"].strip()):
-        return False
-    registration = oauth.get("clientRegistration", "dcr")
-    if registration != "dcr":
-        if registration != "cimd" or "clientId" in oauth or "clientName" in oauth:
-            return False
-        if callback is not None and (callback.hostname == "::1" or callback.path != "/callback"):
-            return False
-    if "authServerMetadataUrl" in oauth:
-        metadata = (
-            _parse_url(oauth["authServerMetadataUrl"]) if isinstance(oauth["authServerMetadataUrl"], str) else None
-        )
-        if metadata is None or not (
-            metadata.scheme == "https" or (metadata.scheme == "http" and metadata.hostname in _LOOPBACK_HOSTS)
-        ):
-            return False
-    return True
+    return "headers" not in value or _is_str_mapping(value["headers"])
 
 
 def _stdio_valid(value: dict[str, Any]) -> bool:
     if "args" in value and not (isinstance(value["args"], list) and all(isinstance(arg, str) for arg in value["args"])):
         return False
-    if "env" in value and not _is_str_mapping(value["env"]):
-        return False
-    return "cwd" not in value or isinstance(value["cwd"], str)
+    return "env" not in value or _is_str_mapping(value["env"])
 
 
 def _parse_url(value: str) -> Any:
@@ -389,12 +340,6 @@ def _parse_url(value: str) -> Any:
 def _normalize_url(value: str) -> str:
     """The common WHATWG whitespace cleanup applied by pi's URL constructor."""
     return value.strip("".join(chr(code) for code in range(33))).replace("\t", "").replace("\r", "").replace("\n", "")
-
-
-def _is_integral(value: object) -> bool:
-    """A JSON number JavaScript's ``Number.isInteger`` accepts, ``3000.0`` included."""
-    number = json_number(value)
-    return number is not None and math.isfinite(number) and number.is_integer()
 
 
 def _is_positive_number(value: object) -> bool:
@@ -467,6 +412,9 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
             converted[first_name] = f"{converted[first_name]}, {rendered}" if first_name in converted else rendered
         else:
             converted[key] = rendered
+    if transport == "stdio" and (invalid_env := unsupported_env_value(converted)) is not None:
+        reason, field = invalid_env
+        return unsupported(reason, f"mcpServers.{entry.name}.env.{field}")
     if values_key == "headers":
         converted = {key: trim_header_value(value) for key, value in converted.items()}
 
@@ -483,10 +431,18 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
                 original=expanded,
             )
         )
+    elif transport == "stdio" and "cwd" in config and not isinstance(cwd, str):
+        warnings.append(ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="cwd"))
     if transport == "http" and "oauth" in config:
         warnings.append(ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     if transport == "http" and "auth" in config:
-        warnings.append(ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=config["auth"]["provider"]))
+        auth = config["auth"]
+        provider = auth.get("provider") if isinstance(auth, dict) else None
+        warnings.append(
+            ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original=provider)
+            if isinstance(provider, str) and provider
+            else ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="auth")
+        )
     if entry.override:
         warnings.append(ImportWarning(ImportWarningKind.MERGED, original=entry.override))
     access = _tool_access(config)
@@ -577,7 +533,7 @@ class _ToolAccess:
 def _tool_access(config: dict[str, Any]) -> _ToolAccess:
     """pi's ``exposure`` and ``toolExposure`` as iCode's tool lists and loading strategy.
 
-    Exact tool names beat patterns in pi [code: CA/core/mcp-servers.ts:234-242];
+    Exact tool names beat patterns in pi [code: CA/core/mcp-servers.ts:246-254];
     a pattern, or an exact name iCode can't single out, is named in a warning.
     """
     exposure = config.get("exposure", "codemode")

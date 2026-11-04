@@ -74,7 +74,7 @@ from chrys.service.mcp.importers import (
     detected_sources,
     with_tool_name_prefix,
 )
-from chrys.service.mcp.importers.base import MAX_SOURCE_BYTES
+from chrys.service.mcp.importers.base import MAX_SOURCE_BYTES, ConfigValueKind
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
 if TYPE_CHECKING:
@@ -97,7 +97,7 @@ _NOT_ENABLED = msg("tui.mcp.import.field.enabled.no", fallback="No")
 _DETECTING = msg("tui.mcp.import.detecting", fallback="Looking for agents...")
 _DETECT_FAILED = msg(
     "tui.mcp.import.detect_failed",
-    fallback="Couldn't search for MCP configurations. Reopen import to try again. If it still fails, check the log.",
+    fallback="Couldn't search for MCP configurations. Reopen import to try again. If it still fails, see the User Guide (F8) to locate iCode's debug.log.",
 )
 _LOADING = msg("tui.mcp.import.loading", fallback="Reading MCP servers...")
 _NO_AGENTS = msg(
@@ -107,7 +107,7 @@ _NO_AGENTS = msg(
 _EMPTY_SOURCE = msg("tui.mcp.import.empty_source", fallback="No MCP servers found.")
 _READ_FAILED = msg(
     "tui.mcp.import.read_failed",
-    fallback="Couldn't load MCP configurations from {agent}. Reopen import to try again. If it still fails, check the log.",
+    fallback="Couldn't load MCP configurations from {agent}. Reopen import to try again. If it still fails, see the User Guide (F8) to locate iCode's debug.log.",
 )
 _DESCRIPTION = msg(
     "tui.mcp.import.description",
@@ -117,37 +117,28 @@ _DESCRIPTION_SCOPED = msg(
     "tui.mcp.import.description.scoped",
     fallback="Imported from {agent}. There it is a {scope} server, used only in {path}.",
 )
-_SCOPED_NOTICE = msg(
-    "tui.mcp.import.scoped_notice",
-    fallback=(
-        "In {agent}, servers with {local} or {project} scope are used only in the folder shown on each card. "
-        "After import, {app} uses them in every project."
-    ),
-)
-_SCOPED_NOTICE_PROJECT = msg(
-    "tui.mcp.import.scoped_notice.project",
-    fallback=(
-        "In {agent}, servers with {project} scope are used only in the folder shown on each card. "
-        "After import, {app} uses them in every project."
-    ),
-)
 _SCOPE = msg("tui.mcp.import.field.scope", fallback="Scope in {agent}")
 _SCOPE_EVERY_PROJECT = msg("tui.mcp.import.field.scope.every_project", fallback="{scope}, used in every project")
 _SCOPE_ONLY_IN = msg("tui.mcp.import.field.scope.only_in", fallback="{scope}, used only in {path}")
+_SCOPE_AFTER_IMPORT = msg("tui.mcp.import.field.scope_after_import", fallback="Scope After Import")
+_SCOPE_IMPORTED_ALL = msg(
+    "tui.mcp.import.field.scope_imported_all", fallback="Available to this agent in every project"
+)
 _CONFIGURATION_SOURCE = msg("tui.mcp.import.field.configuration_source", fallback="Configuration Source")
 _TRANSPORT_OPTIONS = msg("tui.mcp.import.field.transport_options", fallback="{transport} Options")
 _SOURCE_CONNECTION = msg("tui.mcp.import.field.source_connection", fallback="Connection Settings in Source")
+_ENV_HTTP_HEADERS = msg("tui.mcp.import.field.env_http_headers", fallback="Headers From Environment Variables")
 _REQUEST_TIMEOUT = msg("tui.mcp.import.field.request_timeout", fallback="MCP Request Timeout")
 _TIMEOUT_SECONDS = msg("tui.mcp.import.timeout.seconds", fallback="{seconds} s")
 _TIMEOUT_CONVERTED = msg(
     "tui.mcp.import.timeout.converted",
-    fallback="{seconds} s (source: {milliseconds} ms)",
+    fallback=" (source: {milliseconds} ms)",
 )
 _TIMEOUT_CONVERTED_SECONDS = msg(
     "tui.mcp.import.timeout.converted_seconds",
-    fallback="{seconds} s (source: {source_seconds} s)",
+    fallback=" (source: {source_seconds} s)",
 )
-_TIMEOUT_UNLIMITED = msg("tui.mcp.import.timeout.unlimited", fallback="{seconds} s (source: no timeout limit)")
+_TIMEOUT_UNLIMITED = msg("tui.mcp.import.timeout.unlimited", fallback=" (source: no timeout limit)")
 _TIMEOUT_DEFAULT = msg("tui.mcp.import.timeout.default", fallback="Use {app} default")
 _AVAILABLE_TOOL_SCOPE = msg("tui.mcp.import.field.available_tool_scope", fallback="Available Tool Scope")
 _ALL_TOOLS = msg("tui.mcp.import.field.all_tools", fallback="All server tools")
@@ -160,7 +151,7 @@ _SCOPE_GLOBAL = msg("tui.mcp.import.scope.global", fallback="global")
 _TOGGLE_BINDING = msg("tui.binding.toggle_card", fallback="Expand or collapse")
 _UNSUPPORTED_TRANSPORT = msg(
     "tui.mcp.import.unsupported.transport",
-    fallback="{app} supports only STDIO and HTTP MCP servers. Use a supported connection type.",
+    fallback="{app} supports only STDIO and HTTP MCP servers. Add the server manually using a STDIO command or HTTP URL that the server provides.",
 )
 _TEMPLATE_IN_URL = msg(
     "tui.mcp.import.unsupported.template_in_url",
@@ -178,15 +169,12 @@ _TEMPLATE_IN_COMMAND = msg(
 )
 _TEMPLATE_IN_FIELD_NAME = msg(
     "tui.mcp.import.unsupported.template_in_field_name",
-    fallback=(
-        "{app} requires fixed server names and configuration field names. "
-        "Use fixed names in the source configuration, then reopen import."
-    ),
+    fallback="{app} requires fixed server names and configuration field names. Names containing variable or file references can't be imported.",
 )
 _TEMPLATE_NEXT_TO_BRACE = msg(
     "tui.mcp.import.unsupported.template_next_to_brace",
     fallback=(
-        "A variable reference next to a brace cannot be converted to {app} syntax. "
+        "{app} can't import this value because a variable reference is adjacent to a brace. "
         "Add the server manually and enter the full value in Environment Variables or Headers."
     ),
 )
@@ -194,50 +182,43 @@ _FILE_REFERENCE = msg(
     "tui.mcp.import.unsupported.file_reference",
     fallback=(
         "{app} can't import values read from files. Add the server manually and fill in the required value "
-        "from the file. In Environment Variables or Headers, you can also reference an environment variable "
-        "or credential command."
+        "from the file. For variable or credential command references, see the User Guide (F8)."
     ),
 )
 _HEADER_VALUE_ENCODING = msg(
     "tui.mcp.import.unsupported.header_value_encoding",
-    fallback=(
-        "{app} can't import HTTP headers containing non-ASCII text. "
-        "Use an ASCII representation accepted by the server in the source configuration, then reopen import."
-    ),
+    fallback="This HTTP header contains non-ASCII text and can't be imported.",
 )
 _VALUE_FROM_COMMAND = msg(
     "tui.mcp.import.unsupported.value_from_command",
     fallback=(
         "This value comes from a command that needs to be configured manually in {app}. "
         "Add the server and use {template} in Environment Variables or Headers. "
-        "Before testing, check that the command runs from your home folder and outputs one nonempty line of ASCII text."
+        "For credential command usage, see the User Guide (F8)."
     ),
 )
 _VARIABLE_NAME = msg(
     "tui.mcp.import.unsupported.variable_name",
-    fallback=(
-        "An environment variable name is not supported by {app}. "
-        "Use a name beginning with an ASCII letter or underscore, followed by ASCII letters, digits or underscores, "
-        "then reopen import."
-    ),
+    fallback="This environment variable name isn't supported by {app}. Names must begin with an ASCII letter or underscore and contain only ASCII letters, digits or underscores.",
+)
+_EMPTY_ENV_VALUE = msg(
+    "tui.mcp.import.unsupported.empty_env_value",
+    fallback="{app} doesn't support environment variables with empty values, so this server can't be imported.",
+)
+_ENV_VALUE_WHITESPACE = msg(
+    "tui.mcp.import.unsupported.env_value_whitespace",
+    fallback="{app} doesn't support environment variable values with leading or trailing whitespace, so this server can't be imported.",
 )
 _UNSUPPORTED_SETTING = msg(
     "tui.mcp.import.unsupported.setting", fallback="{reason}\nSource setting: {field}", multiline=True
 )
 _VARIABLE_NAME_DETAILS = msg(
     "tui.mcp.import.unsupported.variable_name_details",
-    fallback=(
-        "{field} references the unsupported environment variable name {variable}. "
-        "Use a name beginning with an ASCII letter or underscore, followed by ASCII letters, digits or underscores. "
-        "Update the name in the source configuration and environment, then reopen import."
-    ),
+    fallback="{field} references the unsupported environment variable name {variable}. Names must begin with an ASCII letter or underscore and contain only ASCII letters, digits or underscores.",
 )
 _HEADER_NAME_COLLISION = msg(
     "tui.mcp.import.unsupported.header_name_collision",
-    fallback=(
-        "These headers have conflicting entries whose names differ only in case: {fields}. "
-        "Keep one entry for each header in the source configuration, then reopen import."
-    ),
+    fallback="These headers have conflicting entries whose names differ only in case: {fields}.",
 )
 _REMOTE_ENVIRONMENT = msg(
     "tui.mcp.import.unsupported.remote_environment",
@@ -255,38 +236,39 @@ _COVERED = msg(
 _DEFAULT_DROPPED = msg(
     "tui.mcp.import.warning.default_dropped",
     fallback=(
-        "{field} keeps the reference {converted}; the default for {variable} was not imported. "
-        "Set {variable} to a nonempty value before starting {app}, or fill in a fixed value after import."
+        "Defaults for {variable} in {field} are not imported. "
+        "Set {variable} before starting {app}, or enter a fixed value after import."
     ),
 )
 _HEADERS_HELPER_IGNORED = msg(
     "tui.mcp.import.warning.headers_helper_ignored",
     fallback=(
         "The headers helper is not imported. After import, add the required headers in this server's settings. "
-        "For a value supplied by a command, use {template} with a command that outputs only that header's value. "
-        "In {app}, do not use a helper that outputs a JSON object of headers."
+        "To obtain each header's value using {template}, see the User Guide (F8)."
     ),
 )
 _OAUTH_IGNORED = msg(
     "tui.mcp.import.warning.oauth_ignored",
     fallback=(
-        "{app} doesn't support OAuth sign-in. After import, configure Headers if the server accepts "
-        "a token or another authentication method. Replace expired tokens yourself, or use a credential command."
+        "OAuth settings and sign-in state are not imported. If the server accepts a token or another "
+        "authentication method, configure Headers after import, or see the User Guide (F8) to obtain credentials "
+        "using {template}."
     ),
 )
 _CODEX_OAUTH_IGNORED = msg(
     "tui.mcp.import.warning.codex_oauth_ignored",
     fallback=(
-        "This server explicitly configures OAuth in Codex. OAuth settings and sign-in will not transfer to {app}. "
-        "After import, configure Headers if the server accepts a token or another authentication method."
+        "OAuth settings and sign-in state from Codex are not imported. If the server accepts a token or another "
+        "authentication method, configure Headers after import, or see the User Guide (F8) to obtain credentials "
+        "using {template}."
     ),
 )
 _CREDENTIAL_VARIABLE = msg(
     "tui.mcp.import.warning.credential_variable",
     fallback=(
-        "The reference to {variable} in {field} is removed, as in {agent}. "
-        "Other text is kept; a header left empty is omitted. To send this credential in {app}, "
-        "set an environment variable with another name before starting {app}, then reference it in this field."
+        "To avoid unintentionally sending local credentials to an MCP server, references to {variable} "
+        "in headers {field} are removed, matching {agent}. "
+        "Other text is kept; headers with no remaining value are omitted."
     ),
 )
 _CLAUDE_PROJECT_DIR = msg(
@@ -301,15 +283,14 @@ _CWD_IGNORED = msg(
     "tui.mcp.import.warning.cwd_ignored",
     fallback=(
         "The working folder {folder} from {agent} is not imported. "
-        "Before testing, start {app} from that folder or replace the server's relative paths with absolute paths."
+        "Before testing, start {app} there or use absolute paths in the server's command and arguments."
     ),
 )
 _RELATIVE_CWD_IGNORED = msg(
     "tui.mcp.import.warning.relative_cwd_ignored",
     fallback=(
-        "The working folder {folder} from {agent} is relative to {base} and is not imported. "
-        "Before testing, find that folder under {base} and start {app} there, "
-        "or replace the server's relative paths with absolute paths."
+        "The working folder {folder} from {agent}, relative to {base}, is not imported. "
+        "Before testing, start {app} in the resolved folder or use absolute paths in the server's command and arguments."
     ),
 )
 _MERGED = msg(
@@ -329,22 +310,23 @@ _AUTH_PROVIDER_IGNORED = msg(
     "tui.mcp.import.warning.auth_provider_ignored",
     fallback=(
         "The {provider} credentials from {agent} are not imported. After import, configure this server's Headers "
-        "with a token it accepts, or use {template} with a command that obtains one."
+        "with a token it accepts, or see the User Guide (F8) to obtain credentials using {template}."
     ),
 )
 _TOOL_RULES_IGNORED = msg(
     "tui.mcp.import.warning.tool_rules_ignored",
     fallback=(
         "These tool rules from {agent} are not imported: {rules}. Before using the server in {app}, "
-        "check Available Tool Scope and, if shown, Loading Strategy in this server's settings, "
-        "and adjust which tools are available and when they load."
+        "check Available Tool Scope in this server's settings and select the tools you need. "
+        "For tool loading options, see the User Guide (F8)."
     ),
 )
 _TOOL_PERMISSIONS_IGNORED = msg(
     "tui.mcp.import.warning.tool_permissions_ignored",
     fallback=(
         "Tool permissions from {agent} are not imported ({fields}). "
-        "After import, check Available Tool Scope in the server's settings and the agent profile's approval rules."
+        "After import, select which tools are available under Available Tool Scope. "
+        "To change whether tool execution requires approval, see the User Guide (F8) to configure approval rules."
     ),
 )
 _TOOLS_LIMITED_NONE = msg(
@@ -374,23 +356,17 @@ _UNKNOWN_FIELDS_IGNORED = msg(
     "tui.mcp.import.warning.unknown_fields_ignored",
     fallback=(
         "These source settings are not imported: {fields}. "
-        "Check their purpose in {agent}; they may have no equivalent in {app}. "
-        "Test the imported server before using it."
+        "Check whether your server relies on them before using it in {app}. "
+        "For supported settings, see the User Guide (F8)."
     ),
 )
 _INVALID_HEADER_NAME_IGNORED = msg(
     "tui.mcp.import.warning.invalid_header_name_ignored",
-    fallback=(
-        "{field} has an invalid HTTP header name. {agent} skips it, and it is not imported. "
-        "If this header is needed, correct its name in the source configuration and reopen import."
-    ),
+    fallback="{field} has an invalid HTTP header name. {agent} skips it, and it is not imported.",
 )
 _INVALID_HEADER_VALUE_IGNORED = msg(
     "tui.mcp.import.warning.invalid_header_value_ignored",
-    fallback=(
-        "{field} has an invalid HTTP header value. {agent} skips it, and it is not imported. "
-        "If this header is needed, remove line breaks or control characters from its source value and reopen import."
-    ),
+    fallback="{field} has an invalid HTTP header value. {agent} skips it, and it is not imported.",
 )
 _ZERO_TIMEOUT_IGNORED = msg(
     "tui.mcp.import.warning.zero_timeout_ignored",
@@ -411,49 +387,17 @@ _TOOL_OUTPUT_LIMIT_IGNORED = msg(
     "tui.mcp.import.warning.tool_output_limit_ignored",
     fallback=(
         "These per-tool output limits are not imported: {fields}. "
-        "After import, review the server-wide max_tool_result_tokens setting in the agent profile if needed."
+        "You can set one output limit for the whole server after import. For configuration, see the User Guide (F8)."
     ),
 )
 _LITERAL_BRACES_ESCAPED = msg(
     "tui.mcp.import.warning.literal_braces_escaped",
-    fallback="Literal braces are escaped using {app} syntax; the text received by the server is unchanged.",
+    fallback="Braces look different in the preview; the text sent to the server is unchanged.",
 )
 _WARNING_TITLE = msg("tui.mcp.import.warning.title", fallback="Import Warnings")
-_WARNING_FIELDS = msg("tui.mcp.import.warning.fields", fallback="Affected fields:")
-_WARNING_RESULT = msg("tui.mcp.import.warning.result", fallback="Converted variable reference:")
-_WARNING_EFFECT = msg("tui.mcp.import.warning.effect", fallback="Impact:")
-_WARNING_ACTION = msg("tui.mcp.import.warning.action", fallback="Action:")
 _WARNING_NOTE = msg("tui.mcp.import.warning.note", fallback="Note:")
-_PROJECT_DIR_TITLE = msg("tui.mcp.import.warning.project_dir.title", fallback="Configure the project folder manually")
-_PROJECT_DIR_EFFECT = msg(
-    "tui.mcp.import.warning.project_dir.effect",
-    fallback="The connection fails if {variable} is unset. {app} does not set it automatically.",
-)
-_PROJECT_DIR_ACTION = msg(
-    "tui.mcp.import.warning.project_dir.action",
-    fallback=("Enter the required folder path in these fields, or set {variable} before starting {app}."),
-)
-_DEFAULT_TITLE = msg("tui.mcp.import.warning.default.title", fallback="Variable defaults will not be kept")
-_DEFAULT_ACTION = msg(
-    "tui.mcp.import.warning.default.action",
-    fallback=("Set {variable} before starting {app}, or enter a fixed value in these fields."),
-)
 _DEFAULT_NOTE = msg(
     "tui.mcp.import.warning.default.note", fallback="The variable default in these fields will not be kept: {fields}."
-)
-_CREDENTIAL_TITLE = msg(
-    "tui.mcp.import.warning.credential.title", fallback="Credential variable references will be removed"
-)
-_CREDENTIAL_ACTION = msg(
-    "tui.mcp.import.warning.credential.action",
-    fallback="To send this credential, set an environment variable with another name before starting the application, then reference it in these fields.",
-)
-_CREDENTIAL_EFFECT = msg(
-    "tui.mcp.import.warning.credential.effect",
-    fallback=(
-        "References to {variable} are replaced with an empty string; other text is kept. "
-        "A header left entirely empty after trimming is omitted."
-    ),
 )
 _HINT_DEFAULT_DROPPED = msg("tui.mcp.import.hint.default_dropped", fallback="A variable default won't be kept")
 _HINT_HEADERS_HELPER = msg("tui.mcp.import.hint.headers_helper", fallback="The headers helper won't be imported")
@@ -527,54 +471,88 @@ _HINT_KINDS = {
 _INFORMATIONAL_WARNING_KINDS = frozenset({ImportWarningKind.LITERAL_BRACES_ESCAPED, ImportWarningKind.MERGED})
 _UNREADABLE = msg(
     "tui.mcp.import.source_error.unreadable",
-    fallback="Couldn't read {path}. Check that the file exists and your account has permission to read it, then reopen import.",
+    fallback="Couldn't read {path}. Check that the file exists and your account has permission to read it.",
 )
 _TOO_LARGE = msg(
     "tui.mcp.import.source_error.too_large",
-    fallback="{path} exceeds the {limit_mib} MiB file size limit. Reduce its size, then reopen import.",
+    fallback="{path} exceeds the {limit_mib} MiB file size limit.",
 )
 _INVALID_JSON = msg(
-    "tui.mcp.import.source_error.invalid_json", fallback="{path} is not valid JSON. Fix the file, then reopen import."
+    "tui.mcp.import.source_error.invalid_json",
+    fallback="{path} is not valid JSON.",
 )
 _INVALID_JSON_LOCATION = msg(
     "tui.mcp.import.source_error.invalid_json_location",
-    fallback="Couldn't parse {path} as JSON at line {line}, column {column}. Fix the file, then reopen import.",
+    fallback="Couldn't parse {path} as JSON at line {line}, column {column}.",
 )
 _INVALID_TOML = msg(
     "tui.mcp.import.source_error.invalid_toml",
-    fallback="Couldn't parse {path} as TOML. Check its syntax and file encoding, then reopen import.",
+    fallback="Couldn't parse {path} as TOML.",
 )
 _INVALID_TOML_LOCATION = msg(
     "tui.mcp.import.source_error.invalid_toml_location",
-    fallback="Couldn't parse {path} as TOML at line {line}, column {column}. Fix the file, then reopen import.",
+    fallback="Couldn't parse {path} as TOML at line {line}, column {column}.",
 )
 _INVALID_ENCODING = msg(
     "tui.mcp.import.source_error.invalid_encoding",
-    fallback="Couldn't read {path} as UTF-8. Save the file as UTF-8, then reopen import.",
+    fallback="Couldn't read {path} as UTF-8.",
 )
 _INVALID_CONFIG_FIELD = msg(
     "tui.mcp.import.source_error.invalid_config_field",
-    fallback="{field} in {path} must be a TOML table, such as {example}. Fix the file, then reopen import.",
+    fallback="{field} in {path} must be a TOML table, such as {example}.",
 )
 _INVALID_CONFIG_SETTING = msg(
     "tui.mcp.import.source_error.invalid_config_setting",
-    fallback="The setting {field} in {path} is invalid. Check its type and value, then reopen import.",
+    fallback="The setting {field} in {path} is invalid.",
 )
+_EXPECTED_OBJECT = msg(
+    "tui.mcp.import.source_error.expected.object",
+    fallback="{field} in {path} must be a JSON object.",
+)
+_EXPECTED_STRING = msg(
+    "tui.mcp.import.source_error.expected.string",
+    fallback="{field} in {path} must be a string.",
+)
+_EXPECTED_STRING_ARRAY = msg(
+    "tui.mcp.import.source_error.expected.string_array",
+    fallback="The command at {field} in {path} must be an array of strings, such as {example}.",
+)
+_EXPECTED_STRING_MAP = msg(
+    "tui.mcp.import.source_error.expected.string_map",
+    fallback="{field} in {path} must be a JSON object whose values are strings.",
+)
+_EXPECTED_BOOLEAN = msg(
+    "tui.mcp.import.source_error.expected.boolean",
+    fallback="{field} in {path} must be true or false.",
+)
+_EXPECTED_POSITIVE_INTEGER = msg(
+    "tui.mcp.import.source_error.expected.positive_integer",
+    fallback="{field} in {path} must be a positive integer.",
+)
+_EXPECTED_SERVER_TYPE = msg(
+    "tui.mcp.import.source_error.expected.server_type",
+    fallback='{field} in {path} must be "local" or "remote".',
+)
+_EXPECTED_VALUES = {
+    ConfigValueKind.OBJECT: _EXPECTED_OBJECT,
+    ConfigValueKind.STRING: _EXPECTED_STRING,
+    ConfigValueKind.STRING_ARRAY: _EXPECTED_STRING_ARRAY,
+    ConfigValueKind.STRING_MAP: _EXPECTED_STRING_MAP,
+    ConfigValueKind.BOOLEAN: _EXPECTED_BOOLEAN,
+    ConfigValueKind.POSITIVE_INTEGER: _EXPECTED_POSITIVE_INTEGER,
+    ConfigValueKind.SERVER_TYPE: _EXPECTED_SERVER_TYPE,
+}
 _INVALID_JSON_OBJECT_FIELD = msg(
     "tui.mcp.import.source_error.invalid_json_object_field",
-    fallback="{field} in {path} must be a JSON object. Fix the file, then reopen import.",
+    fallback="{field} in {path} must be a JSON object.",
 )
 _INVALID_SERVER_CONFIG = msg(
     "tui.mcp.import.source_error.invalid_server_config",
-    fallback=(
-        "The MCP server settings at {field} in {path} are invalid. "
-        "For type local, provide a command array; for type remote, provide a URL. "
-        "Check the other settings' types and values, then reopen import."
-    ),
+    fallback="The MCP server settings at {field} in {path} are invalid. Type local requires a command array; type remote requires a URL.",
 )
 _NOT_AN_OBJECT = msg(
     "tui.mcp.import.source_error.not_an_object",
-    fallback="{path} must contain a JSON object at the top level. Fix the file, then reopen import.",
+    fallback="{path} must contain a JSON object at the top level.",
 )
 
 _SCOPE_LABELS = {"user": _SCOPE_USER, "local": _SCOPE_LOCAL, "project": _SCOPE_PROJECT, "global": _SCOPE_GLOBAL}
@@ -589,10 +567,12 @@ _UNSUPPORTED_REASONS = {
     UnsupportedReason.HEADER_VALUE_ENCODING: _HEADER_VALUE_ENCODING,
     UnsupportedReason.VALUE_FROM_COMMAND: _VALUE_FROM_COMMAND,
     UnsupportedReason.VARIABLE_NAME: _VARIABLE_NAME,
+    UnsupportedReason.EMPTY_ENV_VALUE: _EMPTY_ENV_VALUE,
+    UnsupportedReason.ENV_VALUE_WHITESPACE: _ENV_VALUE_WHITESPACE,
 }
 _INVALID_CONFIG = msg(
     "tui.mcp.import.source_error.invalid_config",
-    fallback="{path} has settings {agent} rejects, so its servers are not listed. Fix the file, then reopen import.",
+    fallback="{path} has settings {agent} rejects, so its servers are not listed.",
 )
 _SOURCE_ERRORS = {
     SourceErrorKind.INVALID_TOML: _INVALID_TOML,
@@ -616,6 +596,11 @@ def _source_error(error: McpSourceError, agent: str) -> MessageRef:
     if error.kind is SourceErrorKind.INVALID_TOML and error.line is not None and error.column is not None:
         return _INVALID_TOML_LOCATION.bind(path=path, line=error.line, column=error.column)
     if error.kind is SourceErrorKind.INVALID_CONFIG:
+        if error.expected is not None:
+            field = sanitize_legacy_scalar(error.field)
+            if error.expected is ConfigValueKind.STRING_ARRAY:
+                return _EXPECTED_STRING_ARRAY.bind(path=path, field=field, example='["server", "--flag"]')
+            return _EXPECTED_VALUES[error.expected].bind(path=path, field=field)
         if agent == "pi" and error.field == "mcpServers":
             return _INVALID_JSON_OBJECT_FIELD.bind(path=path, field=error.field)
         if agent == "Codex" and error.field == "mcp_servers":
@@ -703,12 +688,21 @@ class _CardField:
     value: str = ""
     pairs: tuple[tuple[str, str], ...] = ()
     single_line: bool = False
+    annotation: str = ""
+
+
+class _AnnotatedFieldValue(Static):
+    """A value with a quieter inline explanation, following the active theme."""
+
+    COMPONENT_CLASSES: ClassVar[set[str]] = {"mcp-import-value--annotation"}
+
+    def __init__(self, value: str, annotation: str, *, classes: str) -> None:
+        super().__init__(Content.assemble(value, (annotation, ".mcp-import-value--annotation")), classes=classes)
 
 
 @dataclass(frozen=True, slots=True)
 class _WarningGroup:
     text: str
-    fields: tuple[_CardField, ...] = ()
     attention: bool = True
 
 
@@ -718,7 +712,10 @@ def _field_widgets(field: _CardField) -> ComposeResult:
         yield _PairGrid(field.pairs)
     else:
         classes = "mcp-import-field-value" + (" -single-line" if field.single_line else "")
-        yield Static(Text(field.value), classes=classes)
+        if field.annotation:
+            yield _AnnotatedFieldValue(field.value, field.annotation, classes=classes)
+        else:
+            yield Static(Text(field.value), classes=classes)
 
 
 # Textual puts the fold symbol and a space before the label; the gap follows the name before the summary.
@@ -837,31 +834,15 @@ class _Section(Vertical):
             yield from _field_widgets(field)
 
 
-class _WarningFields(Grid):
-    """The labelled rows under a warning, as the agent's MCP card labels its fields."""
-
-    def __init__(self, fields: Sequence[_CardField]) -> None:
-        super().__init__(classes="mcp-import-warning-fields")
-        self._fields = fields
-
-    def compose(self) -> ComposeResult:
-        for field in self._fields:
-            yield Static(Text(field.label), classes="mcp-import-warning-label")
-            yield Static(Text(field.value), classes="mcp-import-warning-value")
-
-
 class _WarningBlock(Vertical):
-    """One warning: its line and, when it groups fields, the labelled rows that say which."""
+    """One warning paragraph, with related fields named together."""
 
     def __init__(self, group: _WarningGroup) -> None:
         super().__init__(classes="mcp-import-warning-group")
         self._group = group
 
     def compose(self) -> ComposeResult:
-        title_classes = "mcp-import-warning" + (" mcp-import-warning-title" if self._group.fields else "")
-        yield Static(Text(self._group.text), classes=title_classes)
-        if self._group.fields:
-            yield _WarningFields(self._group.fields)
+        yield Static(Text(self._group.text), classes="mcp-import-warning")
 
 
 class _ImportItem(Horizontal):
@@ -967,7 +948,7 @@ class _ImportCard(CollapsibleConfigCard):
         self._hint_panel.display = self._hint_widget.display
         self._hint_panel.set_class(not self._covered, "-error")
         attention, unavailable, covered, imported = self._status_labels
-        self._hint_title.update(Text(covered if self._covered else unavailable))
+        self._hint_title.update(Text(covered if self._covered else f"✕ {unavailable}"))
         if isinstance(self._title_widget, _CardTitle):
             status = (
                 covered
@@ -1235,20 +1216,6 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             Static(Text(self._render_message(_source_error(error, agent))), classes="mcp-import-error")
             for error in result.source_errors
         ]
-        # Said once for the whole list: importing makes a folder-only server global.
-        if any(candidate.scope_path for candidate in result.candidates):
-            if any(candidate.scope == "local" for candidate in result.candidates):
-                notice = _SCOPED_NOTICE.bind(
-                    agent=agent,
-                    local=self._scope_label("local"),
-                    project=self._scope_label("project"),
-                    app=APP_DISPLAY_NAME,
-                )
-            else:
-                notice = _SCOPED_NOTICE_PROJECT.bind(
-                    agent=agent, project=self._scope_label("project"), app=APP_DISPLAY_NAME
-                )
-            widgets.append(Static(Text(self._render_message(notice)), classes="mcp-import-notice"))
         # Importable servers first, then those that can't be imported, then those this agent already has.
         states = [
             (index, candidate, self._candidate_state(candidate)) for index, candidate in enumerate(result.candidates)
@@ -1364,6 +1331,8 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         reason = self._render_message(
             _VALUE_FROM_COMMAND.bind(app=APP_DISPLAY_NAME, template="{{!command}}")
             if candidate.unsupported is UnsupportedReason.VALUE_FROM_COMMAND
+            else _HEADER_VALUE_ENCODING.bind()
+            if candidate.unsupported is UnsupportedReason.HEADER_VALUE_ENCODING
             else _UNSUPPORTED_REASONS[candidate.unsupported].bind(app=APP_DISPLAY_NAME)
         )
         if candidate.unsupported_field:
@@ -1414,6 +1383,12 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             else _SCOPE_EVERY_PROJECT.bind(scope=scope)
         )
         fields.append(_CardField(self._render_message(_SCOPE.bind(agent=agent)), self._render_message(where)))
+        if converted and candidate.scope_path:
+            fields.append(
+                _CardField(
+                    self._render_message(_SCOPE_AFTER_IMPORT.bind()), self._render_message(_SCOPE_IMPORTED_ALL.bind())
+                )
+            )
         if candidate.config is not None and not candidate.config.enabled:
             fields.append(
                 _CardField(self._render_message(MCP_ENABLED.bind()), self._render_message(_NOT_ENABLED.bind()))
@@ -1480,6 +1455,11 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 headers=entry.get("headers"),
             )
         )
+        env_headers = entry.get("env_http_headers")
+        if isinstance(env_headers, Mapping) and env_headers:
+            fields.append(
+                _CardField(self._render_message(_ENV_HTTP_HEADERS.bind()), pairs=_key_value_pairs(env_headers))
+            )
         return fields
 
     def _sections(self, candidate: McpImportCandidate) -> list[_CardSection]:
@@ -1520,20 +1500,23 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         if config is None or config.request_timeout is None:
             return None
         timeout = _TIMEOUT_SECONDS.bind(seconds=config.request_timeout)
+        annotation: MessageRef | None = None
         if candidate.timeout_source_ms is not None and candidate.timeout_source_ms != config.request_timeout * 1000:
-            timeout = _TIMEOUT_CONVERTED.bind(seconds=config.request_timeout, milliseconds=candidate.timeout_source_ms)
+            annotation = _TIMEOUT_CONVERTED.bind(milliseconds=candidate.timeout_source_ms)
         elif (
             candidate.timeout_source_seconds is not None and candidate.timeout_source_seconds != config.request_timeout
         ):
-            timeout = (
-                _TIMEOUT_UNLIMITED.bind(seconds=config.request_timeout)
+            annotation = (
+                _TIMEOUT_UNLIMITED.bind()
                 if isinstance(candidate.timeout_source_seconds, float)
                 and not math.isfinite(candidate.timeout_source_seconds)
-                else _TIMEOUT_CONVERTED_SECONDS.bind(
-                    seconds=config.request_timeout, source_seconds=str(candidate.timeout_source_seconds)
-                )
+                else _TIMEOUT_CONVERTED_SECONDS.bind(source_seconds=str(candidate.timeout_source_seconds))
             )
-        return _CardField(self._render_message(_REQUEST_TIMEOUT.bind()), self._render_message(timeout))
+        return _CardField(
+            self._render_message(_REQUEST_TIMEOUT.bind()),
+            self._render_message(timeout),
+            annotation=self._render_message(annotation) if annotation is not None else "",
+        )
 
     def _tool_access_fields(self, candidate: McpImportCandidate) -> list[_CardField]:
         """The available-tool scope alone, as the agent's MCP card boxes it under Tool Access."""
@@ -1645,33 +1628,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     sanitize_legacy_scalar(item.field) for item in sorted(items, key=lambda item: item.kind is not kind)
                 )
             )
-            rows = [_CardField(self._render_message(_WARNING_FIELDS.bind()), fields)]
-            match kind:
-                case ImportWarningKind.CLAUDE_PROJECT_DIR:
-                    title = _PROJECT_DIR_TITLE.bind()
-                    action = _PROJECT_DIR_ACTION.bind(app=APP_DISPLAY_NAME, variable=variable)
-                    rows.append(
-                        _CardField(
-                            self._render_message(_WARNING_EFFECT.bind()),
-                            self._render_message(_PROJECT_DIR_EFFECT.bind(app=APP_DISPLAY_NAME, variable=variable)),
-                        )
-                    )
-                case ImportWarningKind.DEFAULT_DROPPED:
-                    title = _DEFAULT_TITLE.bind()
-                    action = _DEFAULT_ACTION.bind(app=APP_DISPLAY_NAME, variable=variable)
-                    rows.append(_CardField(self._render_message(_WARNING_RESULT.bind()), "{{" + variable + "}}"))
-                case ImportWarningKind.CREDENTIAL_VARIABLE:
-                    title = _CREDENTIAL_TITLE.bind()
-                    action = _CREDENTIAL_ACTION.bind()
-                    rows.append(
-                        _CardField(
-                            self._render_message(_WARNING_EFFECT.bind()),
-                            self._render_message(_CREDENTIAL_EFFECT.bind(variable=variable)),
-                        )
-                    )
-                case _:
-                    raise ValueError(f"Unsupported variable warning group: {kind}")
-            rows.append(_CardField(self._render_message(_WARNING_ACTION.bind()), self._render_message(action)))
+            text = self._warning_text(replace(items[0], kind=kind, field=fields, variable=variable), agent)
             defaults = ", ".join(
                 dict.fromkeys(
                     sanitize_legacy_scalar(item.field)
@@ -1680,13 +1637,8 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 )
             )
             if kind is ImportWarningKind.CLAUDE_PROJECT_DIR and defaults:
-                rows.append(
-                    _CardField(
-                        self._render_message(_WARNING_NOTE.bind()),
-                        self._render_message(_DEFAULT_NOTE.bind(fields=defaults)),
-                    )
-                )
-            groups.append(_WarningGroup(self._render_message(title), tuple(rows)))
+                text += " " + self._render_message(_DEFAULT_NOTE.bind(fields=defaults))
+            groups.append(_WarningGroup(text))
         return groups
 
     def _warning_text(self, warning: ImportWarning, agent: str) -> str:
@@ -1697,20 +1649,19 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             case ImportWarningKind.DEFAULT_DROPPED:
                 reference = _DEFAULT_DROPPED.bind(
                     field=field,
-                    converted="{{" + variable + "}}",
                     variable=variable,
                     app=APP_DISPLAY_NAME,
                 )
             case ImportWarningKind.HEADERS_HELPER_IGNORED:
-                reference = _HEADERS_HELPER_IGNORED.bind(app=APP_DISPLAY_NAME, template="{{!command}}")
+                reference = _HEADERS_HELPER_IGNORED.bind(template="{{!command}}")
             case ImportWarningKind.OAUTH_IGNORED:
-                reference = (_CODEX_OAUTH_IGNORED if agent == "Codex" else _OAUTH_IGNORED).bind(app=APP_DISPLAY_NAME)
+                reference = (_CODEX_OAUTH_IGNORED if agent == "Codex" else _OAUTH_IGNORED).bind(template="{{!command}}")
             case ImportWarningKind.CREDENTIAL_VARIABLE:
-                reference = _CREDENTIAL_VARIABLE.bind(field=field, variable=variable, agent=agent, app=APP_DISPLAY_NAME)
+                reference = _CREDENTIAL_VARIABLE.bind(field=field, variable=variable, agent=agent)
             case ImportWarningKind.CLAUDE_PROJECT_DIR:
                 reference = _CLAUDE_PROJECT_DIR.bind(field=field, variable=variable, app=APP_DISPLAY_NAME)
             case ImportWarningKind.UNKNOWN_FIELDS_IGNORED:
-                reference = _UNKNOWN_FIELDS_IGNORED.bind(fields=original, agent=agent, app=APP_DISPLAY_NAME)
+                reference = _UNKNOWN_FIELDS_IGNORED.bind(fields=original, app=APP_DISPLAY_NAME)
             case ImportWarningKind.CWD_IGNORED:
                 reference = (
                     _RELATIVE_CWD_IGNORED.bind(agent=agent, folder=original, base=field, app=APP_DISPLAY_NAME)
@@ -1740,7 +1691,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
             case ImportWarningKind.DENY_LIST:
                 reference = _DENY_LIST.bind(agent=agent, tools=original, app=APP_DISPLAY_NAME)
             case ImportWarningKind.LITERAL_BRACES_ESCAPED:
-                reference = _LITERAL_BRACES_ESCAPED.bind(app=APP_DISPLAY_NAME)
+                reference = _LITERAL_BRACES_ESCAPED.bind()
             case ImportWarningKind.INVALID_HEADER_IGNORED:
                 message = _INVALID_HEADER_NAME_IGNORED if original == "name" else _INVALID_HEADER_VALUE_IGNORED
                 reference = message.bind(field=field, agent=agent)

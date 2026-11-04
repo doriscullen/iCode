@@ -22,9 +22,10 @@ from chrys.app.tui.screens.agents.import_mcp_dialog import (
     _EMPTY_SOURCE,
     _NO_AGENTS,
     _SCOPE,
+    _SCOPE_AFTER_IMPORT,
     _SCOPE_EVERY_PROJECT,
+    _SCOPE_IMPORTED_ALL,
     _SCOPE_ONLY_IN,
-    _SCOPED_NOTICE,
     _UNSUPPORTED_TRANSPORT,
     ImportMcpServersDialog,
     _ImportCard,
@@ -147,17 +148,16 @@ def test_import_messages_keep_english_and_localize_chinese() -> None:
     described = chinese.render(_DESCRIPTION.bind(agent="Claude Code", scope="用户"))
     assert described == "从 Claude Code 导入。它在 Claude Code 中是“用户”服务器，在所有项目中使用。"  # noqa: RUF001
     unsupported = chinese.render(_UNSUPPORTED_TRANSPORT.bind(app="iCode"))
-    assert unsupported == ("iCode 仅支持 STDIO 和 HTTP MCP 服务器。请改用受支持的连接方式。")
+    assert (
+        unsupported == "iCode 仅支持 STDIO 和 HTTP MCP 服务器。请使用服务器提供的 STDIO 启动命令或 HTTP 地址手动添加。"
+    )
     assert Localizer("en").render(_DESCRIPTION.bind(agent="Claude Code", scope="user")) == _USER_ORIGIN
     scoped = _DESCRIPTION_SCOPED.bind(agent="Claude Code", scope="项目", path="/work/app")
     assert chinese.render(scoped) == (
         "从 Claude Code 导入。它在 Claude Code 中是“项目”服务器，仅在 /work/app 中使用。"  # noqa: RUF001
     )
-    notice = _SCOPED_NOTICE.bind(agent="Claude Code", local="本地", project="项目", app="iCode")
-    assert chinese.render(notice) == (
-        "作用范围为“本地”或“项目”的服务器，Claude Code 只在卡片所写的目录中使用。"  # noqa: RUF001
-        "导入后，iCode 会在所有项目中使用它们。"  # noqa: RUF001
-    )
+    assert chinese.render(_SCOPE_AFTER_IMPORT.bind()) == "导入后的作用范围"
+    assert chinese.render(_SCOPE_IMPORTED_ALL.bind()) == "当前智能体可在所有项目中使用此服务器"
     assert chinese.render(_SCOPE.bind(agent="Claude Code")) == "Claude Code 中的作用范围"
     assert chinese.render(_SCOPE_EVERY_PROJECT.bind(scope="用户")) == "用户，在所有项目中使用"  # noqa: RUF001
     assert chinese.render(_SCOPE_ONLY_IN.bind(scope="本地", path="/work/app")) == (
@@ -483,6 +483,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
                 [
                     claude_json,
                     local,
+                    ("Scope After Import", "Available to this agent in every project"),
                     _transport("HTTP"),
                     ("URL", "https://x.test/mcp"),
                     ("Available Tool Scope", "All server tools"),
@@ -496,6 +497,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
                 [
                     claude_json,
                     local,
+                    ("Scope After Import", "Available to this agent in every project"),
                     _transport("STDIO"),
                     ("Command", format_mcp_command_line("uvx", ["here-too"])),
                     ("Available Tool Scope", "All server tools"),
@@ -509,6 +511,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
                 [
                     mcp_json,
                     project,
+                    ("Scope After Import", "Available to this agent in every project"),
                     _transport("STDIO"),
                     ("Command", format_mcp_command_line("codegraph", ["serve", "--mcp"])),
                     ("Available Tool Scope", "All server tools"),
@@ -531,13 +534,7 @@ async def test_local_and_project_servers_name_their_folder_in_the_card_and_the_d
                 True,
             ),
         ]
-        # What importing changes is said once, above the cards.
-        (notice,) = dialog.query(".mcp-import-notice")
-        assert str(notice.render()) == (
-            "In Claude Code, servers with local or project scope are used only in the folder shown on each card. "
-            "After import, iCode uses them in every project."
-        )
-        assert dialog.query_one("#mcp-import-servers").children[0] is notice
+        assert not dialog.query(".mcp-import-notice")
 
         here.value = True
         codegraph.value = True
@@ -581,12 +578,12 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         dialog = await _open_dialog(app, panel, pilot)
         local, remote, signed_in = await _wait_for_rows(dialog, pilot, 3)
         dropped = (
-            "HOST keeps the reference {{API_HOST}}; the default for API_HOST was not imported. "
-            "Set API_HOST to a nonempty value before starting iCode, or fill in a fixed value after import."
+            "Defaults for API_HOST in HOST are not imported. "
+            "Set API_HOST before starting iCode, or enter a fixed value after import."
         )
         dropped_token = (
-            "Authorization keeps the reference {{TOKEN}}; the default for TOKEN was not imported. "
-            "Set TOKEN to a nonempty value before starting iCode, or fill in a fixed value after import."
+            "Defaults for TOKEN in Authorization are not imported. "
+            "Set TOKEN before starting iCode, or enter a fixed value after import."
         )
         project_dir = (
             "ROOT references CLAUDE_PROJECT_DIR, which iCode does not set automatically. "
@@ -596,32 +593,30 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         # The command may hold a credential: the warning, saved in the description, never names it.
         helper = (
             "The headers helper is not imported. After import, add the required headers in this server's settings. "
-            "For a value supplied by a command, use {{!command}} with a command that outputs only that header's value. "
-            "In iCode, do not use a helper that outputs a JSON object of headers."
+            "To obtain each header's value using {{!command}}, see the User Guide (F8)."
         )
         credential = (
-            "The reference to ANTHROPIC_API_KEY in Authorization is removed, as in Claude Code. "
-            "Other text is kept; a header left empty is omitted. To send this credential in iCode, "
-            "set an environment variable with another name before starting iCode, then reference it in this field."
+            "To avoid unintentionally sending local credentials to an MCP server, references to ANTHROPIC_API_KEY "
+            "in headers Authorization are removed, matching Claude Code. "
+            "Other text is kept; headers with no remaining value are omitted."
         )
         oauth = (
-            "iCode doesn't support OAuth sign-in. After import, configure Headers if the server accepts "
-            "a token or another authentication method. Replace expired tokens yourself, or use a credential command."
+            "OAuth settings and sign-in state are not imported. If the server accepts a token or another "
+            "authentication method, configure Headers after import, or see the User Guide (F8) to obtain credentials "
+            "using {{!command}}."
         )
         unknown = (
             "These source settings are not imported: future. "
-            "Check their purpose in Claude Code; they may have no equivalent in iCode. "
-            "Test the imported server before using it."
+            "Check whether your server relies on them before using it in iCode. "
+            "For supported settings, see the User Guide (F8)."
         )
         # Warnings sit in the card's body, which the card builds when it is unfolded.
         await _read_cards(dialog, pilot)
         warnings = _warning_texts(dialog)
         assert len(warnings) == 7
-        assert "Affected fields: HOST" in warnings[0]
-        assert "Affected fields: ROOT" in warnings[1]
-        assert "Affected fields: Authorization" in warnings[2]
+        assert warnings[:3] == [dropped, project_dir, dropped_token]
         assert warnings[3] == helper
-        assert "References to ANTHROPIC_API_KEY are replaced with an empty string" in warnings[4]
+        assert warnings[4] == credential
         assert warnings[5:] == [oauth, unknown]
 
         local.value = True
@@ -643,6 +638,47 @@ async def test_import_warnings_say_what_changed_and_stay_in_the_description(clau
         )
         # The credential is sent empty, as Claude Code sends it (the card trims the value it holds).
         assert panel.get_config()[2].headers == {"Authorization": "Bearer"}
+
+
+@pytest.mark.parametrize("locale", ["en", "zh-Hans"])
+@pytest.mark.parametrize(
+    "variable, value, fragment_en, fragment_zh",
+    [
+        ("AWS_BEARER_TOKEN_BEDROCK", "", "empty values", "值为空"),
+        ("API_KEY", "", "empty values", "值为空"),
+        ("API_KEY", "  ", "empty values", "值为空"),
+        ("API_KEY", " padded-secret ", "leading or trailing whitespace", "首尾空白"),
+    ],
+)
+async def test_unsupported_environment_values_cannot_be_imported(
+    claude_home: Path, locale: str, variable: str, value: str, fragment_en: str, fragment_zh: str
+) -> None:
+    _write_claude_servers(
+        claude_home,
+        {"blocked": {"command": "server", "env": {variable: value}}, "valid": {"command": "valid-server"}},
+    )
+    panel = MCPConfigPanel([])
+    app = _PanelApp(panel)
+    app.locale_controller = LocaleController(Settings(locale=locale))
+    async with app.run_test(size=(120, 60)) as pilot:
+        dialog = await _open_dialog(app, panel, pilot)
+        await _wait_for_rows(dialog, pilot, 2)
+        rows = {card.row.server_name: card.row for card in dialog.query(_ImportCard)}
+        blocked, valid = rows["blocked"], rows["valid"]
+        assert blocked.disabled and not blocked.value
+        assert not valid.disabled
+        text = _pane_text(dialog)
+        assert f"mcpServers.blocked.env.{variable}" in text
+        assert (fragment_en if locale == "en" else fragment_zh) in text
+        assert "padded-secret" not in text
+        assert dialog.query_one("#mcp-import-confirm", Button).disabled
+        await _read_cards(dialog, pilot)
+        assert variable in _pane_text(dialog)
+        valid.value = True
+        await _import_ticked(dialog, pilot)
+        (card,) = await _cards(panel, pilot, 1)
+        assert card.validate() == []
+        assert [config.name for config in panel.get_config()] == ["valid"]
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
@@ -679,8 +715,8 @@ async def test_project_directory_warnings_group_defaults_without_hiding_actions(
         assert ("before starting iCode" if locale == "en" else "启动 iCode 前") in text
         assert "private-default-value" not in _pane_text(dialog)
         assert not card.query(Collapsible)
-        assert ("Impact:" if locale == "en" else "影响：") in text  # noqa: RUF001
-        assert ("Action:" if locale == "en" else "处理方式：") in text  # noqa: RUF001
+        assert not card.query(".mcp-import-warning-fields, .mcp-import-warning-title")
+        assert ("does not set automatically" if locale == "en" else "不会自动设置") in text
         # Folded back, as it opened.
         card.set_collapsed(True)
         await wait_for(lambda: card.collapsed and not card.query_one(".config-card-body").display, pilot=pilot)
@@ -697,7 +733,8 @@ async def test_project_directory_warnings_group_defaults_without_hiding_actions(
         assert "private-default-value" not in config.description
 
 
-async def test_same_variable_warnings_group_fields_within_each_server(claude_home: Path) -> None:
+@pytest.mark.parametrize("locale", ["en", "zh-Hans"])
+async def test_same_variable_warnings_group_fields_within_each_server(claude_home: Path, locale: str) -> None:
     _write_claude_servers(
         claude_home,
         {
@@ -712,6 +749,7 @@ async def test_same_variable_warnings_group_fields_within_each_server(claude_hom
     )
     panel = MCPConfigPanel([])
     app = _PanelApp(panel)
+    app.locale_controller = LocaleController(Settings(locale=locale))
     async with app.run_test(size=(120, 60)) as pilot:
         dialog = await _open_dialog(app, panel, pilot)
         await _wait_for_rows(dialog, pilot, 3)
@@ -723,11 +761,18 @@ async def test_same_variable_warnings_group_fields_within_each_server(claude_hom
             (text,) = _warning_texts(card)
             texts.append(text)
             assert not card.query(Collapsible)
-        assert "Affected fields: A, B" in texts[0]
-        assert "Set TOKEN before starting iCode" in texts[0]
-        assert "Affected fields: Authorization, X-Token" in texts[1]
-        assert "other text is kept" in texts[1]
-        assert "Affected fields: C" in texts[2]
+        assert "A, B" in texts[0] and "TOKEN" in texts[0]
+        assert ("Set TOKEN before starting iCode" if locale == "en" else "启动 iCode 前设置 TOKEN") in texts[0]
+        assert "Authorization, X-Token" in texts[1] and "NPM_TOKEN" in texts[1]
+        assert ("Other text is kept" if locale == "en" else "其他文字保留") in texts[1]
+        assert (
+            "unintentionally sending local credentials" if locale == "en" else "意外向 MCP 服务器发送本机凭据"
+        ) in texts[1]
+        assert ("no remaining value are omitted" if locale == "en" else "没有剩余值的请求头会被省略") in texts[1]
+        assert "F8" not in texts[1]
+        assert ("different name" if locale == "en" else "另一个") not in texts[1]
+        assert "C" in texts[2] and "TOKEN" in texts[2]
+        assert not dialog.query(".mcp-import-warning-fields, .mcp-import-warning-title")
         assert "secret-" not in "\n".join(texts)
 
 
@@ -745,22 +790,18 @@ async def test_warning_values_wrap_to_available_width(claude_home: Path, locale:
         # The card opens folded; the wrapping assertions below need it laid out.
         _expand_cards(dialog)
         await pilot.pause()
-        title = dialog.query_one(".mcp-import-warning-title", Static)
-        grid = dialog.query_one(".mcp-import-warning-fields")
-        values = list(grid.query(".mcp-import-warning-value").results(Static))
-        action = values[-1]
-        wide_width, wide_height = action.size.width, action.size.height
-        assert values[1].render().plain == "{{ICODE_TEST_UNSET}}"
-        assert all("\n" not in str(value.render()) for value in values)
-        assert grid.content_region.x > title.region.x
-        assert len({value.region.x for value in values}) == 1
+        warning = dialog.query_one(".mcp-import-warning", Static)
+        wide_width, wide_height = warning.size.width, warning.size.height
+        text = str(warning.render())
+        assert "ICODE_TEST_UNSET" in text and "X-Test" in text
+        assert "\n" not in text
+        assert not dialog.query(".mcp-import-warning-fields, .mcp-import-warning-title")
         assert not dialog.query(Collapsible)
         await pilot.resize_terminal(80, 42)
         await pilot.pause()
-        assert action.size.width < wide_width
-        assert action.size.height > wide_height
-        assert len({value.region.x for value in values}) == 1
-        assert all(value.region.right <= grid.content_region.right for value in values)
+        assert warning.size.width < wide_width
+        assert warning.size.height > wide_height
+        assert warning.region.right <= dialog.query_one(_ImportCard).content_region.right
         assert "private-default" not in _pane_text(dialog)
 
 
@@ -804,7 +845,7 @@ async def test_imported_environment_survives_editing_saving_and_runtime_resoluti
     from chrys.service.profiles.agents.schema import AgentProfile
     from chrys.service.profiles.agents.serializer import save_profile
 
-    env = {"PASSWORD": " padded ", "EMPTY": "", "SPACES": "  ", "LINES": "first\nsecond"}
+    env = {"PASSWORD": "secret", "SPACES": "a b", "LINES": "first\nsecond"}
     _write_claude_servers(claude_home, {"values": {"command": "server", "env": env}})
     panel = MCPConfigPanel([])
     app = _PanelApp(panel)
@@ -871,7 +912,7 @@ async def test_claude_timeout_and_literal_braces_survive_preview_edit_and_save(
         assert preview in text
         assert "1 seconds" not in text
         assert text.count("MCP Request Timeout") == 1
-        assert "Literal braces are escaped using iCode syntax; the text received by the server is unchanged." in text
+        assert "Braces look different in the preview; the text sent to the server is unchanged." in text
         assert "Tool permissions from Claude Code are not imported (toolPermissions)." in text
         assert "These source settings are not imported: tools." in text
         converted.value = True
@@ -1291,13 +1332,13 @@ async def _broken_detect() -> None:
         (
             "_pane_widgets",
             _broken_pane,
-            "Couldn't load MCP configurations from First Agent. Reopen import to try again. If it still fails, check the log.",
+            "Couldn't load MCP configurations from First Agent. Reopen import to try again. If it still fails, see the User Guide (F8) to locate iCode's debug.log.",
             "Showing the MCP servers of First Agent failed",
         ),
         (
             "_list_sources",
             _broken_detect,
-            "Couldn't search for MCP configurations. Reopen import to try again. If it still fails, check the log.",
+            "Couldn't search for MCP configurations. Reopen import to try again. If it still fails, see the User Guide (F8) to locate iCode's debug.log.",
             "Listing agents to import MCP servers from failed",
         ),
     ],
@@ -1418,10 +1459,8 @@ def test_every_unsupported_reason_has_a_message(reason: UnsupportedReason, local
     assert text and "{" not in text.replace("{{!command}}", "")
     assert "headers.X-Test" in text
     assert not text.startswith(("Can't import:", "无法导入："))  # noqa: RUF001
-    if locale == "zh-Hans":
-        assert "请" in text
-    else:
-        assert any(action in text for action in ("Add", "Use", "Keep", "Update", "To use"))
+    assert "reopen import" not in text
+    assert "修改源配置" not in text
 
 
 @pytest.mark.parametrize("kind", list(SourceErrorKind))
@@ -1499,6 +1538,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
                 [
                     _source(pi_project),
                     _scope("pi", f"project, used only in {workspace}"),
+                    ("Scope After Import", "Available to this agent in every project"),
                     _transport("HTTP"),
                     ("Description", description),
                     ("URL", "https://docs.test/mcp"),
@@ -1526,6 +1566,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
         assert order == [
             "Configuration Source",
             "Scope in pi",
+            "Scope After Import",
             "Transport",
             "Description",
             "box",
@@ -1540,11 +1581,7 @@ async def test_opencode_and_pi_servers_are_listed_and_imported_with_what_they_br
             "MCP Request Timeout",
         ]
         assert str(card.query(".mcp-import-section")[0].border_title) == "HTTP Options"
-        (notice,) = dialog.query(".mcp-import-notice")
-        assert str(notice.render()) == (
-            "In pi, servers with project scope are used only in the folder shown on each card. "
-            "After import, iCode uses them in every project."
-        )
+        assert not dialog.query(".mcp-import-notice")
         (docs,) = await _wait_for_rows(dialog, pilot, 1)
         docs.value = True
         await _import_ticked(dialog, pilot)
@@ -1646,12 +1683,9 @@ async def test_command_migration_guidance_is_shown_without_copying_the_command(t
         await _read_cards(dialog, pilot)
         guidance = _guidance(dialog)
         assert "{{!command}}" in guidance
-        if source_id == "pi":
-            assert "home folder" in guidance
-            assert "one nonempty line of ASCII text" in guidance
-        else:
-            assert "outputs only that header's value" in guidance
-            assert "do not use a helper that outputs a JSON object" in guidance
+        assert "User Guide (F8)" in guidance
+        assert "home folder" not in guidance
+        assert "JSON object" not in guidance
         assert command not in guidance and "private-command-argument" not in guidance
 
         app.locale_controller.switch_locale("zh-Hans")

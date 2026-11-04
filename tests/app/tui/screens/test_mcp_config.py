@@ -1075,8 +1075,9 @@ async def test_mcp_add_button_appends_another_editable_row() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stdio_validate_allows_empty_env_values() -> None:
-    """An empty environment override can intentionally clear an inherited value."""
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+async def test_stdio_validate_rejects_partial_env_rows(value: str) -> None:
+    """Partially-filled stdio env rows should block Save with clear errors."""
 
     app = _MCPPanelApp()
     async with app.run_test(size=(120, 40)) as pilot:
@@ -1091,10 +1092,27 @@ async def test_stdio_validate_allows_empty_env_values() -> None:
         env_row = env_container.query_one(".mcp-item-row")
         env_row.query_one(".mcp-item-key-input", Input).value = "API_KEY"
 
+        env_row.query_one(".mcp-item-value-input", Input).value = value
+
         errors = card.validate()
 
-        assert card.get_config().env == {"API_KEY": ""}
-    assert errors == []
+    assert "Server 'New Server': Environment Variables row 1: value is required for key 'API_KEY'." in errors
+
+
+@pytest.mark.asyncio
+async def test_stdio_environment_values_are_trimmed_when_saved() -> None:
+    app = _MCPPanelApp()
+    async with app.run_test(size=(120, 40)) as pilot:
+        panel = MCPConfigPanel([])
+        await app.mount(panel)
+        card = await _add_mcp_card(panel, pilot)
+        card.query_one("#mcp-cmd-0", TextArea).text = "python -V"
+        env_row = card.query_one("#mcp-env-0 .mcp-item-row")
+        env_row.query_one(".mcp-item-key-input", Input).value = "API_KEY"
+        env_row.query_one(".mcp-item-value-input", Input).value = " padded "
+
+        assert card.validate() == []
+        assert card.get_config().env == {"API_KEY": "padded"}
 
 
 @pytest.mark.asyncio

@@ -2,14 +2,19 @@
 
 """Import MCP servers configured in Claude Code.
 
-Baseline: Claude Code 2.1.316, checked 2026-10-31 against
-code.claude.com/docs/en/{mcp,managed-mcp,settings-reference}. Each rule is
+Baseline: Claude Code 2.1.318, checked 2026-11-04 against the release changelog
+and isolated binary probes. Documentation and unchanged schema rules were
+checked on 2.1.316 against code.claude.com/docs/en/{mcp,managed-mcp,settings-reference}.
+Each rule is
 tagged with its evidence: ``[doc: page, "section"]``, ``[observed 2.1.302]``
 (behavior the docs leave out, seen by running that release; a few were seen
 in 2.1.303) or ``[binary 2.1.302]`` (read from that release's config schema;
 internal). The rules were written against 2.1.302; on 2.1.316 the observed
 ones were seen again and its schema read again, which changed only the URL
 length limits tagged with that release.
+On 2.1.318, empty global files (including whitespace and BOM) and the stdio
+AWS bearer empty-value rule were verified; this is not a complete
+revalidation of the unchanged binary schema.
 
 What is read [doc: mcp, "MCP installation scopes"]:
 
@@ -36,14 +41,19 @@ while ``.claude.json`` is missing [observed 2.1.302; binary 2.1.302]. A relative
 or blank folder is a path under the folder Claude Code starts in, for which the
 workspace stands in here. A ``.claude.json`` inside a project is not read:
 Claude Code never reads one.
+An empty or whitespace-only global file holds no servers [observed 2.1.318,
+without backups]. Import reads the selected file, not Claude Code's backup
+recovery state; it never restores or rewrites source files.
 
 Local and project candidates carry their folder, so the user sees that a
-server Claude Code uses in one folder becomes global once imported. Only
-servers Claude Code itself loads are listed: an entry it skips (a ``url`` with
-no ``type``, ``type: "sdk"``, an unknown type, a missing or mistyped setting,
-or a name it keeps for its own servers) is left out [doc: mcp, "Option 1: Add a
+server Claude Code uses in one folder becomes global once imported. Connection
+fields follow the source's transport rules: a ``url`` with no ``type``,
+``type: "sdk"``, an unknown type, a missing or mistyped connection setting,
+or a name it keeps for its own servers is left out [doc: mcp, "Option 1: Add a
 remote HTTP server", "Configuration warnings"; binary 2.1.302; observed
-2.1.302]. Servers it loads that iCode can't run are listed with the reason.
+2.1.302]. Recognized connections iCode can't run are listed with the reason.
+Omitted authentication and internal settings are not validated. The baseline
+records verified discovery and conversion rules, not a source version gate.
 
 Runtime differences an imported server may notice:
 
@@ -63,6 +73,10 @@ Runtime differences an imported server may notice:
 - ``roots/list``: Claude Code answers it with the session's folders
   [doc: mcp, "Option 3: Add a local stdio server"]; iCode doesn't advertise
   roots, so a server asking falls back to its working folder or fails.
+- Empty ``AWS_BEARER_TOKEN_BEDROCK``: Claude Code removes the variable from a
+  stdio server's environment, even over a nonempty inherited value [observed
+  2.1.318; changelog 2.1.317]. Such a server cannot be imported into iCode.
+  Removing the setting would inherit the ambient value rather than unset it.
 - A tool's ``_meta["anthropic/alwaysLoad"]`` [doc: mcp, "Scale with MCP tool
   search"] means nothing to iCode, which loads tools by its own strategy.
 
@@ -75,8 +89,8 @@ picks what to import.
 
 When Claude Code updates: read the entries of CHANGELOG.md in
 anthropics/claude-code after the baseline that mention MCP, ``.mcp.json`` or
-``.claude.json``; for each, re-check the rules here tagged with that topic
-against the cited doc section (an ``[observed]`` rule needs a re-run of
+``.claude.json``; re-check discovery, connection fields, variables and timeout
+conversion against the cited doc section (an ``[observed]`` rule needs a re-run of
 ``claude mcp list`` under a temporary ``HOME`` and ``CLAUDE_CONFIG_DIR``, which
 lists every server Claude Code loads and names each one it skips, with the
 reason); then update the code, the tests and the baseline above.
@@ -91,7 +105,6 @@ import stat
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
 
 from chrys.service.mcp.importers.base import (
     ImportContext,
@@ -111,11 +124,12 @@ from chrys.service.mcp.importers.base import (
     parse_json_object,
     read_source_bytes,
     trim_header_value,
+    unsupported_env_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Iterable, Mapping
 
 SCOPE_LOCAL = "local"
 SCOPE_PROJECT = "project"
@@ -178,11 +192,10 @@ _UNSUPPORTED_REMOTE_TRANSPORTS = frozenset({"sse", "ws"})
 # [doc: mcp, "Time limits on MCP tool calls"].
 _MIN_TIMEOUT_MS = 1000
 
-# Claude Code skips a remote server whose ``url``, or whose ``oauth.authServerMetadataUrl``,
-# is longer than these, counted as JavaScript counts a string's length, on the value as
+# Claude Code skips a remote server whose ``url`` is longer than this,
+# counted as JavaScript counts a string's length, on the value as
 # written, before any trimming [binary 2.1.316; observed 2.1.316]. 2.1.314 had no limit.
 _MAX_URL_LENGTH = 65_536
-_MAX_AUTH_SERVER_METADATA_URL_LENGTH = 4_096
 
 # A remote server's ``request_timeout_ms`` becomes its ``timeout`` when it sets none,
 # capped at five minutes; any other value is dropped [binary 2.1.302, internal].
@@ -215,18 +228,9 @@ _HTTP_FIELDS = frozenset(
     }
 )
 
-# A setting of the wrong type makes Claude Code skip the whole entry; unknown fields
-# don't [binary 2.1.302; observed 2.1.302]. ``timeout`` is a positive whole number of
-# milliseconds a JavaScript number holds exactly.
+# The migrated ``timeout`` is a positive whole number of milliseconds a
+# JavaScript number holds exactly [binary 2.1.302; observed 2.1.302].
 _MAX_SAFE_INTEGER = 2**53 - 1
-_TOOL_POLICIES = frozenset({"always_allow", "always_ask", "always_deny"})
-_TOOL_PERMISSIONS = frozenset({"allow", "ask", "blocked"})
-# Characters a URL's host can't hold once parsed; ``:`` is left out because only an
-# IPv6 host keeps one once the port is split off, and ``%`` because the parser decodes it.
-_FORBIDDEN_HOST_RE = re.compile(r"[\x00-\x20#/<>?@\[\]^|\x7f]")
-_URL_DROPPED_RE = re.compile(r"[\t\n\r]")
-_C0_AND_SPACE = "".join(chr(code) for code in range(0x21))
-
 # Variables Claude Code reads as empty in a remote server's url and headers, whether
 # set or not and whatever their default, so a project file or plugin can't send the
 # user's own credentials to a server it names [doc: mcp, "Credential variables that
@@ -261,7 +265,7 @@ class ClaudeCodeSource:
     def discover(self, ctx: ImportContext) -> McpImportResult:
         collector = _Collector()
         config_path = _config_file(ctx)
-        config = collector.read(config_path) if config_path is not None else None
+        config = collector.read(config_path, blank_holds_nothing=True) if config_path is not None else None
         if config is not None and config_path is not None and ctx.workspace_cwd:
             local = _local_project(config, _project_folder(ctx.workspace_cwd))
             if local is not None:
@@ -422,7 +426,7 @@ class _Collector:
 
 
 def _candidate(name: str, entry: object, scope: str, source_path: str) -> McpImportCandidate | None:
-    """The server as iCode would import it; None for an entry Claude Code itself skips."""
+    """A recognized connection with valid migration fields; omitted settings don't gate it."""
     if not isinstance(entry, dict) or not name.strip() or _is_reserved_name(name):
         return None
     transport = _transport(entry)
@@ -430,7 +434,7 @@ def _candidate(name: str, entry: object, scope: str, source_path: str) -> McpImp
         return _stdio_candidate(name, entry, scope, source_path)
     if transport == "http":
         return _http_candidate(name, entry, scope, source_path)
-    if transport in _UNSUPPORTED_REMOTE_TRANSPORTS and _remote_shape_is_valid(entry, transport):
+    if transport in _UNSUPPORTED_REMOTE_TRANSPORTS and _remote_shape_is_valid(entry):
         return _unsupported(name, entry, scope, source_path, UnsupportedReason.UNSUPPORTED_TRANSPORT)
     # A url with no type (read as stdio, so a configuration error), "sdk" (only an SDK host
     # registers one) and unknown types: Claude Code skips them all
@@ -464,22 +468,28 @@ def _js_length(text: str) -> int:
     return len(text) + sum(1 for char in text if ord(char) > 0xFFFF)
 
 
-def _remote_shape_is_valid(entry: dict[str, Any], transport: str) -> bool:
-    """Whether Claude Code would connect the remote entry: a non-empty url, string headers, well-typed settings."""
+def _remote_shape_is_valid(entry: dict[str, Any]) -> bool:
+    """Validate the URL, headers and migrated timeout, without checking omitted metadata."""
     url = entry.get("url")
     if not isinstance(url, str) or not url.strip() or not _is_str_mapping(entry.get("headers", {})):
         return False
     if _js_length(url) > _MAX_URL_LENGTH:
         return False
-    checks = _WEBSOCKET_CHECKS if transport == "ws" else _HTTP_CHECKS
-    return _settings_are_valid(entry, checks)
+    return "timeout" not in entry or _is_positive_int(entry["timeout"])
 
 
 def _unsupported(
-    name: str, entry: dict[str, Any], scope: str, source_path: str, reason: UnsupportedReason
+    name: str, entry: dict[str, Any], scope: str, source_path: str, reason: UnsupportedReason, *, field: str = ""
 ) -> McpImportCandidate:
     return McpImportCandidate(
-        name, scope, source_path, None, unsupported=reason, entry=entry, transport=_transport(entry)
+        name,
+        scope,
+        source_path,
+        None,
+        unsupported=reason,
+        entry=entry,
+        transport=_transport(entry),
+        unsupported_field=field,
     )
 
 
@@ -489,13 +499,30 @@ def _stdio_candidate(name: str, entry: dict[str, Any], scope: str, source_path: 
     env = entry.get("env", {})
     if not isinstance(command, str) or not command.strip() or not _is_str_list(args) or not _is_str_mapping(env):
         return None
-    if not _settings_are_valid(entry, _STDIO_CHECKS):
+    if "timeout" in entry and not _is_positive_int(entry["timeout"]):
         return None
     if has_dollar_template(command) or any(has_dollar_template(arg) for arg in args):
         return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_IN_COMMAND)
-    if not _convertible(env):
-        return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
+    if (field := _unconvertible_field(env)) is not None:
+        return _unsupported(
+            name,
+            entry,
+            scope,
+            source_path,
+            UnsupportedReason.TEMPLATE_NEXT_TO_BRACE,
+            field=f"mcpServers.{name}.env.{field}",
+        )
     converted_env, warnings = _convert_mapping(env)
+    if (invalid_env := unsupported_env_value(converted_env)) is not None:
+        reason, field = invalid_env
+        return _unsupported(
+            name,
+            entry,
+            scope,
+            source_path,
+            reason,
+            field=f"mcpServers.{name}.env.{field}",
+        )
     warnings = (*warnings, *_project_dir_warnings(env), *_unknown_fields(entry, _STDIO_FIELDS))
     config = MCPServerConfig(
         name=name,
@@ -517,14 +544,21 @@ def _stdio_candidate(name: str, entry: dict[str, Any], scope: str, source_path: 
 
 
 def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: str) -> McpImportCandidate | None:
-    if not _remote_shape_is_valid(entry, "http"):
+    if not _remote_shape_is_valid(entry):
         return None
     url: str = entry["url"]
     headers: dict[str, str] = entry.get("headers", {})
     if has_dollar_template(url):
         return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_IN_URL)
-    if not _convertible(headers, read_as_empty=CREDENTIAL_VARIABLES):
-        return _unsupported(name, entry, scope, source_path, UnsupportedReason.TEMPLATE_NEXT_TO_BRACE)
+    if (field := _unconvertible_field(headers, read_as_empty=CREDENTIAL_VARIABLES)) is not None:
+        return _unsupported(
+            name,
+            entry,
+            scope,
+            source_path,
+            UnsupportedReason.TEMPLATE_NEXT_TO_BRACE,
+            field=f"mcpServers.{name}.headers.{field}",
+        )
     converted_headers, warnings = _convert_mapping(headers, read_as_empty=CREDENTIAL_VARIABLES)
     # Claude Code sends each value trimmed, so ``Bearer ${NPM_TOKEN}`` goes as ``Bearer`` [observed 2.1.303].
     # A header a credential left blank carries nothing, as Claude Code sends it; the MCP card can't hold one.
@@ -548,7 +582,7 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
         warnings = (*warnings, ImportWarning(ImportWarningKind.OAUTH_IGNORED))
     # HTTP toolPermissions caps the loaded tools' permissions [binary 2.1.316].
     # tools.permission_policy is only confirmed for dynamic SDK servers, not these file scopes.
-    if entry.get("toolPermissions"):
+    if "toolPermissions" in entry:
         warnings = (*warnings, ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, original="toolPermissions"))
     warnings = (*warnings, *_unknown_fields(entry, _HTTP_FIELDS))
     config = MCPServerConfig(
@@ -571,8 +605,11 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
     )
 
 
-def _convertible(values: dict[str, str], *, read_as_empty: frozenset[str] = frozenset()) -> bool:
-    return all(dollar_templates_convertible(value, read_as_empty=read_as_empty) for value in values.values())
+def _unconvertible_field(values: dict[str, str], *, read_as_empty: frozenset[str] = frozenset()) -> str | None:
+    return next(
+        (key for key, value in values.items() if not dollar_templates_convertible(value, read_as_empty=read_as_empty)),
+        None,
+    )
 
 
 def _convert_mapping(
@@ -645,23 +682,6 @@ def _is_str_mapping(value: object) -> bool:
     return isinstance(value, dict) and all(isinstance(item, str) for item in value.values())
 
 
-def _settings_are_valid(entry: dict[str, Any], checks: Mapping[str, Callable[[object], bool]]) -> bool:
-    """Whether every setting *checks* names that *entry* holds has the type Claude Code requires."""
-    return all(check(entry[key]) for key, check in checks.items() if key in entry)
-
-
-def _is_bool(value: object) -> bool:
-    return isinstance(value, bool)
-
-
-def _is_str(value: object) -> bool:
-    return isinstance(value, str)
-
-
-def _is_non_empty_str(value: object) -> bool:
-    return isinstance(value, str) and bool(value)
-
-
 def _is_positive_int(value: object) -> bool:
     """A JSON number Claude Code takes as a positive whole number: ``1500.0`` is one.
 
@@ -672,68 +692,3 @@ def _is_positive_int(value: object) -> bool:
     if isinstance(value, int):
         return 0 < value <= _MAX_SAFE_INTEGER
     return isinstance(value, float) and value.is_integer() and 0 < value <= _MAX_SAFE_INTEGER
-
-
-def _is_https_url(value: object) -> bool:
-    """An ``https://`` URL with a host, approximating the WHATWG parser Claude Code checks it with.
-
-    Claude Code trims the value first and reads ``\\`` as ``/``. When unsure this accepts: iCode
-    never imports ``oauth``, and rejecting it would hide a server Claude Code loads.
-    """
-    if not isinstance(value, str) or _js_length(value) > _MAX_AUTH_SERVER_METADATA_URL_LENGTH:
-        return False
-    text = value.strip(_JS_WHITESPACE)
-    if not text.startswith("https://"):
-        return False
-    try:
-        parts = urlsplit(_URL_DROPPED_RE.sub("", text.strip(_C0_AND_SPACE)).replace("\\", "/"))
-        _ = parts.port
-    except ValueError:
-        return False
-    host = parts.hostname
-    return bool(host) and _FORBIDDEN_HOST_RE.search(host) is None
-
-
-def _is_oauth(value: object) -> bool:
-    return isinstance(value, dict) and _settings_are_valid(value, _OAUTH_CHECKS)
-
-
-def _is_tool_list(value: object) -> bool:
-    return isinstance(value, list) and all(
-        isinstance(tool, dict)
-        and isinstance(tool.get("name"), str)
-        and ("permission_policy" not in tool or _is_one_of(tool["permission_policy"], _TOOL_POLICIES))
-        for tool in value
-    )
-
-
-def _is_tool_permissions(value: object) -> bool:
-    return isinstance(value, dict) and all(_is_one_of(permission, _TOOL_PERMISSIONS) for permission in value.values())
-
-
-def _is_one_of(value: object, choices: frozenset[str]) -> bool:
-    return isinstance(value, str) and value in choices
-
-
-# The settings each schema types, beyond those every transport's conversion checks
-# itself (``command``, ``args``, ``env``, ``url`` and ``headers``) [binary 2.1.302].
-_STDIO_CHECKS: dict[str, Callable[[object], bool]] = {
-    "timeout": _is_positive_int,
-    "alwaysLoad": _is_bool,
-    "bareElicitationCapability": _is_bool,
-}
-_WEBSOCKET_CHECKS: dict[str, Callable[[object], bool]] = {**_STDIO_CHECKS, "headersHelper": _is_str}
-_HTTP_CHECKS: dict[str, Callable[[object], bool]] = {
-    **_WEBSOCKET_CHECKS,
-    "oauth": _is_oauth,
-    "tools": _is_tool_list,
-    "discoveryCache": _is_bool,
-    "toolPermissions": _is_tool_permissions,
-}
-_OAUTH_CHECKS: dict[str, Callable[[object], bool]] = {
-    "clientId": _is_str,
-    "callbackPort": _is_positive_int,
-    "authServerMetadataUrl": _is_https_url,
-    "scopes": _is_non_empty_str,
-    "xaa": _is_bool,
-}

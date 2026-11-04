@@ -68,7 +68,7 @@ def test_stdio_literals_disabled_state_and_default_timeout(ctx: ImportContext) -
 [mcp_servers.files]
 command = "~/bin/server"
 args = ["${HOME}", "{{literal}}"]
-env = { DOLLAR = "${TOKEN}", BRACES = "{{TOKEN}}", EMPTY = "" }
+env = { DOLLAR = "${TOKEN}", BRACES = "{{TOKEN}}" }
 enabled = false
 """,
     )
@@ -78,7 +78,7 @@ enabled = false
         transport="stdio",
         command="~/bin/server",
         args=["${HOME}", "{{literal}}"],
-        env={"DOLLAR": "${TOKEN}", "BRACES": "{{{{TOKEN}}}}", "EMPTY": ""},
+        env={"DOLLAR": "${TOKEN}", "BRACES": "{{{{TOKEN}}}}"},
         enabled=False,
         request_timeout=300,
     )
@@ -175,12 +175,12 @@ command = "server"
 env = { PAD = " kept " }
 """,
     )
-    candidates = {candidate.name: candidate.config for candidate in CodexSource().discover(ctx).candidates}
-    remote, local = candidates["remote"], candidates["local"]
-    assert remote is not None and local is not None
+    candidates = {candidate.name: candidate for candidate in CodexSource().discover(ctx).candidates}
+    remote = candidates["remote"].config
+    assert remote is not None
     assert remote.headers == {"authorization": "Bearer", "x-pad": "padded {{{{literal}}}}"}
-    # Environment values are passed to the process as written.
-    assert local.env == {"PAD": " kept "}
+    assert candidates["local"].config is None
+    assert candidates["local"].unsupported is UnsupportedReason.ENV_VALUE_WHITESPACE
 
 
 def test_tool_allow_list_applies_deny_list_afterwards(ctx: ImportContext) -> None:
@@ -297,27 +297,58 @@ def test_remote_execution_cannot_become_a_local_command(ctx: ImportContext, sett
         'command = "server"\nenv_vars = [{name = "TOKEN", source = "invalid"}]',
         'command = "server"\nenv_vars = [{name = "TOKEN", unexpected = true}]',
         'url = "https://example.test"\nbearer_token = "secret"',
-        'url = "https://example.test"\nhttp_headers_helper = "  "',
-        'url = "https://example.test"\noauth = {client_secret = "secret"}',
-        'url = "https://example.test"\noauth = {client_id = "client", client_secret = ""}',
-        'url = "https://example.test"\noauth = {callback_port = 65536}',
-        'url = "https://example.test"\noauth = {authorization_server_issuer = "issuer"}',
-        (
-            'url = "https://example.test"\nauth = "ema_auth"\n'
-            'oauth = {client_id = "client", client_secret = "secret", token_endpoint_auth_method = "private_key_jwt"}'
-        ),
-        (
-            'url = "https://example.test"\n'
-            'oauth = {client_id = "client", client_secret = "secret", token_endpoint_auth_method = "client_secret_post"}'
-        ),
-        'url = "https://example.test"\nauth = "ema_auth"\noauth = {token_endpoint_auth_method = "client_secret_basic"}',
-        'command = "server"\nomit_tools_from = ["invalid"]',
     ],
 )
 def test_invalid_entries_are_not_candidates(ctx: ImportContext, entry: str) -> None:
     _user(ctx, f'[mcp_servers.invalid]\n{entry}\n[mcp_servers.good]\ncommand = "good"')
     result = CodexSource().discover(ctx)
     assert [candidate.name for candidate in result.candidates] == ["good"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "oauth",
+        "oauth_resource",
+        "auth",
+        "http_headers_helper",
+        "startup_readiness",
+        "startup_timeout_sec",
+        "startup_timeout_ms",
+        "required",
+        "supports_parallel_tool_calls",
+        "scopes",
+        "omit_tools_from",
+        "tool_input_schema_max_bytes",
+        "name",
+        "future_setting",
+    ],
+)
+@pytest.mark.parametrize("value", ['"future-mode"', '{secret = "omitted-secret"}', '["omitted-secret"]', "false", "42"])
+def test_omitted_settings_do_not_gate_migration(ctx: ImportContext, field: str, value: str) -> None:
+    _user(ctx, f'[mcp_servers.remote]\nurl = "https://example.test/mcp"\n{field} = {value}')
+
+    result = CodexSource().discover(ctx)
+    (candidate,) = result.candidates
+    assert result.source_errors == ()
+    assert candidate.config == MCPServerConfig(
+        name="remote", transport="http", url="https://example.test/mcp", request_timeout=300
+    )
+    assert candidate.warnings
+    assert "omitted-secret" not in repr(result)
+
+
+@pytest.mark.parametrize("value", ['{secret = "omitted-secret"}', '["omitted-secret"]', "42", "false"])
+def test_an_unrecognized_working_folder_is_reported_without_its_value(ctx: ImportContext, value: str) -> None:
+    _user(ctx, f'[mcp_servers.local]\ncommand = "server"\ncwd = {value}')
+
+    result = CodexSource().discover(ctx)
+    (candidate,) = result.candidates
+    assert candidate.config is not None and candidate.config.command == "server"
+    assert [(warning.kind, warning.original) for warning in candidate.warnings] == [
+        (ImportWarningKind.UNKNOWN_FIELDS_IGNORED, "cwd")
+    ]
+    assert "omitted-secret" not in repr(result)
 
 
 @pytest.mark.parametrize("method", ["client_secret_basic", "client_secret_post"])
@@ -701,6 +732,33 @@ def test_effective_header_alias_conflicts_are_not_silently_selected(ctx: ImportC
     assert candidate.unsupported_field == "x-test"
     assert candidate.unsupported_variable == ""
     assert candidate.warnings == ()
+
+
+@pytest.mark.parametrize("with_static_headers", [False, True])
+def test_unsupported_header_preview_keeps_original_maps_separate(
+    ctx: ImportContext, monkeypatch: pytest.MonkeyPatch, with_static_headers: bool
+) -> None:
+    monkeypatch.setenv("MCP_IMPORT_TEST", "resolved-lower-secret")
+    monkeypatch.setenv("CODEX_PROBE_TOKEN", "resolved-upper-secret")
+    static = {"x-test": "literal-lower", "X-Test": "literal-upper"} if with_static_headers else {}
+    settings = 'http_headers = {"x-test" = "literal-lower", "X-Test" = "literal-upper"}\n' if static else ""
+    _user(
+        ctx,
+        '[mcp_servers.s]\nurl = "http://127.0.0.1:18767/mcp"\n'
+        + settings
+        + 'env_http_headers = {"x-test" = "MCP_IMPORT_TEST", "X-Test" = "CODEX_PROBE_TOKEN"}',
+    )
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is None
+    assert candidate.unsupported is UnsupportedReason.HEADER_NAME_COLLISION
+    assert candidate.entry == {
+        "url": "http://127.0.0.1:18767/mcp",
+        "headers": static,
+        "env_http_headers": {"x-test": "MCP_IMPORT_TEST", "X-Test": "CODEX_PROBE_TOKEN"},
+    }
+    assert "resolved-" not in repr(candidate)
 
 
 def test_bearer_masks_header_alias_conflicts_and_invalid_authorization_variable(ctx: ImportContext) -> None:

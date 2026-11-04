@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Tests for importing MCP servers configured in pi 1.4.0."""
+"""Tests for importing MCP servers configured in pi 1.5.0."""
 
 from __future__ import annotations
 
@@ -167,11 +167,11 @@ def test_header_values_are_imported_trimmed_as_pi_sends_them(home: Path) -> None
 
     candidates = _by_name(_discover(home))
 
-    docs, files = candidates["docs"].config, candidates["files"].config
-    assert docs is not None and files is not None
+    docs = candidates["docs"].config
+    assert docs is not None
     assert docs.headers == {"Authorization": "Bearer", "X-Pad": "padded {{T}}"}
-    # Environment values are passed to the process as written.
-    assert files.env == {"PAD": " kept "}
+    assert candidates["files"].config is None
+    assert candidates["files"].unsupported is UnsupportedReason.ENV_VALUE_WHITESPACE
 
 
 @pytest.mark.parametrize("transport", ["stdio", "http"])
@@ -249,25 +249,56 @@ def test_settings_icode_lacks_are_reported(home: Path) -> None:
         {"command": "cmd", "timeout": -(10**400)},  # -Infinity to pi; too long for a Python float
         {"command": "cmd", "exposure": "sometimes"},
         {"command": "cmd", "enabled": "no"},
-        {"url": "https://x.test", "oauth": {"callbackPort": 0}},
-        {"url": "https://x.test", "oauth": {"callbackPort": 10**400}},
-        {"url": "https://x.test", "oauth": {"clientRegistration": "cimd", "clientId": "x"}},
-        {"url": "http://x.test", "auth": {"provider": "radius"}},
         {"enabled": False},
         "not an object",
         # Any JSON value where pi expects a word.
         {"command": "cmd", "exposure": []},
         {"command": "cmd", "toolExposure": {"t": {}}},
         {"command": "cmd", "type": []},
-        {"url": "https://x.test", "oauth": {"callbackPort": 3000, "callbackUrl": "http://localhost:4000/cb"}},
-        {"url": "https://x.test", "oauth": {"clientRegistration": "cimd", "callbackUrl": "http://[::1]/callback"}},
-        {"url": "https://x.test", "oauth": {"clientRegistration": "cimd", "callbackUrl": "http://localhost/cb"}},
     ],
 )
-def test_entries_pi_rejects_are_not_listed(home: Path, entry: object) -> None:
+def test_invalid_migration_fields_are_not_listed(home: Path, entry: object) -> None:
     _global(home, {"skipped": entry, "kept": {"command": "cmd"}})
 
     assert [candidate.name for candidate in _discover(home)] == ["kept"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("oauth", {"callbackPort": 0, "clientSecret": "omitted-secret"}),
+        ("oauth", {"clientRegistration": "future-mode", "callbackUrl": []}),
+        ("oauth", ["omitted-secret"]),
+        ("oauth", None),
+        ("auth", {"provider": ["omitted-secret"]}),
+        ("auth", {"credentials": "omitted-secret"}),
+        ("auth", ["omitted-secret"]),
+        ("auth", None),
+        ("future_setting", {"secret": "omitted-secret"}),
+    ],
+)
+def test_omitted_auth_settings_do_not_gate_migration(home: Path, field: str, value: object) -> None:
+    _global(home, {"server": {"url": "http://example.test/mcp", field: value}})
+
+    (candidate,) = _discover(home)
+    assert candidate.config is not None and candidate.config.url == "http://example.test/mcp"
+    if field != "future_setting":
+        assert candidate.warnings == (
+            ImportWarning(ImportWarningKind.OAUTH_IGNORED)
+            if field == "oauth"
+            else ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="auth"),
+        )
+    assert "omitted-secret" not in repr(candidate)
+
+
+@pytest.mark.parametrize("value", [None, ["omitted-secret"], {"secret": "omitted-secret"}, 42])
+def test_an_unrecognized_working_folder_is_reported_without_its_value(home: Path, value: object) -> None:
+    _global(home, {"server": {"command": "server", "cwd": value}})
+
+    (candidate,) = _discover(home)
+    assert candidate.config is not None and candidate.config.command == "server"
+    assert candidate.warnings == (ImportWarning(ImportWarningKind.UNKNOWN_FIELDS_IGNORED, original="cwd"),)
+    assert "omitted-secret" not in repr(candidate)
 
 
 @pytest.mark.parametrize(
@@ -277,6 +308,7 @@ def test_entries_pi_rejects_are_not_listed(home: Path, entry: object) -> None:
         ({"headers": {"authorization": "Bearer example"}}, False),
         ({"auth": {"provider": "example"}}, False),
         ({"oauth": {"clientId": "id"}}, True),
+        ({"oauth": {"clientRegistration": "auto"}}, True),
     ],
 )
 def test_only_explicit_oauth_settings_have_a_migration_warning(home: Path, settings: dict, warned: bool) -> None:
@@ -395,8 +427,8 @@ def test_project_servers_replace_global_ones_and_overrides_adjust_them(home: Pat
     candidates = _discover(home, workspace)
 
     # A replaced server keeps the global one's place.
-    assert [c.name for c in candidates] == ["first", "second", "third", "own"]
-    first, second, third, own = candidates
+    assert [c.name for c in candidates] == ["first", "second", "third", "fourth", "own"]
+    first, second, third, fourth, own = candidates
     assert first.config is not None and (first.config.command, first.config.env) == ("project-first", {})
     assert (first.scope, first.source_path, first.scope_path) == ("project", str(project_file), str(workspace))
     assert second.config is not None and (second.config.enabled, second.config.allowed_tools) == (False, [])
@@ -407,6 +439,8 @@ def test_project_servers_replace_global_ones_and_overrides_adjust_them(home: Pat
     )
     # An override may only set enabled, exposure and toolExposure.
     assert third.config is not None and third.config.enabled is True
+    assert fourth.scope == "project"
+    assert fourth.warnings == (ImportWarning(ImportWarningKind.AUTH_PROVIDER_IGNORED, original="radius"),)
     assert own.scope == "project"
 
 
