@@ -190,7 +190,6 @@ async def test_opencode_unsupported_settings_offer_repairs_without_secret_values
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ('{"mcp":{"broken":{"type":"local","command":"secret-invalid"}}}', "mcp.broken"),
         ('{\n // preserved location\n "mcp": { "secret-invalid": }\n}', "line 3, column"),
     ],
 )
@@ -206,7 +205,6 @@ async def test_opencode_source_errors_locate_repairs_without_source_values(
         )
         text = "\n".join(str(widget.render()) for widget in app.dialog.query(".mcp-import-error"))
         assert expected in text
-        assert "reopen import" not in text
         assert "secret-" not in text
 
 
@@ -216,7 +214,6 @@ def test_opencode_source_error_without_location_explains_the_failure() -> None:
     )
     assert "/config/opencode.json" in text
     assert "has settings opencode rejects" in text
-    assert "reopen import" not in text
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])

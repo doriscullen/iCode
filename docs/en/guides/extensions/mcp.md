@@ -59,149 +59,55 @@ An STDIO connection starts the specified program on the local machine. If the st
 
 ## Import servers from other applications
 
-If you already set up MCP servers in another application, you can copy them into the current iCode agent instead of typing them again. Claude Code, Codex, opencode and pi are supported.
+You can copy MCP servers from Claude Code, Codex, opencode and pi into the current iCode agent. This is a one-time copy: later changes in the source application do not update iCode.
 
-Import keeps the server's connection settings, enabled state, and supported timeouts and tool restrictions. Agent-specific tool access rules and tool approval rules from the source application are not migrated. After import, iCode's approval mode and rules determine whether a tool call requires your confirmation; see [Configure approval mode](../configuration/approval.md).
+1. Open `/agents mcp` and click "Import from other applications" next to "+ Add".
+2. Select an application on the left. Expand a server card to review its connection settings, configuration source and import warnings.
+3. Tick the servers you want, then click "Import". You can select servers from several applications at once.
+4. Review the new cards, especially "Available Tool Scope", "Tool Name Prefix" and "MCP Request Timeout". Click "Test", then "Save". Importing alone does not connect to a server.
 
-After import, changes in the source application's configuration do not automatically update the configuration in iCode. Review the import warnings and use "Test" before saving; a server being listed does not confirm that it can connect.
+A ⚠ marks changes that need your attention. "Can't import" cards explain the unsupported setting and identify its source file. "Imported" means the current agent already has the configuration; "Duplicate" means the same configuration is already selected and will be imported once. If saving reports duplicate names, rename one of the servers.
 
-1. On the "MCP" tab, click "Import from other applications" next to "+ Add".
-2. Select an application on the left to review its MCP servers on the right. Click a server's title to unfold or fold its configuration; tick its checkbox to choose it for import. Expanding a card does not select the server.
-3. Tick the servers you want, then click "Import" at the bottom right. You can select servers from more than one application before you import.
+### Check before use
 
-A ⚠ marks changes that need attention. Unfold the card to read "Import Warnings" and review the configuration before importing. "Can't import" means the configuration cannot be imported; unfold it to see why and inspect the source settings. "Imported" means the current agent already has the configuration. "Duplicate" means an identical configuration is already selected for this import; unfold it to see which one. It will be imported once.
+- **Scope and working folder**: Imported servers are available in every project that uses the current agent, even if they were limited to one project in the source application. STDIO servers start in iCode's current working folder. If a server needs a specific folder, start iCode there or adjust the server's command and paths before testing.
+- **Tools and timeouts**: Disabled servers stay disabled. Review the imported tool scope and timeout; settings without an iCode equivalent appear in the warnings. Source application approval rules do not transfer. Configure [iCode's approval mode and rules](../configuration/approval.md) as needed.
+- **Credentials**: Literal tokens and passwords are copied into the agent file. OAuth sign-in state and authentication providers do not transfer, even when no warning appears. If authentication is required, supply the headers the server expects, such as `Authorization: Bearer <access-token>`. Replace expired tokens yourself or use an [external credential command](#move-command-values-and-headers-helpers-manually); iCode does not perform OAuth login.
+- **Environment variables**: Set referenced variables before starting iCode. Imported references use `{{NAME}}` and require nonempty values. HTTP header values must be ASCII, with no line breaks, control characters or surrounding whitespace. Empty or non-ASCII literal headers cannot be imported. STDIO environment values cannot be empty or have surrounding whitespace.
+- **Unsupported connections**: Remote servers must support Streamable HTTP; SSE-only and WebSocket servers are unsupported. Commands, arguments and URLs containing environment references cannot be imported. Add these servers manually using the actual program, arguments or full URL.
 
-For a server marked "Can't import", its card explains the limitation. "Source setting" identifies the affected entry in the file under "Configuration Source". If you add the server manually instead, enter the full address in "URL" or the program and arguments in "Command" without environment variable references; environment variables and headers can use `{{NAME}}`.
+### Configuration sources and application-specific checks
 
-"MCP Request Timeout" shows the value that takes effect after import. The gray "source" note in parentheses lets you compare it with the original value.
+"Configuration Source" on each card identifies the files to inspect or edit. The locations below help you find missing configurations; refer to each application's documentation for its full configuration rules.
 
-Disabled servers stay disabled after import. Check "Scope in …" to see whether a server was configured for all projects or only one folder. Cards for servers limited to one folder also show "Scope After Import": imported servers are available in every project that uses the current iCode agent. iCode starts STDIO servers in the current working folder; if a server needs a specific folder, adjust its command or arguments before use.
+| Application | Common configuration locations | Check before use |
+| --- | --- | --- |
+| [Claude Code](https://code.claude.com/docs/en/mcp) | `~/.claude.json` for user/local servers; `.mcp.json` in the working folder or its ancestors for project servers. Custom locations under `CLAUDE_CONFIG_DIR` are also supported. | Variable defaults are not carried over: set each referenced variable. If the server needs `CLAUDE_PROJECT_DIR`, set it yourself. iCode does not provide MCP roots; check whether the server accepts an explicit folder instead. |
+| [Codex](https://developers.openai.com/codex/mcp) | `~/.codex/config.toml` (or under `CODEX_HOME`) and project `.codex/config.toml` files. | Set variables flagged as required, or remove unneeded headers. A tool deny list may import as "No tools"; select the tools you want after import. STDIO servers inherit iCode's environment: unset variables you do not want to pass on before starting iCode. |
+| [opencode](https://opencode.ai/docs/mcp-servers/) | Global configuration under `~/.config/opencode`, project `opencode.json` / `opencode.jsonc` and `.opencode` folders; custom configuration locations are also supported. | `{file:...}` values cannot be imported. Add the server manually with the required content, or use an environment variable or credential command for header and environment values. |
+| [pi](https://github.com/earendil-works/pi) | `~/.pi/agent/mcp.json` (or under `PI_CODING_AGENT_DIR`) and `.pi/mcp.json` in the working folder. | Review "Available Tool Scope", "Loading Strategy" and "Initially Visible Tools" when tool-rule warnings appear. Values starting with `!` need manual credential-command setup. Servers added by pi extensions are not listed. |
 
-Each imported server gets a "Tool Name Prefix" based on its name to avoid tool name conflicts. For example, a server named `github` offers `search` as `github_search`. Names containing unsupported characters or exceeding the length limit are adjusted automatically. Check the generated prefix and change or clear it in the server's card if needed (see [Naming and limits](#naming-and-limits)).
+Configurations supplied only by cloud services, plugins or session overrides may need to be added manually. Review the listed sources before importing: source application trust decisions do not restrict which configurations you can select in iCode.
 
-After import, review the new server cards. Their "Description" includes the source application and import notices. Changes that need review carry `⚠`; brace escaping and combined configuration sources are saved as `Note:` entries and do not require a repair. Identical notices are saved once. Click "Test" to check the connection, then "Save" to keep the configuration.
+### When a server is missing or cannot be imported
 
-What to know about imported servers, whichever agent they come from:
+If the list is empty, check that the source application's MCP configuration exists for the current working folder. Installing the application alone does not create a server configuration. Unreadable files show an error above the list; invalid server entries may be omitted. Follow the file or field named in the error, or add the server manually.
 
-- Values are copied as they are, including tokens and passwords in environment variables and headers. iCode saves them in the agent file, which only your user account can read. Surrounding whitespace is removed from header values. STDIO servers with empty environment variable values or values containing leading or trailing whitespace cannot be imported.
-- Environment variable references are changed to iCode's form, `{{NAME}}`. Set each variable before starting iCode: iCode fails the connection when one is not set.
-- OAuth settings and sign-in state are not imported. iCode does not manage the OAuth login or token refresh flow. If the server accepts a valid token you supply or supports another authentication method, configure authentication headers as it requires, for example `Authorization: Bearer <access-token>`. Replace an expired token if you entered it directly. You can also configure `Bearer {{!tokenprovider gettoken}}` if an external command obtains or refreshes the token; see [Move command values and headers helpers manually](#move-command-values-and-headers-helpers-manually).
-- Settings iCode has no equivalent for are not imported, and a warning names them, such as a working folder for the server (iCode always starts it in the current working folder).
-- Servers whose command, arguments or URL uses an environment variable cannot be imported. Some environment variable and header values also cannot be converted, such as `{${TOKEN}}`. The card identifies the unsupported setting.
-- Servers already configured in the current agent cannot be selected again. Servers with different environment variables, headers, enabled states or tool scopes can be imported separately even if their command or URL is the same. If "Save" reports duplicate names, rename one of the servers.
-- The same server may be listed more than once, for example as both a "user" and a "project" server, or in two agents. Once you tick one, other cards with the same settings are locked and say which one is ticked, so the server is imported only once. Untick it to choose another.
-- If a configuration file cannot be read, a message at the top of the list identifies the file. The message describes the read or configuration error.
+For "Can't import" cards, expand the card and use "Source setting" and "Configuration Source" to locate the problem. After correcting the source file, reopen import to load it again.
 
-If no configuration is found, this means no supported application's MCP configuration was found, even if the application is installed. Files must not exceed 16 MiB; a JSON file must contain a JSON object at the top level. Read errors identify the affected file and format requirements.
-
-If searching or loading still fails after reopening import, check iCode's `debug.log`. Its default location is `~/.chrys/logs/debug.log` on macOS and Linux, or `%APPDATA%/chrys/logs/debug.log` on Windows. It records errors while finding and reading source configurations.
-
-### Claude Code
-
-iCode reads servers from Claude Code's configuration files, using these scope labels:
-
-- "user": servers you added for all projects, kept in `~/.claude.json` (or the file of that name in the folder `CLAUDE_CONFIG_DIR` names). If Claude Code's settings folder (`~/.claude`, or the folder `CLAUDE_CONFIG_DIR` names) holds a non-empty `.config.json` left from an older Claude Code, Claude Code reads that file instead, and so does iCode.
-- "local": servers you added only for one folder, kept in the same file. If the working folder is inside a Git repository, these are the servers you added for the repository's top folder, which Claude Code uses in every folder of the repository. Otherwise they are the servers you added for the working folder itself.
-- "project": servers in the `.mcp.json` file of the working folder or of any folder above it. Tools that install a server "just for this project" put it there.
-
-Entries with invalid connection settings are not listed, such as a URL with no `type`, an incomplete command, or an environment variable value that is not text. Names Claude Code keeps for its own servers, such as `workspace`, are also excluded. Also:
-
-- `${GITHUB_TOKEN}` becomes `{{GITHUB_TOKEN}}`. Defaults such as `localhost` in `${HOST:-localhost}` are not imported. Set the variable before starting iCode, or replace the reference with the value you want.
-- Variable references stay dynamic. Leading or trailing whitespace supplied by an HTTP header variable is not removed after expansion and may cause an `Illegal header value` connection error. Remove that whitespace from the variable before starting iCode.
-- A server may depend on capabilities Claude Code provides beyond the imported configuration. iCode does not set `CLAUDE_PROJECT_DIR` or provide MCP roots. If a server needs that variable, even without referencing it in the configuration, set it before starting iCode. For a server that needs roots, check whether it can use the working folder or an explicitly configured folder instead.
-- To avoid unintentionally sending local credentials to an MCP server, references to certain credential variables such as `ANTHROPIC_API_KEY` are removed from remote server headers, matching Claude Code's behavior. Other text is kept: `Bearer ${ANTHROPIC_API_KEY}` becomes `Bearer`, while a header containing only the removed reference is omitted.
-- Literal braces in environment variables and headers are escaped using iCode syntax. A note appears only when escaping occurs: `{{literal}}` appears as `{{{{literal}}}}` in the configuration, but the server still receives `{{literal}}`. This is literal text, not an environment reference.
-- The server's per-call timeout is kept: Claude Code's `timeout` in milliseconds becomes iCode's "MCP Request Timeout" in seconds, rounded up. The preview shows the final value and the source milliseconds when the duration changes, for example 1501 milliseconds becomes 2 seconds. An entry without a configured timeout shows no explicit timeout. Values below one second are ignored, as Claude Code ignores them. An HTTP server with no `timeout` but a `request_timeout_ms` uses that value instead, at most five minutes, as Claude Code does.
-- HTTP `toolPermissions` limits are not migrated. Check "Available Tool Scope" and approval rules before using the imported tools.
-- For `headersHelper`, follow [Move command values and headers helpers manually](#move-command-values-and-headers-helpers-manually). For OAuth servers, configure authentication as described in the common import notes above.
-- SSE and WebSocket servers can't be imported: iCode supports only STDIO and HTTP servers. The `streamable-http` type is read as HTTP.
-- iCode requires Streamable HTTP for remote servers. If "Test" fails, check whether the server offers a Streamable HTTP address; an SSE-only server cannot connect even if Claude Code lists it as HTTP.
-
-### Codex
-
-- "user": servers under `[mcp_servers]` in `~/.codex/config.toml`, or `config.toml` in the folder `CODEX_HOME` names. A relative `CODEX_HOME` is resolved from the working folder.
-- "project": `.codex/config.toml` from the project root down to the working folder, with the nearer file taking precedence. The root is the nearest folder containing a `project_root_markers` entry (default: `.git`); without one, only the working folder is searched. When multiple files configure the same server, check the combined settings and the contributing files named on its card.
-
-Codex's project trust decisions do not restrict import. You choose which configurations to copy into the current iCode agent; importing does not start a server or change Codex's trust settings.
-
-Also:
-
-- `command` selects STDIO and `url` selects HTTP. Both together are invalid, including when they come from different merged files. Invalid server entries are not listed; unreadable or malformed TOML files show an error.
-- `env` and `http_headers` values remain literal. A notice explains any escaped braces shown in the preview; the server receives the original braces. `env_http_headers` and `bearer_token_env_var` retain references to environment variables without copying current credential values. Environment headers override static headers, and bearer authentication overrides an Authorization header.
-- Check optional-variable notices before connecting. Codex can skip an unavailable or empty optional header and keep a static fallback; iCode requires a nonempty referenced value. Set the variable before starting iCode, or remove an unnecessary setting after import. Explicit `PYTHONPATH` and `PYTHONHOME` references also need nonempty values. For request headers, remove surrounding whitespace and ensure variable or command output contains no line breaks or control characters; otherwise the connection or the value sent can differ from Codex.
-- iCode's STDIO servers inherit more of the environment than Codex forwards. Before starting iCode, unset variables you do not want the imported server to receive, or use a clean environment. A variable omitted from the imported settings can still be inherited from the process that started iCode.
-- Disabled servers stay disabled. Check "MCP Request Timeout" in the preview and adjust it after import if needed. An unspecified Codex timeout becomes 300 seconds, fractional seconds round up, and very large values are reduced to the supported maximum. A source timeout of zero uses iCode's default request timeout. iCode has no separate startup timeout: connection setup and tool requests share this timeout. Codex's `startup_timeout_sec` is not carried over. If startup needs more time, expand the imported server's card and increase "MCP Request Timeout (seconds)"; this also increases the tool request timeout.
-- Check "Available Tool Scope" in the preview. `enabled_tools` retains only tools not in `disabled_tools`; an empty list means **no tools**. If the source only has a deny list, it imports with **no tools** and a warning. After import, open the server's settings and select the tools you want under "Available Tool Scope".
-- OAuth settings and sign-in state, ChatGPT/enterprise authentication settings, approval rules and per-tool output limits are not carried over. An OAuth warning is shown only when the source explicitly sets `auth = "oauth"`, `oauth` or `oauth_resource`. A configuration file cannot establish whether Codex signed in automatically; the absence of a warning does not mean credentials were transferred. Servers that work without authentication need no authentication changes. If authentication is required, open the imported server's "Headers" and provide a valid token or other authentication headers as the server requires. iCode does not manage OAuth login or token refresh; an [external credential command](#move-command-values-and-headers-helpers-manually) can supply a token. Check the agent profile's [approval rules](../../reference/agent-profile.md#approval). If an output limit is needed, configure the server-wide `max_tool_result_tokens` in the [agent profile](../../reference/agent-profile.md#toolsmcp); it does not preserve separate limits for individual tools.
-- A custom `cwd` is not carried over. If the server relies on that folder, start iCode from the original folder or adjust the server's relative paths before testing. `http_headers_helper` has a separate notice with [manual migration instructions](#move-command-values-and-headers-helpers-manually); no helper commands run during import. Remote execution environments and remote-sourced variables cannot be imported as local servers.
-- Headers that Codex skips because of an invalid name or literal value are also omitted, with a notice naming the field. Conflicting header entries whose names differ only in case within an `http_headers` or `env_http_headers` group cannot be imported. Static headers and environment headers can still share a name; environment headers take precedence. Expand the card's "Connection Settings in Source" to review the original header names. Static headers and "Headers From Environment Variables" are shown separately; the latter shows the referenced variable names, never their current values. An unsupported variable-name notice identifies the source field and variable name.
-
-Only local user and project configuration files are imported. Servers or credentials supplied through system, managed or cloud settings, selected profiles, session overrides or plugins must be configured manually. Check any warnings about environment variables that were omitted.
-
-### opencode
-
-iCode looks for opencode servers in these configuration locations. Review each server's final settings before importing:
-
-- "global": `opencode.json`, `opencode.jsonc` and `config.json` in `~/.config/opencode` (or in `opencode` under `XDG_CONFIG_HOME`), the file `OPENCODE_CONFIG` names, the `~/.opencode` folder, the folder `OPENCODE_CONFIG_DIR` names, the settings in `OPENCODE_CONFIG_CONTENT`, and the settings your administrator installed for all users.
-- "project": `opencode.json` and `opencode.jsonc` in the working folder and in each folder above it, and in their `.opencode` folders, up to the top folder of the Git repository (outside a repository, up to the top of the disk). They are skipped when `OPENCODE_DISABLE_PROJECT_CONFIG` is set, as opencode skips them.
-
-Relative `XDG_CONFIG_HOME` paths are resolved from the current working folder selected in iCode.
-
-If more than one configuration source changes a server, check "Configuration Source" and the additional sources named in its notice to locate the settings you need to review or fix. Also check any inherited environment variables or headers: they will be passed to the server shown on the card. Settings opencode gets from the internet, such as your organization's, are not read.
-
-For remote servers, check the final URL and request headers in the preview before testing the connection.
-
-Also:
-
-- `{env:GITHUB_TOKEN}` becomes `{{GITHUB_TOKEN}}`. Set referenced variables before testing or using the server. Literal braces remain unchanged in the value received by the server; a notice explains escaped braces shown in the preview. For request-header variables, remove surrounding whitespace before starting iCode.
-- A command, argument or URL containing an environment reference can't be imported. Add the server manually, replacing references with the actual program, arguments or full URL.
-- Server names and configuration field names containing `{env:...}` or `{file:...}` references can't be imported. This includes environment-variable and header names, and names of settings such as `command` or `type`. These names must be fixed text.
-- A setting that reads a file with `{file:...}` can't be imported. Add the server manually and fill in the required content from that file. In environment variables and headers, you can also reference an environment variable or credential command. Follow any notices about variable names or braces to correct the indicated setting.
-- A server opencode has turned off (`"enabled": false`) is imported turned off. Tick "Enabled" in its card to use it.
-- Check "MCP Request Timeout" in the preview. A changed value shows both the original milliseconds and the final seconds: fractional seconds round up and oversized values are reduced to the supported maximum. Without a server `timeout`, `experimental.mcp_timeout` is used; when neither is configured, the default request timeout is 60 seconds. iCode also uses this value for connection setup, while opencode's default connection timeout is 30 seconds.
-- A server's custom `cwd` is not imported. Resolve a relative `cwd` from the base directory named in its notice. Before testing, start iCode from the resulting folder or adjust the server's relative paths.
-- Global `tools`, `permission`, `permissions`, `OPENCODE_PERMISSION` and agent-specific permission rules are not migrated. Configure "Available Tool Scope" and approval rules in iCode.
-- opencode enables OAuth by default unless `oauth` is `false`, but that does not establish whether a server requires sign-in. An OAuth warning appears only for an explicit `oauth` configuration other than `false`. Sign-in state never transfers, including when no warning appears. Servers that work without authentication need no authentication changes. If authentication is required and the server accepts a token or another method, configure the required headers. iCode does not manage OAuth login or token refresh.
-- opencode also connects to a remote server over SSE when it doesn't support HTTP; iCode doesn't.
-
-Configuration errors identify the affected file, setting and required value. A `local` server's `command` must be an array of strings, such as `["server", "--flag"]`; a `remote` server's `url` must be a string. Each `environment` or `headers` value must be a string, `enabled` must be `true` or `false`, and `timeout` must be a positive integer in milliseconds.
-
-### pi
-
-iCode reads pi's server configuration for the working folder:
-
-- "global": `mcp.json` in `~/.pi/agent`, or in the folder `PI_CODING_AGENT_DIR` names.
-- "project": `.pi/mcp.json` in the working folder itself. A project server replaces a global server of the same name. A project entry that only turns a global server on or off, or changes how its tools are offered, changes that global server, and a warning names the project file.
-
-pi's project trust decisions do not restrict import. You choose which configurations to copy into the current iCode agent; importing does not start a server or change pi's trust settings.
-
-If a pi configuration file cannot be read, check the file, setting or line and column named in the error. pi configuration files must use UTF-8 and valid JSON without comments or trailing commas. Also:
-
-- `${GITHUB_TOKEN}` and `$GITHUB_TOKEN` become `{{GITHUB_TOKEN}}`, and `$$` becomes `$`. For values starting with `!`, [add the server and configure its credential command manually](#move-command-values-and-headers-helpers-manually).
-- Text pi treats literally, such as `${TOKEN:-default}` and literal braces in environment variables or headers, is preserved. A notice explains escaped braces shown in the preview; the server receives the original text. pi doesn't support defaults in variable references.
-- HTTP headers containing non-ASCII literal text cannot be imported from pi. Referenced header variables must also contain ASCII text with surrounding whitespace removed; check their values before starting iCode.
-- `~` at the start of the command or an argument becomes your home folder.
-- A server pi has turned off is imported turned off. Check the final "MCP Request Timeout" in the preview: an unspecified timeout retains pi's 60-second default, fractional seconds round up, and very large values are reduced to iCode's maximum. A source configuration with no timeout limit is identified alongside that final value. The server's `description` comes first in the imported description.
-- A custom `cwd` is not imported. For `~` paths, use the expanded folder shown in the notice; resolve relative paths from the base directory shown there. Before testing, start iCode in that folder or adjust the server's relative paths.
-- How pi offers the server's tools becomes iCode's "Loading Strategy" and "Available Tool Scope": `codemode` (pi's default) and `deferred` become "On demand — load tools as needed", `direct` becomes "Full — load all available tools", and `hidden` becomes "No tools". In `toolExposure`, tools named one by one are added to the tool lists where iCode can express it; patterns such as `"write_*"` are named in a warning.
-- Tool rules that cannot be imported follow the server's overall settings in iCode instead. Their availability or loading behavior may differ from pi. Check "Available Tool Scope" and select the tools you need after import. Once tools are enabled, you can adjust "Loading Strategy" and, with on-demand loading, "Initially Visible Tools" in the server's settings.
-- OAuth sign-in state and pi's `auth` provider credentials do not transfer. If authentication is required, open the imported server's "Headers" and supply a valid token or other authentication headers as the server requires. iCode does not manage OAuth login or token refresh; an [external credential command](#move-command-values-and-headers-helpers-manually) can supply a new token. Replace a directly entered token when it expires. pi defaults to OAuth when neither an `Authorization` header nor `auth` is configured, but a warning appears only when `oauth` is explicitly configured. Whether a warning appears establishes neither a need for authentication nor a transfer of credentials. Servers that pi extensions add are not listed.
+If loading still fails, check `~/.chrys/logs/debug.log` on macOS/Linux or `%APPDATA%/chrys/logs/debug.log` on Windows.
 
 ### Move command values and headers helpers manually
 
-Import does not execute credential commands or headers helpers. Text the source treats as literal stays literal, including `{{!command}}` in an environment variable or header: importing and saving it does not turn it into an iCode credential command.
+Import does not run credential commands or headers helpers. To use one in iCode:
 
-For a pi value such as `!tokenprovider gettoken`, add the server manually. Under Environment Variables, set the required variable to `{{!tokenprovider gettoken}}`. Under Headers, a token command can be used as `Authorization=Bearer {{!tokenprovider gettoken}}`. If the command prints the complete header value, use `{{!command}}` without adding another `Bearer` prefix.
+1. Install and authenticate your credential provider on this machine.
+2. Add the server manually if its command-based values prevent import; otherwise edit the imported card.
+3. Set the required environment value to `{{!tokenprovider gettoken}}`, or add an `Authorization` header with `Bearer {{!tokenprovider gettoken}}`. Replace the example command with your provider's command. If it prints the complete header value, omit the extra `Bearer` prefix.
+4. Use absolute paths if the command needs files: iCode runs it from your home folder. It must exit successfully and print one nonempty line of ASCII text. See [Get an API key from a command](../configuration/models.md#get-an-api-key-from-a-command) for command requirements and refresh behavior.
+5. Click "Test" before saving.
 
-You can also configure this header after importing a server that needs a token. `tokenprovider gettoken` is an example: replace it with your token provider's command, installed and authenticated on this machine. The command must print only the value needed at that position; iCode does not perform OAuth sign-in for it.
-
-Check these differences before clicking "Test":
-
-- pi runs a value command from the folder pi started in, with a 10-second limit. iCode runs from your home folder with a 30-second limit. Shell selection and inherited environment can differ. Use absolute paths or a script that sets its own working folder when the command depends on a particular folder.
-- iCode accepts one nonempty line of printable ASCII, trims surrounding whitespace, and limits captured output to 64 KiB. pi accepts trimmed UTF-8 output, including multiple lines. A command used by iCode must print only the required value and exit successfully. See [Get an API key from a command](../configuration/models.md#get-an-api-key-from-a-command).
-- iCode refreshes HTTP command credentials after the configured interval or a 401 response. Restart an STDIO server to get a new value. If an HTTP refresh fails, the previous value may remain in use.
-
-Claude Code's `headersHelper` and Codex's `http_headers_helper` return a JSON object containing multiple headers. Add each required header separately in iCode, using an environment variable or a command that prints only that header's value. Do not use a JSON-producing helper as `Authorization={{!command}}`: it would send the JSON as the header value. iCode does not support generating and refreshing multiple headers together with one helper command.
+For Claude Code's `headersHelper` or Codex's `http_headers_helper`, configure each header separately with an environment variable or a command that prints only that header's value. Do not use a helper's JSON output as a header value.
 
 ## Configure instructions, tools, and request options
 

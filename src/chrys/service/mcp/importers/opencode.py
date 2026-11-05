@@ -127,6 +127,7 @@ from chrys.service.mcp.importers.base import (
     templates_convertible,
     trim_header_value,
     unsupported_env_value,
+    unsupported_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -845,6 +846,9 @@ def _candidate(name: str, server: _Server, merged: _Merged, workspace_cwd: str |
     if values_key == "headers":
         # Fetch trims once more after joining aliases; intermediate empty values keep their spaces.
         converted = {key: trim_header_value(value) for key, value in converted.items()}
+        if (invalid_header := unsupported_header_value(converted)) is not None:
+            reason, field = invalid_header
+            return unsupported(reason, f"mcp.{name}.headers.{field}")
 
     warnings: list[ImportWarning] = []
     if escaped_braces:

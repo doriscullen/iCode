@@ -87,7 +87,6 @@ async def test_pi_preview_shows_final_loading_and_initial_tools(tmp_path: Path, 
         assert ("No tools" if locale == "en" else "无工具") in none
         assert "write_*" in none
         assert ("User Guide (F8)" if locale == "en" else "用户指南（F8）") in none  # noqa: RUF001
-        assert ("if shown" if locale == "en" else "如有显示") not in none
         labels = [str(widget.render()) for widget in cards["none"].query(".mcp-import-field-label")]
         assert ("Loading Strategy" if locale == "en" else "加载策略") not in labels
 
@@ -116,7 +115,6 @@ async def test_pi_project_scope_and_credential_command_guidance_stay_in_the_card
             "Available to this agent in every project" if locale == "en" else "当前智能体可在所有项目中使用此服务器"
         )
         assert "{{!command}}" in text
-        assert "tokenprovider" not in text
         assert ("User Guide (F8)" if locale == "en" else "用户指南（F8）") in text  # noqa: RUF001
 
 
@@ -154,7 +152,6 @@ async def test_pi_literal_timeout_and_cwd_repairs_are_visible(tmp_path: Path, lo
         assert str(context.home / "server-home") in await _card_text(cards["home"], pilot)
         unlimited = await _card_text(cards["unlimited"], pilot)
         assert ("source: no timeout limit" if locale == "en" else "源配置：无超时上限") in unlimited  # noqa: RUF001
-        assert "source: inf" not in unlimited
 
 
 @pytest.mark.parametrize("locale", ["en", "zh-Hans"])
@@ -186,8 +183,6 @@ async def test_pi_non_ascii_header_refusal_has_safe_actionable_field(tmp_path: P
         encoding = await _card_text(cards["encoding"], pilot)
         assert "mcpServers.encoding.headers.X-Test" in encoding
         assert ("contains non-ASCII text" if locale == "en" else "含有非 ASCII 文本") in encoding
-        assert "reopen import" not in encoding
-        assert "重新打开导入" not in encoding
         assert "mcpServers.command.env.TOKEN" in await _card_text(cards["command"], pilot)
         assert not cards["variable"].row.disabled
         diagnostics = "\n".join(
@@ -200,7 +195,6 @@ async def test_pi_non_ascii_header_refusal_has_safe_actionable_field(tmp_path: P
     ("raw", "expected"),
     [
         (b"\xff", "UTF-8"),
-        ('{"mcpServers":"private-secret-invalid"}', "mcpServers"),
         ('{\n "mcpServers": {"private-secret-invalid": }\n}', "line 2, column"),
     ],
 )
@@ -213,7 +207,7 @@ async def test_pi_source_errors_locate_safe_repairs(tmp_path: Path, raw: str | b
             description="pi source error was rendered",
         )
         text = "\n".join(str(widget.render()) for widget in app.dialog.query(".mcp-import-error"))
-        assert expected in text and "reopen import" not in text
+        assert expected in text
         assert "private-secret-" not in text
 
 

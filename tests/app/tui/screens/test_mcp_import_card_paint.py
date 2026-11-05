@@ -13,7 +13,7 @@ from textual.color import Color
 from textual.geometry import Region
 
 from chrys.app.tui.i18n import LocaleController
-from chrys.app.tui.screens.agents.import_mcp_dialog import ImportMcpServersDialog, _ImportCard
+from chrys.app.tui.screens.agents.import_mcp_dialog import _ImportCard
 from chrys.app.tui.screens.agents.panels.mcp import MCPConfigPanel
 from chrys.foundation.config.settings import Settings
 from chrys.service.mcp.importers import ImportWarning, ImportWarningKind, McpImportCandidate, UnsupportedReason
@@ -142,15 +142,23 @@ async def test_the_summary_keeps_its_contrast_on_hover_and_focus(tmp_path: Path)
         )
 
 
-async def test_an_unfolded_card_drops_its_hint_and_puts_the_warning_first(tmp_path: Path) -> None:
-    """The hint says what the body's warning says, so only the warning shows once the body does."""
+async def test_warning_status_and_details_follow_the_card_fold(tmp_path: Path) -> None:
     warning = ImportWarning(ImportWarningKind.TOOL_PERMISSIONS_IGNORED, field="tools")
     app = _PanelApp(MCPConfigPanel([]))
     async with app.run_test(size=(120, 40)) as pilot:
-        dialog = await _open(app, pilot, tmp_path, (_warned("lab", _stdio("lab", "python"), warning),))
-        card = dialog.query_one(_ImportCard)
+        dialog = await _open(
+            app,
+            pilot,
+            tmp_path,
+            (
+                _warned("lab", _stdio("lab", "python"), warning),
+                _warned("note", _stdio("note", "other"), ImportWarning(ImportWarningKind.LITERAL_BRACES_ESCAPED)),
+            ),
+        )
+        card, note = dialog.query(_ImportCard)
+        assert not note.query_one(".mcp-import-status").display
         hint = card.query_one(".mcp-import-hint")
-        # Folded, one short line stands in for the warning the unbuilt body would spell out.
+        # The title shows a status icon; the details are built only on unfolding.
         assert _hints(dialog) == []
         assert _titles(dialog)[0].endswith("⚠")
 
@@ -160,7 +168,7 @@ async def test_an_unfolded_card_drops_its_hint_and_puts_the_warning_first(tmp_pa
             pilot=pilot,
             description="the body is built",
         )
-        # Unfolded, the short line stands down and its warning comes first, above the settings.
+        # Warning details precede the connection settings.
         assert hint.display is False
         assert _hints(dialog) == []
         (text,) = _warning_texts(card)
@@ -173,7 +181,7 @@ async def test_an_unfolded_card_drops_its_hint_and_puts_the_warning_first(tmp_pa
         assert card.query_one(".mcp-import-title").tooltip is None
         assert first.region.y < card.query_one(".mcp-import-field-value").region.y
 
-        # Folded again, the short line comes back; the body is kept, not rebuilt.
+        # Folding keeps the status icon visible.
         await click_when_settled(pilot, card.query_one(".mcp-import-status"))
         await wait_for(lambda: card.collapsed is True, pilot=pilot, description="the card folds")
         assert hint.display is False
@@ -267,7 +275,6 @@ async def test_a_refusal_stays_under_the_title_when_unfolded(tmp_path: Path) -> 
         # The body shows the source's own connection settings; the reason under the title is the only one said.
         (reason,) = _hints(dialog)
         assert reason.startswith("iCode supports only STDIO and HTTP")
-        assert "Can't import:" not in reason
         assert not card.query(".mcp-import-warning-group")
         assert not card.query(".mcp-import-full-name")
         panel = card.query_one(".mcp-import-notes")
@@ -350,67 +357,3 @@ async def test_header_and_environment_names_paint_in_the_same_colour_as_values(t
             key_colour = next(_colour(style) for text, style in _first_line(key) if text.strip())
             value_colour = next(_colour(style) for text, style in _first_line(value) if text.strip())
             assert key_colour == value_colour
-
-
-# The folded line names one change, so each band below must outrank every band after it: a
-# server that has both must show the worse one. A new kind goes into a band here and into
-# `_HINT_ORDER` together.
-_HINT_BANDS = (
-    # It cannot start or cannot authenticate until you fix this.
-    (
-        ImportWarningKind.OPTIONAL_VARIABLE,
-        ImportWarningKind.CLAUDE_PROJECT_DIR,
-        ImportWarningKind.CREDENTIAL_VARIABLE,
-        ImportWarningKind.AUTH_PROVIDER_IGNORED,
-        ImportWarningKind.OAUTH_IGNORED,
-        ImportWarningKind.HEADERS_HELPER_IGNORED,
-    ),
-    # It starts, but offers fewer tools than the source gives it, or none at all.
-    (ImportWarningKind.DENY_LIST, ImportWarningKind.TOOLS_LIMITED),
-    # It starts and works, but not as the source application had it run.
-    (
-        ImportWarningKind.DEFAULT_DROPPED,
-        ImportWarningKind.CWD_IGNORED,
-        ImportWarningKind.UNKNOWN_FIELDS_IGNORED,
-        ImportWarningKind.TOOL_RULES_IGNORED,
-        ImportWarningKind.TOOL_PERMISSIONS_IGNORED,
-        ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED,
-        ImportWarningKind.ZERO_TIMEOUT_IGNORED,
-        ImportWarningKind.STARTUP_TIMEOUT_IGNORED,
-        ImportWarningKind.INVALID_HEADER_IGNORED,
-    ),
-    # Nothing it receives or does changes; the line only records a difference.
-    (ImportWarningKind.LITERAL_BRACES_ESCAPED, ImportWarningKind.MERGED),
-)
-
-
-def test_every_warning_kind_has_a_rank() -> None:
-    """A new warning kind must be placed in a band, or its severity would be left unstated."""
-    ranked = [kind for band in _HINT_BANDS for kind in band]
-
-    assert sorted(ranked, key=lambda kind: kind.value) == sorted(ImportWarningKind, key=lambda kind: kind.value)
-
-
-@pytest.mark.parametrize(
-    ("worse", "better"),
-    [
-        (worse, better)
-        for low, _band in enumerate(_HINT_BANDS)
-        for better_band in _HINT_BANDS[low + 1 :]
-        for worse in _band
-        for better in better_band
-    ],
-    ids=lambda kind: kind.value,
-)
-def test_the_folded_line_names_the_worse_of_two_changes(worse: ImportWarningKind, better: ImportWarningKind) -> None:
-    """A worse band outranks every better one, whichever order the server's warnings arrive in."""
-    dialog = ImportMcpServersDialog(workspace_cwd=None, existing=[], locale_controller=None, sources=[])
-    candidate = _candidate("both", "user", _stdio("both", "python"))
-
-    def hint(*kinds: ImportWarningKind) -> str | None:
-        return dialog._hint(replace(candidate, warnings=tuple(ImportWarning(kind) for kind in kinds)))
-
-    worst = hint(worse)
-    assert worst is not None
-    assert hint(better, worse) == hint(worse, better) == worst
-    assert worst != hint(better)

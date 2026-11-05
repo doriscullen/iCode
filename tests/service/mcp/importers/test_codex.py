@@ -693,7 +693,7 @@ def test_invalid_header_values_are_omitted_before_trimming_without_disclosing_th
         """
 [mcp_servers.s]
 url = "https://example.test"
-http_headers = { "Bad Header" = "secret-name-value", "X-Test" = "\\nsecret-newline\\n", "X-Control" = "\\u0001secret-control", "X-Good" = "kept", "X-Unicode" = "你好", "X-Empty" = "" }
+http_headers = { "Bad Header" = "secret-name-value", "X-Test" = "\\nsecret-newline\\n", "X-Control" = "\\u0001secret-control", "X-Good" = "kept" }
 env_http_headers = { "Bad Env Header" = "TOKEN" }
 """,
     )
@@ -701,7 +701,7 @@ env_http_headers = { "Bad Env Header" = "TOKEN" }
     (candidate,) = CodexSource().discover(ctx).candidates
 
     assert candidate.config is not None
-    assert candidate.config.headers == {"x-good": "kept", "x-unicode": "你好", "x-empty": ""}
+    assert candidate.config.headers == {"x-good": "kept"}
     assert {
         (warning.field, warning.original)
         for warning in candidate.warnings
@@ -713,6 +713,55 @@ env_http_headers = { "Bad Env Header" = "TOKEN" }
         ("env_http_headers.Bad Env Header", "name"),
     }
     assert "secret-" not in repr(candidate)
+
+
+@pytest.mark.parametrize("ignored_first", [False, True])
+@pytest.mark.parametrize(
+    ("literal", "reason"),
+    [
+        ("café", UnsupportedReason.HEADER_VALUE_ENCODING),
+        ("", UnsupportedReason.EMPTY_HEADER_VALUE),
+        (" \t ", UnsupportedReason.EMPTY_HEADER_VALUE),
+    ],
+)
+def test_unsupported_header_field_excludes_ignored_aliases(
+    ctx: ImportContext, literal: str, reason: UnsupportedReason, ignored_first: bool
+) -> None:
+    entries = [("X-Test", "\nignored"), ("x-test", literal)]
+    if not ignored_first:
+        entries.reverse()
+    headers = ", ".join(f"{json.dumps(key)} = {json.dumps(value)}" for key, value in entries)
+    _user(ctx, '[mcp_servers.s]\nurl = "https://example.test"\nhttp_headers = { ' + headers + " }\n")
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is None
+    assert candidate.unsupported is reason
+    assert candidate.unsupported_field == "mcp_servers.s.http_headers.x-test"
+
+
+@pytest.mark.parametrize("literal", ["", " \t ", "café"])
+@pytest.mark.parametrize("bearer", [False, True])
+def test_target_header_checks_follow_environment_and_bearer_overrides(
+    ctx: ImportContext, literal: str, bearer: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOKEN", "你好")
+    key = "Authorization" if bearer else "X-Test"
+    settings = 'bearer_token_env_var = "TOKEN"' if bearer else 'env_http_headers = { "x-test" = "TOKEN" }'
+    _user(
+        ctx,
+        '[mcp_servers.s]\nurl = "https://example.test"\nhttp_headers = { '
+        + json.dumps(key)
+        + " = "
+        + json.dumps(literal, ensure_ascii=False)
+        + " }\n"
+        + settings,
+    )
+
+    (candidate,) = CodexSource().discover(ctx).candidates
+
+    assert candidate.config is not None
+    assert candidate.config.headers == {key.lower(): "Bearer {{TOKEN}}" if bearer else "{{TOKEN}}"}
 
 
 @pytest.mark.parametrize(

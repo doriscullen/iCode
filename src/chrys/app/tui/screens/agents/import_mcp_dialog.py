@@ -205,6 +205,10 @@ _EMPTY_ENV_VALUE = msg(
     "tui.mcp.import.unsupported.empty_env_value",
     fallback="{app} doesn't support environment variables with empty values, so this server can't be imported.",
 )
+_EMPTY_HEADER_VALUE = msg(
+    "tui.mcp.import.unsupported.empty_header_value",
+    fallback="{app} doesn't support HTTP headers with empty values, so this server can't be imported.",
+)
 _ENV_VALUE_WHITESPACE = msg(
     "tui.mcp.import.unsupported.env_value_whitespace",
     fallback="{app} doesn't support environment variable values with leading or trailing whitespace, so this server can't be imported.",
@@ -399,75 +403,6 @@ _WARNING_NOTE = msg("tui.mcp.import.warning.note", fallback="Note:")
 _DEFAULT_NOTE = msg(
     "tui.mcp.import.warning.default.note", fallback="The variable default in these fields will not be kept: {fields}."
 )
-_HINT_DEFAULT_DROPPED = msg("tui.mcp.import.hint.default_dropped", fallback="A variable default won't be kept")
-_HINT_HEADERS_HELPER = msg("tui.mcp.import.hint.headers_helper", fallback="The headers helper won't be imported")
-_HINT_OAUTH = msg("tui.mcp.import.hint.oauth", fallback="Sign-in settings won't be imported")
-_HINT_CREDENTIAL = msg("tui.mcp.import.hint.credential", fallback="Some credential references are removed")
-_HINT_PROJECT_DIR = msg("tui.mcp.import.hint.project_dir", fallback="A project folder variable won't be set")
-_HINT_UNKNOWN_FIELDS = msg("tui.mcp.import.hint.unknown_fields", fallback="Some settings won't be imported")
-_HINT_CWD = msg("tui.mcp.import.hint.cwd", fallback="The working folder won't be kept")
-_HINT_MERGED = msg("tui.mcp.import.hint.merged", fallback="Settings come from more than one file")
-_HINT_AUTH_PROVIDER = msg("tui.mcp.import.hint.auth_provider", fallback="Sign-in settings won't be imported")
-_HINT_TOOL_RULES = msg("tui.mcp.import.hint.tool_rules", fallback="Some tool rules won't be imported")
-_HINT_TOOL_PERMISSIONS = msg("tui.mcp.import.hint.tool_permissions", fallback="Tool permissions won't be imported")
-_HINT_TOOLS_LIMITED = msg("tui.mcp.import.hint.tools_limited", fallback="Tool access will be restricted")
-_HINT_OPTIONAL_VARIABLE = msg("tui.mcp.import.hint.optional_variable", fallback="An optional variable is required")
-_HINT_DENY_LIST = msg("tui.mcp.import.hint.deny_list", fallback="No tools will be available after import")
-_HINT_LITERAL_BRACES = msg("tui.mcp.import.hint.literal_braces", fallback="Brace escaping keeps the original text")
-_HINT_INVALID_HEADER = msg("tui.mcp.import.hint.invalid_header", fallback="An invalid header won't be imported")
-_HINT_ZERO_TIMEOUT = msg("tui.mcp.import.hint.zero_timeout", fallback="The source timeout can't be kept")
-_HINT_TOOL_OUTPUT_LIMIT = msg(
-    "tui.mcp.import.hint.tool_output_limit", fallback="Per-tool output limits won't be imported"
-)
-# The hint names the most consequential change: the first kind here that the server has.
-# Worst first: what leaves the server unusable, then what makes it run differently from
-# its source application, then what only records a difference.
-_HINT_ORDER = (
-    # It cannot start or cannot authenticate until you fix this.
-    ImportWarningKind.OPTIONAL_VARIABLE,
-    ImportWarningKind.CLAUDE_PROJECT_DIR,
-    ImportWarningKind.CREDENTIAL_VARIABLE,
-    ImportWarningKind.AUTH_PROVIDER_IGNORED,
-    ImportWarningKind.OAUTH_IGNORED,
-    ImportWarningKind.HEADERS_HELPER_IGNORED,
-    # It starts, but offers fewer tools than the source gives it, or none at all.
-    ImportWarningKind.DENY_LIST,
-    ImportWarningKind.TOOLS_LIMITED,
-    # It starts and works, but not as the source application had it run.
-    ImportWarningKind.DEFAULT_DROPPED,
-    ImportWarningKind.CWD_IGNORED,
-    ImportWarningKind.UNKNOWN_FIELDS_IGNORED,
-    ImportWarningKind.TOOL_RULES_IGNORED,
-    ImportWarningKind.TOOL_PERMISSIONS_IGNORED,
-    ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED,
-    ImportWarningKind.ZERO_TIMEOUT_IGNORED,
-    ImportWarningKind.STARTUP_TIMEOUT_IGNORED,
-    ImportWarningKind.INVALID_HEADER_IGNORED,
-    # Nothing it receives or does changes; the line only records a difference.
-    ImportWarningKind.LITERAL_BRACES_ESCAPED,
-    ImportWarningKind.MERGED,
-)
-_HINT_KINDS = {
-    ImportWarningKind.OPTIONAL_VARIABLE: _HINT_OPTIONAL_VARIABLE,
-    ImportWarningKind.CLAUDE_PROJECT_DIR: _HINT_PROJECT_DIR,
-    ImportWarningKind.CREDENTIAL_VARIABLE: _HINT_CREDENTIAL,
-    ImportWarningKind.AUTH_PROVIDER_IGNORED: _HINT_AUTH_PROVIDER,
-    ImportWarningKind.OAUTH_IGNORED: _HINT_OAUTH,
-    ImportWarningKind.HEADERS_HELPER_IGNORED: _HINT_HEADERS_HELPER,
-    ImportWarningKind.DENY_LIST: _HINT_DENY_LIST,
-    ImportWarningKind.TOOLS_LIMITED: _HINT_TOOLS_LIMITED,
-    ImportWarningKind.DEFAULT_DROPPED: _HINT_DEFAULT_DROPPED,
-    ImportWarningKind.CWD_IGNORED: _HINT_CWD,
-    ImportWarningKind.UNKNOWN_FIELDS_IGNORED: _HINT_UNKNOWN_FIELDS,
-    ImportWarningKind.TOOL_RULES_IGNORED: _HINT_TOOL_RULES,
-    ImportWarningKind.TOOL_PERMISSIONS_IGNORED: _HINT_TOOL_PERMISSIONS,
-    ImportWarningKind.TOOL_OUTPUT_LIMIT_IGNORED: _HINT_TOOL_OUTPUT_LIMIT,
-    ImportWarningKind.ZERO_TIMEOUT_IGNORED: _HINT_ZERO_TIMEOUT,
-    ImportWarningKind.STARTUP_TIMEOUT_IGNORED: _HINT_UNKNOWN_FIELDS,
-    ImportWarningKind.INVALID_HEADER_IGNORED: _HINT_INVALID_HEADER,
-    ImportWarningKind.LITERAL_BRACES_ESCAPED: _HINT_LITERAL_BRACES,
-    ImportWarningKind.MERGED: _HINT_MERGED,
-}
 _INFORMATIONAL_WARNING_KINDS = frozenset({ImportWarningKind.LITERAL_BRACES_ESCAPED, ImportWarningKind.MERGED})
 _UNREADABLE = msg(
     "tui.mcp.import.source_error.unreadable",
@@ -568,6 +503,7 @@ _UNSUPPORTED_REASONS = {
     UnsupportedReason.VALUE_FROM_COMMAND: _VALUE_FROM_COMMAND,
     UnsupportedReason.VARIABLE_NAME: _VARIABLE_NAME,
     UnsupportedReason.EMPTY_ENV_VALUE: _EMPTY_ENV_VALUE,
+    UnsupportedReason.EMPTY_HEADER_VALUE: _EMPTY_HEADER_VALUE,
     UnsupportedReason.ENV_VALUE_WHITESPACE: _ENV_VALUE_WHITESPACE,
 }
 _INVALID_CONFIG = msg(
@@ -890,7 +826,6 @@ class _ImportCard(CollapsibleConfigCard):
         hint: str | None = None,
         covered: str | None = None,
         status_labels: tuple[str, str, str, str] = ("⚠", "", "", ""),
-        needs_attention: bool = True,
         collapsed: bool = True,
     ) -> None:
         self._row = row
@@ -902,7 +837,7 @@ class _ImportCard(CollapsibleConfigCard):
         self._sections = list(sections)
         self._warnings = list(warnings)
         self._status_labels = status_labels
-        self._needs_attention = needs_attention
+        self._needs_attention = any(warning.attention for warning in warnings)
         # The hint this server has on its own; a cover note shows instead of it while it is locked.
         self._own_hint = hint
         self._hint = covered if covered is not None else hint
@@ -957,7 +892,7 @@ class _ImportCard(CollapsibleConfigCard):
                 if not self._importable and self._hint
                 else imported
                 if not self._importable
-                else (attention if self._hint and self._needs_attention else "")
+                else (attention if self._needs_attention else "")
             )
             self._title_widget.set_status(status, attention=bool(status == attention and status))
 
@@ -1048,6 +983,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         self._all_sources = sources
         self._sources: list[McpImportSource] = []
         self._results: dict[str, McpImportResult | None] = {}
+        self._load_locks: dict[str, asyncio.Lock] = {}
         self._ticked: dict[str, set[int]] = {}
         # Cards the user folded or unfolded, so a pane rebuild (agent or locale switch) keeps them that way.
         self._folded: dict[str, dict[int, bool]] = {}
@@ -1169,12 +1105,17 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         try:
             if source_id not in self._results:
                 await self._show_message(_LOADING.bind(), generation)
-                try:
-                    result: McpImportResult | None = await asyncio.to_thread(source.discover, self._import_context)
-                except Exception:
-                    logger.exception("Reading MCP servers from %s failed", source.display_name)
-                    result = None
-                self._results[source_id] = result
+                # Pane rebuilds share one source snapshot, including its candidate indices.
+                async with self._load_locks.setdefault(source_id, asyncio.Lock()):
+                    if source_id not in self._results:
+                        try:
+                            result: McpImportResult | None = await asyncio.to_thread(
+                                source.discover, self._import_context
+                            )
+                        except Exception:
+                            logger.exception("Reading MCP servers from %s failed", source.display_name)
+                            result = None
+                        self._results[source_id] = result
             async with self._pane_lock:
                 if generation == self._generation:
                     await self._mount_pane(self._pane_widgets(source, self._results[source_id]))
@@ -1255,7 +1196,7 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                 collapsed=collapsed,
                 # What the conversion changed only matters for a server that will be imported.
                 warnings=[] if state == "added" else self._warning_groups(candidate.warnings, agent),
-                hint=None if state == "added" else self._hint(candidate) if state == "importable" else note,
+                hint=note,
                 covered=covered,
                 status_labels=(
                     "⚠",
@@ -1263,7 +1204,6 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
                     self._render_message(_DUPLICATE.bind()),
                     self._render_message(_IMPORTED.bind()),
                 ),
-                needs_attention=any(warning.kind not in _INFORMATIONAL_WARNING_KINDS for warning in candidate.warnings),
             )
             widgets.append(_ImportItem(row, cards))
         # A file that couldn't be read already says why nothing is listed.
@@ -1485,14 +1425,6 @@ class ImportMcpServersDialog(BaseDialog[list[MCPServerConfig] | None]):
         """The one box a server that can't be imported shows: what the source wrote, never converted settings."""
         fields = tuple(self._source_connection_fields(candidate))
         return [_CardSection(self._render_message(_SOURCE_CONNECTION.bind()), fields)] if fields else []
-
-    def _hint(self, candidate: McpImportCandidate) -> str | None:
-        """One line under the title saying what importing this server would change."""
-        kinds = {warning.kind for warning in candidate.warnings}
-        for kind in _HINT_ORDER:
-            if kind in kinds:
-                return f"⚠ {self._render_message(_HINT_KINDS[kind].bind())}"
-        return None
 
     def _timeout_field(self, candidate: McpImportCandidate) -> _CardField | None:
         """The request timeout the import keeps, or None when the source kept the default."""

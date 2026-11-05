@@ -1018,23 +1018,6 @@ def test_aws_bearer_uses_the_same_environment_value_rules(
         assert candidate.entry is not None and candidate.entry["env"] == env
 
 
-def test_empty_aws_http_header_is_not_subject_to_stdio_environment_rules(home: Path) -> None:
-    _write_json(
-        home / ".claude.json",
-        {
-            "mcpServers": {
-                "http": {"type": "http", "url": "https://example.com", "headers": {"AWS_BEARER_TOKEN_BEDROCK": ""}}
-            }
-        },
-    )
-
-    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
-
-    assert candidate.config is not None
-    assert candidate.config.headers == {"AWS_BEARER_TOKEN_BEDROCK": ""}
-    assert candidate.warnings == ()
-
-
 def test_a_project_file_holding_more_than_whitespace_must_be_json(home: Path, workspace: Path) -> None:
     # Python counts these separators as whitespace; JavaScript, and so Claude Code, doesn't.
     project = workspace / ".mcp.json"
@@ -1147,19 +1130,6 @@ def test_header_values_are_imported_trimmed_as_claude_code_sends_them(home: Path
     assert remote.headers == {"Authorization": "Bearer", "X-Pad": "padded {{MY_TOKEN}}"}
     assert candidates["local"].config is None
     assert candidates["local"].unsupported is UnsupportedReason.ENV_VALUE_WHITESPACE
-
-
-def test_a_header_written_blank_is_kept_for_the_user_to_see(home: Path) -> None:
-    # Only a header a credential emptied is left out; one written blank stays, and saving names it.
-    _write_json(
-        home / ".claude.json",
-        {"mcpServers": {"remote": {"type": "http", "url": "https://x.test", "headers": {"X-Blank": ""}}}},
-    )
-
-    (candidate,) = ClaudeCodeSource().discover(_context(home)).candidates
-
-    assert candidate.config is not None
-    assert candidate.config.headers == {"X-Blank": ""}
 
 
 @pytest.mark.parametrize(

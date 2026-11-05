@@ -73,6 +73,7 @@ from chrys.service.mcp.importers.base import (
     render_template,
     request_timeout_seconds,
     unsupported_env_value,
+    unsupported_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -362,6 +363,15 @@ def _candidate(name: str, entry: _Entry) -> McpImportCandidate:
             return unsupported(UnsupportedReason.VARIABLE_NAME, field="bearer_token_env_var", variable=variable)
         headers["authorization"] = render_template(["Bearer ", TemplateVariable(variable)])
     if not stdio:
+        if (invalid_header := unsupported_header_value(headers)) is not None:
+            reason, field = invalid_header
+            ignored_fields = {header.field for header in source_headers.ignored}
+            source_key = next(
+                key
+                for key in value["http_headers"]
+                if key.lower() == field and f"http_headers.{key}" not in ignored_fields
+            )
+            return unsupported(reason, field=f"mcp_servers.{name}.http_headers.{source_key}")
         # Automatic OAuth is a Codex capability, not evidence that this server uses it.
         # Stored sign-in state is outside the local configuration import.
         auth = value.get("auth")

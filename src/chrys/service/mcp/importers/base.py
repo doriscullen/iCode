@@ -55,6 +55,7 @@ class UnsupportedReason(StrEnum):
     HEADER_NAME_COLLISION = "header_name_collision"
     TEMPLATE_IN_FIELD_NAME = "template_in_field_name"
     HEADER_VALUE_ENCODING = "header_value_encoding"
+    EMPTY_HEADER_VALUE = "empty_header_value"
     EMPTY_ENV_VALUE = "empty_env_value"
     ENV_VALUE_WHITESPACE = "env_value_whitespace"
 
@@ -310,6 +311,16 @@ def unsupported_env_value(values: Mapping[str, str]) -> tuple[UnsupportedReason,
             return UnsupportedReason.EMPTY_ENV_VALUE, key
         if value != value.strip():
             return UnsupportedReason.ENV_VALUE_WHITESPACE, key
+    return None
+
+
+def unsupported_header_value(values: Mapping[str, str]) -> tuple[UnsupportedReason, str] | None:
+    """Check effective headers after source overrides, alias merging and trimming."""
+    for key, value in values.items():
+        if not value.isascii():
+            return UnsupportedReason.HEADER_VALUE_ENCODING, key
+        if not value.strip():
+            return UnsupportedReason.EMPTY_HEADER_VALUE, key
     return None
 
 

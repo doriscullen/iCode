@@ -8934,114 +8934,6 @@ msgstr "源中的连接设置"
 msgid "tui.mcp.import.field.transport_options"
 msgstr "{transport} 选项"
 
-#. English: Sign-in settings won't be imported
-#. chrys-meta={"fingerprint":"e9dc0c907688fb2fd8087f96255d6d0495ef6a442ea0071e1ab847858bb5da5f","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.auth_provider"
-msgstr "登录设置不会导入"
-
-#. English: Some credential references are removed
-#. chrys-meta={"fingerprint":"d2260caefc42b06580590e88fe36c1b059a47ef2a67d263565299a6c230d11ed","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.credential"
-msgstr "部分凭据引用会被移除"
-
-#. English: The working folder won't be kept
-#. chrys-meta={"fingerprint":"57f741123fecc359c8f2c77befae582966a05378d3a15b98565378d44c33585e","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.cwd"
-msgstr "工作文件夹不会保留"
-
-#. English: A variable default won't be kept
-#. chrys-meta={"fingerprint":"1160c3afa69df48ed08a4e2a0d6b87bf310878da5f5d8f7652409e99f95f9f6e","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.default_dropped"
-msgstr "变量的默认值不会保留"
-
-#. English: No tools will be available after import
-#. chrys-meta={"fingerprint":"c278767d16bd449136dab35e280a060f62ca6a952527d066018ed0ae4e8d1c27","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.deny_list"
-msgstr "导入后没有可用工具"
-
-#. English: The headers helper won't be imported
-#. chrys-meta={"fingerprint":"e56ac180236dfa8834d3166d5f0e2c38bfaba74f19c2337b441d7a33dde2108b","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.headers_helper"
-msgstr "请求头辅助命令不会导入"
-
-#. English: An invalid header won't be imported
-#. chrys-meta={"fingerprint":"a53f3b7de95ad76e824d4e289ef73e1b472c4e1d824fb8c912de90186f3a2fbc","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.invalid_header"
-msgstr "无效的请求头不会导入"
-
-#. English: Brace escaping keeps the original text
-#. chrys-meta={"fingerprint":"a49e8dfb99589ac807eda9bf7918355e095a9cedddbeb567f107822837305292","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.literal_braces"
-msgstr "花括号已转义，原文不变"
-
-#. English: Settings come from more than one file
-#. chrys-meta={"fingerprint":"5916a5042ce1555b1b9d617a8a943e2f7f97b142115349f9a7e575e81ef79577","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.merged"
-msgstr "设置来自多个文件"
-
-#. English: Sign-in settings won't be imported
-#. chrys-meta={"fingerprint":"e9dc0c907688fb2fd8087f96255d6d0495ef6a442ea0071e1ab847858bb5da5f","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.oauth"
-msgstr "登录设置不会导入"
-
-#. English: An optional variable is required
-#. chrys-meta={"fingerprint":"e7798ade8589f5a27575df4e91de38e3065ed2aaf9ed708c44f1b44d5f0fb585","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.optional_variable"
-msgstr "可选变量会变为必填"
-
-#. English: A project folder variable won't be set
-#. chrys-meta={"fingerprint":"120bc7bed307888a387c4720047ade006f3a0552a4d7d9f8d94bc2a27264b729","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.project_dir"
-msgstr "项目文件夹变量不会设置"
-
-#. English: Per-tool output limits won't be imported
-#. chrys-meta={"fingerprint":"9aebbea96d08327aa004ebd96488aaf0851f7caf1727f8daff8af7571c53bd5a","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.tool_output_limit"
-msgstr "每工具的输出上限不会导入"
-
-#. English: Tool permissions won't be imported
-#. chrys-meta={"fingerprint":"b7d5abd7076622a77a07475b94a316e1644dcf6ed4093c4abcef5349319b3658","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.tool_permissions"
-msgstr "工具权限不会导入"
-
-#. English: Some tool rules won't be imported
-#. chrys-meta={"fingerprint":"b63c1728b85cc1f1512d52da37283746e6d7516c56ad36c17ba575990a1cb007","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.tool_rules"
-msgstr "部分工具规则不会导入"
-
-#. English: Tool access will be restricted
-#. chrys-meta={"fingerprint":"743763280244eb55db158e54b9650de2b97fa8951e9dd592369bb9e59b2f04ca","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.tools_limited"
-msgstr "导入后可用的工具受限"
-
-#. English: Some settings won't be imported
-#. chrys-meta={"fingerprint":"2da131b40f8e0384dd7b24fb07f09ef91ea06fc1ec0f5e347be0a262dc8f2485","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.unknown_fields"
-msgstr "部分设置不会导入"
-
-#. English: The source timeout can't be kept
-#. chrys-meta={"fingerprint":"b4e3e38a5f99e12df6bfeae3b9c33d87376373fd1a74153760377d0c9468f06d","multiline":false,"placeholders":[]}
-#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
-msgid "tui.mcp.import.hint.zero_timeout"
-msgstr "源中的超时设置无法保留"
-
 #. English: Reading MCP servers...
 #. chrys-meta={"fingerprint":"6cce02bdd8e08360fe1d15015e4624c46ae3144b9e956937f42e66cf2ec76b7f","multiline":false,"placeholders":[]}
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
@@ -9269,6 +9161,13 @@ msgstr "从其他应用导入"
 #: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
 msgid "tui.mcp.import.unsupported.empty_env_value"
 msgstr "{app} 不支持值为空的环境变量，无法导入。"
+
+#. English: {app} doesn't support HTTP headers with empty values, so this
+#. server can't be imported.
+#. chrys-meta={"fingerprint":"fc2c9235a10187261d88001afbddc882315522b42fa38424319fff79fba2e7c2","multiline":false,"placeholders":["app"]}
+#: src/chrys/app/tui/screens/agents/import_mcp_dialog.py
+msgid "tui.mcp.import.unsupported.empty_header_value"
+msgstr "{app} 不支持值为空的 HTTP 请求头，无法导入。"
 
 #. English: {app} doesn't support environment variable values with leading or
 #. trailing whitespace, so this server can't be imported.

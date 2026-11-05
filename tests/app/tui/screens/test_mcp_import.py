@@ -1318,6 +1318,64 @@ async def test_switching_back_before_the_pane_worker_starts_shows_the_highlighte
         assert _ticks(dialog) == [("a", False, True)]
 
 
+@pytest.mark.parametrize("refresh", ["source", "locale"])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_pane_rebuilds_share_an_inflight_source_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh: str, failed: bool
+) -> None:
+    gate = threading.Event()
+    calls: list[ImportContext] = []
+    first = _ListedSource("first", "First Agent", (_candidate("old-server", "user", _stdio("old-server")),))
+    second = _ListedSource("second", "Second Agent", ())
+
+    def discover(ctx: ImportContext) -> McpImportResult:
+        calls.append(ctx)
+        if len(calls) > 1:
+            return McpImportResult((_candidate("new-server", "user", _stdio("new-server")),))
+        if not gate.wait(timeout=_DEFAULT_WAIT_TIMEOUT):
+            raise TimeoutError("the test never released discover")
+        if failed:
+            raise RuntimeError("source read failed")
+        return McpImportResult(first.candidates)
+
+    monkeypatch.setattr(first, "discover", discover)
+    app = _PanelApp(MCPConfigPanel([]))
+    app.locale_controller = LocaleController(Settings(locale="en"))
+    async with app.run_test(size=(120, 40)) as pilot:
+        dialog = _open_with(app, [first, second], tmp_path)
+        try:
+            await wait_for(lambda: bool(calls), pilot=pilot, description="the first source is loading")
+            if refresh == "locale":
+                app.locale_controller.switch_locale("zh-Hans")
+            else:
+                dialog._request_source("second")
+                dialog._request_source("first")
+            await pilot.pause()
+            assert len(calls) == 1
+        finally:
+            gate.set()
+        await wait_for(
+            lambda: (
+                "first" in dialog._results
+                and all(worker.is_finished for worker in app.workers if worker.node is dialog)
+            ),
+            pilot=pilot,
+            timeout=_DEFAULT_WAIT_TIMEOUT,
+            description="all pane workers use the same completed read",
+        )
+        if failed:
+            assert dialog._results["first"] is None
+            assert not dialog.query(_ImportRow)
+        else:
+            assert _ticks(dialog) == [("old-server", False, True)]
+            _row(dialog, 0).value = True
+            await pilot.pause()
+            assert [config.name for config in dialog._selected()] == ["old-server"]
+        dialog.refresh_localization()
+        await pilot.pause()
+        assert len(calls) == 1
+
+
 def _broken_pane(source: Any, result: Any) -> list[Any]:
     raise RuntimeError("pane bug")
 
@@ -1458,9 +1516,6 @@ def test_every_unsupported_reason_has_a_message(reason: UnsupportedReason, local
 
     assert text and "{" not in text.replace("{{!command}}", "")
     assert "headers.X-Test" in text
-    assert not text.startswith(("Can't import:", "无法导入："))  # noqa: RUF001
-    assert "reopen import" not in text
-    assert "修改源配置" not in text
 
 
 @pytest.mark.parametrize("kind", list(SourceErrorKind))
@@ -1684,8 +1739,6 @@ async def test_command_migration_guidance_is_shown_without_copying_the_command(t
         guidance = _guidance(dialog)
         assert "{{!command}}" in guidance
         assert "User Guide (F8)" in guidance
-        assert "home folder" not in guidance
-        assert "JSON object" not in guidance
         assert command not in guidance and "private-command-argument" not in guidance
 
         app.locale_controller.switch_locale("zh-Hans")

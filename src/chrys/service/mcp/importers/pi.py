@@ -101,6 +101,7 @@ from chrys.service.mcp.importers.base import (
     templates_convertible,
     trim_header_value,
     unsupported_env_value,
+    unsupported_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -398,8 +399,6 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
             return unsupported(UnsupportedReason.VALUE_FROM_COMMAND, source_field)
         if not templates_convertible(parts):
             return unsupported(UnsupportedReason.TEMPLATE_NEXT_TO_BRACE, source_field)
-        if values_key == "headers" and any(not part.isascii() for part in parts if isinstance(part, str)):
-            return unsupported(UnsupportedReason.HEADER_VALUE_ENCODING, source_field)
         rendered = render_template(parts)
         escaped_braces |= rendered != "".join(
             part if isinstance(part, str) else "{{" + part.name + "}}" for part in parts
@@ -417,6 +416,9 @@ def _candidate(entry: _Entry, ctx: ImportContext) -> McpImportCandidate:
         return unsupported(reason, f"mcpServers.{entry.name}.env.{field}")
     if values_key == "headers":
         converted = {key: trim_header_value(value) for key, value in converted.items()}
+        if (invalid_header := unsupported_header_value(converted)) is not None:
+            reason, field = invalid_header
+            return unsupported(reason, f"mcpServers.{entry.name}.headers.{field}")
 
     warnings: list[ImportWarning] = []
     if escaped_braces:

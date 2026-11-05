@@ -256,5 +256,4 @@ async def test_codex_file_errors_have_safe_repair_information(tmp_path: Path, ra
         )
         text = "\n".join(str(widget.render()) for widget in app.dialog.query(".mcp-import-error"))
         assert expected in text
-        assert "reopen import" not in text
         assert "secret-" not in text

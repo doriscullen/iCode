@@ -125,6 +125,7 @@ from chrys.service.mcp.importers.base import (
     read_source_bytes,
     trim_header_value,
     unsupported_env_value,
+    unsupported_header_value,
 )
 from chrys.service.profiles.agents.schema import MCPServerConfig
 
@@ -574,6 +575,9 @@ def _http_candidate(name: str, entry: dict[str, Any], scope: str, source_path: s
             f"{converted_headers[first_name]}, {value}" if first_name in converted_headers else value
         )
     converted_headers = {key: trim_header_value(value) for key, value in converted_headers.items()}
+    if (invalid_header := unsupported_header_value(converted_headers)) is not None:
+        reason, field = invalid_header
+        return _unsupported(name, entry, scope, source_path, reason, field=f"mcpServers.{name}.headers.{field}")
     warnings = (*warnings, *_credential_warnings(headers), *_project_dir_warnings(headers))
     if "headersHelper" in entry:
         # The command may hold a credential, and warnings are saved in the description: name the setting only.
